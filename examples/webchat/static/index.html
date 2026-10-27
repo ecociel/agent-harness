@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>agent-harness · web chat & hook diagnostics</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="skip" href="#composer-input">Skip to chat input</a>
+<header class="top">
+  <div class="wrap bar">
+    <a class="brand" href="/" aria-label="écociel agent harness"><img src="logo.svg" width="118" height="30" alt="écociel"></a>
+    <span class="product">agent harness</span>
+    <nav class="lang" aria-label="View">
+      <a href="#chat" data-view="chat" aria-current="true">chat</a>
+      <a href="#diag" data-view="diag">diagnostics</a>
+    </nav>
+    <span class="pill mono" id="provider" title="Model provider">…</span>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="grid-bg" aria-hidden="true"></div>
+  <div class="wrap">
+    <p class="eyebrow">AGENT HARNESS · WEB CHAT</p>
+    <h1 class="h-title">Every hook, visible.</h1>
+    <p class="h-sub">Chat with an agent and watch the state machine, guardrails, token budget, approvals and traces fire — live, per turn.</p>
+  </div>
+</section>
+
+<main class="wrap layout">
+  <section class="card chat" id="chat" aria-label="Chat">
+    <div class="card-head">
+      <div>
+        <p class="ix">01 · conversation</p>
+        <h2 class="h3">Chat</h2>
+      </div>
+      <div class="head-actions">
+        <label class="toggle" title="Auto-approve dangerous tool calls (SPA: approval hook)">
+          <input type="checkbox" id="auto-approve"><span>auto-approve</span>
+        </label>
+        <button class="btn ghost sm" id="reset" type="button">reset</button>
+      </div>
+    </div>
+
+    <p class="field-label mono" id="pattern-label">PATTERN</p>
+    <div class="patterns" id="patterns" role="radiogroup" aria-labelledby="pattern-label"></div>
+    <p class="pattern-info" id="pattern-info"></p>
+
+    <ol class="messages" id="messages" aria-live="polite"></ol>
+
+    <div class="chips" id="chips" aria-label="Try"></div>
+    <form class="composer" id="composer">
+      <label class="sr" for="composer-input">Message</label>
+      <textarea id="composer-input" rows="2" placeholder="Ask something… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button class="btn pri" id="send" type="submit">Send</button>
+    </form>
+  </section>
+
+  <section class="diag" id="diag" aria-label="Hook diagnostics">
+    <div class="card">
+      <div class="card-head">
+        <div><p class="ix">02 · state machine</p><h2 class="h3">Inner &amp; outer loop</h2></div>
+        <span class="pill mono" id="current-state">idle</span>
+      </div>
+      <svg id="machine" viewBox="0 0 820 250" role="img" aria-label="State machine diagram"></svg>
+      <table class="runs mono" id="runs"><thead><tr><th>run</th><th>depth</th><th>turn</th><th>state</th><th>stop</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div><p class="ix">03 · hook points</p><h2 class="h3">Every hook, every point</h2></div>
+        <span class="pill mono" id="hook-total">0 calls</span>
+      </div>
+      <div class="matrix-wrap"><table class="matrix mono" id="matrix"></table></div>
+      <p class="hint">Cells count invocations this turn; they flash when a hook fires. <span class="sw allow"></span> allow/ok <span class="sw act"></span> acted (note) <span class="sw deny"></span> deny/stop/error</p>
+    </div>
+
+    <div class="two">
+      <div class="card">
+        <div class="card-head"><div><p class="ix">04 · tokens &amp; budget</p><h2 class="h3">Budget</h2></div></div>
+        <div class="meter" aria-label="Session token budget"><div class="meter-fill" id="budget-fill"></div></div>
+        <dl class="stats mono" id="budget"></dl>
+      </div>
+      <div class="card">
+        <div class="card-head"><div><p class="ix">05 · monitoring</p><h2 class="h3">Metrics</h2></div></div>
+        <dl class="stats mono" id="metrics"></dl>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div><p class="ix">06 · tracing</p><h2 class="h3">Spans</h2></div>
+        <span class="pill mono" id="span-total">0 spans</span>
+      </div>
+      <ol class="spans mono" id="spans"></ol>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div><p class="ix">07 · event stream</p><h2 class="h3">Live events</h2></div>
+        <div class="filters mono" id="filters">
+          <label><input type="checkbox" value="transition" checked>transitions</label>
+          <label><input type="checkbox" value="hook" checked>hooks</label>
+          <label><input type="checkbox" value="model" checked>model</label>
+          <label><input type="checkbox" value="tool" checked>tools</label>
+          <label><input type="checkbox" value="pattern" checked>patterns</label>
+          <label><input type="checkbox" value="run" checked>runs</label>
+          <label><input type="checkbox" value="delta">deltas</label>
+        </div>
+      </div>
+      <ol class="stream mono" id="stream" aria-live="off"></ol>
+    </div>
+  </section>
+</main>
+<footer class="foot wrap mono">github.com/ecociel/agent-harness · examples/webchat · stdlib net/http, embedded assets, works offline</footer>
+<script src="app.js"></script>
+</body>
+</html>
