@@ -20,3 +20,29 @@ jobs:
         run: go vet ./...
       - name: test
         run: go test -race ./...
+  journal-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: journal
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: journal/postgres/go.sum
+      - name: test
+        working-directory: journal/postgres
+        env:
+          JOURNAL_POSTGRES_DSN: postgres://postgres:test@127.0.0.1:5432/journal?sslmode=disable
+        run: go test -race ./...
