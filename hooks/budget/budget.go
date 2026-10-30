@@ -1,25 +1,27 @@
-// Package budget caps what runs may consume: tokens (total, input, output),
+// Package budget caps what a run may consume: tokens (total, input, output),
 // money, wall-clock time, model calls and tool calls. It also detects the
 // most common runaway, the same tool call repeated with the same arguments.
 //
-// A Budget is shared state: attach the same *Budget to several agents (or to
-// every run of a Session) and they draw from one pool. Child carves a
-// sub-budget out of the parent's remaining allowance for a sub-agent; spend
-// in the child is debited from the parent too, so a tree of agents can never
-// overspend its root. This follows ecociel/agents budget/budget.go.
+// A Budget holds limits and no spend. Everything it compares against comes from the
+// Run it is handed, which is the fold of the journal, so a budget survives a crash,
+// a resume on another machine and a fresh Budget value with nothing to restore.
 //
-// Checks happen at three points:
+// A Run knows its own spend, not its tree's or its tenant's. Those totals are the
+// consumer's: project usage in Journal.Append, where (RunID, Seq) is unique, so each
+// reply counts once, and hand the projection to WithPool. Parallel branches race the
+// check, so a shared limit can overshoot by the calls already in flight.
 //
-//   - BeforeModel: refuse the call if a limit is already reached, or if the
-//     estimated input alone would exceed the token limit (pre-flight);
-//   - AfterModel: charge the real usage reported by the provider;
-//   - AfterTurn: count tool calls and detect repeated identical calls.
+// Checks happen at two points:
+//
+//   - BeforeRun: refuse a worker if a limit is already reached;
+//   - BeforeModel: refuse the call if a limit is reached, if the same tool call has
+//     repeated too often, or if the estimated input alone would exceed the token
+//     limit (pre-flight).
 package budget
 
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/ecociel/agent-harness"
@@ -48,23 +50,24 @@ type Price struct {
 
 // Spent is what has been consumed so far.
 type Spent struct {
-	Usage      model.Usage   `json:"usage"`
-	CostUSD    float64       `json:"cost_usd"`
+	Usage model.Usage `json:"usage"`
+	// ModelCalls counts every call that may have been billed: answered ones and
+	// ones a crash cut off.
 	ModelCalls int           `json:"model_calls"`
 	ToolCalls  int           `json:"tool_calls"`
+	CostUSD    float64       `json:"cost_usd"`
 	Elapsed    time.Duration `json:"elapsed_ns"`
 }
 
-// Budget is the budget hook and the shared allowance. Safe for concurrent
-// use.
+// Pool reports what a whole tree or tenant has spent, from the consumer's own
+// projection of the journal.
+type Pool func(ctx context.Context, r harness.Run) (Spent, error)
+
+// Budget is the budget hook. Safe for concurrent use: it holds nothing that changes.
 type Budget struct {
 	limits Limits
 	price  Price
-	parent *Budget
-
-	mu    sync.Mutex
-	start time.Time
-	spent Spent
+	pool   Pool
 }
 
 // New returns a budget with the given limits.
@@ -72,9 +75,13 @@ func New(l Limits) *Budget { return &Budget{limits: l} }
 
 // WithPrice sets the price used for CostUSD and returns b.
 func (b *Budget) WithPrice(p Price) *Budget {
-	b.mu.Lock()
 	b.price = p
-	b.mu.Unlock()
+	return b
+}
+
+// WithPool makes the limits apply to what pool reports instead of to one run.
+func (b *Budget) WithPool(pool Pool) *Budget {
+	b.pool = pool
 	return b
 }
 
@@ -84,95 +91,24 @@ func (b *Budget) Limits() Limits { return b.limits }
 // Name implements harness.Hook.
 func (b *Budget) Name() string { return "budget" }
 
-// Child returns a sub-budget for a sub-agent: each limit is the smaller of
-// want and what b has left (a zero want inherits b's remaining). Spend in the
-// child is also charged to b.
-func (b *Budget) Child(want Limits) *Budget {
-	rem := b.Remaining()
-	pick := func(w, r, lim int) int {
-		if lim == 0 {
-			return w
-		}
-		if w == 0 || w > r {
-			return r
-		}
-		return w
-	}
-	l := Limits{
-		Tokens:       pick(want.Tokens, rem.Tokens, b.limits.Tokens),
-		InputTokens:  pick(want.InputTokens, rem.InputTokens, b.limits.InputTokens),
-		OutputTokens: pick(want.OutputTokens, rem.OutputTokens, b.limits.OutputTokens),
-		ModelCalls:   pick(want.ModelCalls, rem.ModelCalls, b.limits.ModelCalls),
-		ToolCalls:    pick(want.ToolCalls, rem.ToolCalls, b.limits.ToolCalls),
-		CostUSD:      want.CostUSD,
-		Wall:         want.Wall,
-		RepeatCalls:  want.RepeatCalls,
-	}
-	if b.limits.CostUSD > 0 && (l.CostUSD == 0 || l.CostUSD > rem.CostUSD) {
-		l.CostUSD = rem.CostUSD
-	}
-	if b.limits.Wall > 0 && (l.Wall == 0 || l.Wall > rem.Wall) {
-		l.Wall = rem.Wall
-	}
-	b.mu.Lock()
-	price := b.price
-	b.mu.Unlock()
-	return &Budget{limits: l, price: price, parent: b}
+// Spent derives what r has consumed. Time spent suspended is not counted: a run
+// waiting a week for a signal has used none of its wall-clock limit.
+func (b *Budget) Spent(r harness.Run) Spent {
+	return Spent{Usage: r.Usage, ModelCalls: r.ModelCalls + r.LostCalls, ToolCalls: r.ToolCalls,
+		CostUSD: float64(r.Usage.Input)*b.price.InputPerM/1e6 + float64(r.Usage.Output)*b.price.OutputPerM/1e6,
+		Elapsed: time.Since(r.Started) - r.Waited}
 }
 
-// Charge records usage from one model call (and its parents').
-func (b *Budget) Charge(u model.Usage) {
-	b.mu.Lock()
-	b.spent.Usage = b.spent.Usage.Add(u)
-	b.spent.ModelCalls++
-	b.spent.CostUSD += float64(u.Input)*b.price.InputPerM/1e6 + float64(u.Output)*b.price.OutputPerM/1e6
-	b.mu.Unlock()
-	if b.parent != nil {
-		b.parent.Charge(u)
+func (b *Budget) current(ctx context.Context, r harness.Run) (Spent, error) {
+	if b.pool == nil {
+		return b.Spent(r), nil
 	}
+	return b.pool(ctx, r)
 }
 
-func (b *Budget) chargeTools(n int) {
-	b.mu.Lock()
-	b.spent.ToolCalls += n
-	b.mu.Unlock()
-	if b.parent != nil {
-		b.parent.chargeTools(n)
-	}
-}
-
-// Spent returns what has been consumed.
-func (b *Budget) Spent() Spent {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s := b.spent
-	if !b.start.IsZero() {
-		s.Elapsed = time.Since(b.start)
-	}
-	return s
-}
-
-// Remaining returns the allowance left per limit (zero for unlimited fields
-// and for exhausted ones; check Limits to tell them apart).
-func (b *Budget) Remaining() Limits {
-	s := b.Spent()
-	sub := func(lim, used int) int { return max(0, lim-used) }
-	r := Limits{
-		Tokens:       sub(b.limits.Tokens, s.Usage.Total()),
-		InputTokens:  sub(b.limits.InputTokens, s.Usage.Input),
-		OutputTokens: sub(b.limits.OutputTokens, s.Usage.Output),
-		ModelCalls:   sub(b.limits.ModelCalls, s.ModelCalls),
-		ToolCalls:    sub(b.limits.ToolCalls, s.ToolCalls),
-		CostUSD:      max(0, b.limits.CostUSD-s.CostUSD),
-		Wall:         max(0, b.limits.Wall-s.Elapsed),
-		RepeatCalls:  b.limits.RepeatCalls,
-	}
-	return r
-}
-
-// Exceeded reports the first limit that is reached, if any.
-func (b *Budget) Exceeded() (string, bool) {
-	l, s := b.limits, b.Spent()
+// Exceeded reports the first limit s has reached, if any.
+func (b *Budget) Exceeded(s Spent) (string, bool) {
+	l := b.limits
 	switch {
 	case l.Tokens > 0 && s.Usage.Total() >= l.Tokens:
 		return fmt.Sprintf("token limit %d reached (%d used)", l.Tokens, s.Usage.Total()), true
@@ -189,80 +125,64 @@ func (b *Budget) Exceeded() (string, bool) {
 	case l.Wall > 0 && s.Elapsed >= l.Wall:
 		return fmt.Sprintf("time limit %s reached", l.Wall), true
 	}
-	if b.parent != nil {
-		if why, ok := b.parent.Exceeded(); ok {
-			return "parent budget: " + why, true
+	return "", false
+}
+
+// repeats returns a call the run has now made RepeatCalls times with identical
+// arguments, read from the recorded replies.
+func (b *Budget) repeats(r harness.Run) (string, bool) {
+	seen := map[string]int{}
+	for _, e := range r.Events {
+		if e.Kind != harness.KindModelDone {
+			continue
+		}
+		for _, c := range e.Reply.ToolCalls {
+			k := c.Name + "\x00" + string(c.Arguments)
+			seen[k]++
+			if seen[k] >= b.limits.RepeatCalls {
+				return fmt.Sprintf("%s called %d times with identical arguments", c.Name, seen[k]), true
+			}
 		}
 	}
 	return "", false
 }
 
-// BeforeRun starts the wall clock on first use.
-func (b *Budget) BeforeRun(context.Context, *harness.Run) error {
-	b.mu.Lock()
-	if b.start.IsZero() {
-		b.start = time.Now()
+func (b *Budget) check(ctx context.Context, r harness.Run) (Spent, error) {
+	s, err := b.current(ctx, r)
+	if err != nil {
+		return s, err
 	}
-	b.mu.Unlock()
-	if b.parent != nil {
-		_ = b.parent.BeforeRun(context.Background(), nil)
+	if why, ok := b.Exceeded(s); ok {
+		return s, harness.Stop(harness.StopBudget, why)
 	}
-	if why, ok := b.Exceeded(); ok {
-		return harness.Stop(harness.StopBudget, why)
-	}
-	return nil
+	return s, nil
 }
 
-// BeforeModel refuses the call when a limit is reached or the estimated
-// input would not fit.
-func (b *Budget) BeforeModel(_ context.Context, r *harness.Run, req *model.Request) error {
-	if why, ok := b.Exceeded(); ok {
-		return harness.Stop(harness.StopBudget, why)
+// BeforeRun refuses a worker when a limit is already reached.
+func (b *Budget) BeforeRun(ctx context.Context, r harness.Run) error {
+	_, err := b.check(ctx, r)
+	return err
+}
+
+// BeforeModel refuses the call when a limit is reached, a call repeats, or the
+// estimated input would not fit.
+func (b *Budget) BeforeModel(ctx context.Context, r harness.Run, req *model.Request) error {
+	s, err := b.check(ctx, r)
+	if err != nil {
+		return err
+	}
+	if b.limits.RepeatCalls > 0 {
+		if why, ok := b.repeats(r); ok {
+			return harness.Stop(harness.StopLoop, why)
+		}
 	}
 	if b.limits.Tokens > 0 {
 		est := model.EstimateTokens(req.Messages)
-		if left := b.Remaining().Tokens; est > left {
-			return harness.Stop(harness.StopBudget,
-				fmt.Sprintf("estimated input %d tokens exceeds remaining %d", est, left))
+		left := max(0, b.limits.Tokens-s.Usage.Total())
+		if est > left {
+			return harness.Stop(harness.StopBudget, fmt.Sprintf("estimated input %d tokens exceeds remaining %d", est, left))
 		}
-		r.Note(b.Name(), "pre-flight ~%d input tokens, %d left", est, b.Remaining().Tokens)
-	}
-	return nil
-}
-
-// AfterModel charges the real usage.
-func (b *Budget) AfterModel(_ context.Context, r *harness.Run, resp *model.Response) error {
-	b.Charge(resp.Usage)
-	sp := b.Spent()
-	if b.limits.Tokens > 0 {
-		r.Note(b.Name(), "+%d tokens → %d/%d", resp.Usage.Total(), sp.Usage.Total(), b.limits.Tokens)
-	} else {
-		r.Note(b.Name(), "+%d tokens → %d", resp.Usage.Total(), sp.Usage.Total())
-	}
-	return nil
-}
-
-// AfterTurn counts tool calls and detects repeated identical calls.
-func (b *Budget) AfterTurn(_ context.Context, r *harness.Run) error {
-	b.chargeTools(len(r.Last.ToolCalls))
-	if b.limits.RepeatCalls > 0 {
-		seen, _ := r.Value("budget.repeats").(map[string]int)
-		if seen == nil {
-			seen = map[string]int{}
-		}
-		for _, c := range r.Last.ToolCalls {
-			k := c.Name + "\x00" + string(c.Arguments)
-			seen[k]++
-			if seen[k] >= b.limits.RepeatCalls {
-				r.Set("budget.repeats", seen)
-				return harness.Stop(harness.StopLoop,
-					fmt.Sprintf("%s called %d times with identical arguments", c.Name, seen[k]))
-			}
-		}
-		r.Set("budget.repeats", seen)
-	}
-	if why, ok := b.Exceeded(); ok {
-		return harness.Stop(harness.StopBudget, why)
+		harness.Note(ctx, "pre-flight ~%d input tokens, %d left", est, left)
 	}
 	return nil
 }

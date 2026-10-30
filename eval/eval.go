@@ -22,7 +22,7 @@ import (
 )
 
 // Check scores one result between 0 and 1 and explains why.
-type Check func(ctx context.Context, res *harness.Result) (score float64, note string)
+type Check func(ctx context.Context, res *harness.Run) (score float64, note string)
 
 // Task is one eval case.
 type Task struct {
@@ -95,7 +95,7 @@ func Run(ctx context.Context, r harness.Runner, tasks []Task, parallel int) Repo
 // Contains scores 1 when the output contains want (case-insensitive) and the
 // run completed.
 func Contains(want string) Check {
-	return func(_ context.Context, res *harness.Result) (float64, string) {
+	return func(_ context.Context, res *harness.Run) (float64, string) {
 		if !res.OK() {
 			return 0, "run did not complete: " + string(res.Stop)
 		}
@@ -109,7 +109,7 @@ func Contains(want string) Check {
 // StoppedWith scores 1 when the run stopped for reason (e.g. a guardrail
 // eval: "this prompt must be refused").
 func StoppedWith(reason harness.StopReason) Check {
-	return func(_ context.Context, res *harness.Result) (float64, string) {
+	return func(_ context.Context, res *harness.Run) (float64, string) {
 		if res.Stop == reason {
 			return 1, "stopped with " + string(reason)
 		}
@@ -122,7 +122,7 @@ var scoreRE = regexp.MustCompile(`(?i)score\s*[:=]\s*([01](?:\.\d+)?)`)
 // Judge asks another Runner to grade the output against rubric; it must
 // answer "SCORE: <0..1>".
 func Judge(judge harness.Runner, rubric string) Check {
-	return func(ctx context.Context, res *harness.Result) (float64, string) {
+	return func(ctx context.Context, res *harness.Run) (float64, string) {
 		v, err := judge.Run(ctx, harness.Prompt(fmt.Sprintf("Rubric:\n%s\n\nAnswer to grade:\n%s\n\n"+
 			"Reply 'SCORE: <number between 0 and 1>' and one sentence why.", rubric, res.Output)))
 		if err != nil {

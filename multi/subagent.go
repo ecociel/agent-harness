@@ -3,7 +3,10 @@ package multi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/ecociel/agent-harness"
@@ -21,6 +24,12 @@ import (
 // window. Because delegation is an ordinary tool, every policy hook on the
 // lead (guard, approval, budget) applies to it too. Depth is capped so
 // delegation cannot recurse forever.
+//
+// The child's run ID is the call's idempotency key, so a repeated call reaches the
+// same child and a finished child answers from its journal. That is why the tool is
+// EffectIdempotent whatever the child does: the child's own tools carry their own
+// classes. A child's waits surface at the root, and a signal sent there comes back
+// down through this tool.
 type Subagent struct {
 	Name        string
 	Description string
@@ -45,7 +54,8 @@ func (sa Subagent) maxDepth() int {
 // Tool returns the foreground delegation tool: it blocks until the
 // sub-agent finishes and returns its answer.
 func (sa Subagent) Tool() tool.Tool {
-	spec := tool.Spec{Name: sa.Name, Description: sa.Description, Parameters: taskSchema, Risk: sa.Risk}
+	spec := tool.Spec{Name: sa.Name, Description: sa.Description, Parameters: taskSchema, Risk: sa.Risk,
+		Effect: tool.EffectIdempotent}
 	return tool.Func(spec, func(ctx context.Context, raw json.RawMessage) (string, error) {
 		task, err := parseTask(raw)
 		if err != nil {
@@ -59,15 +69,22 @@ func (sa Subagent) delegate(ctx context.Context, task string) (string, error) {
 	if d := harness.Depth(ctx); d > sa.maxDepth() {
 		return "", fmt.Errorf("delegation depth %d exceeds limit %d", d, sa.maxDepth())
 	}
-	s := open(ctx, "subagent", sa.Name)
-	s.emit("delegate", task, nil)
-	res, err := s.run(sa.Agent, harness.Prompt(task))
-	if err != nil {
-		_, _ = s.fail(harness.Prompt(task), err)
-		return "", err
-	}
-	_, _ = s.done(harness.Prompt(task), res.Output, res.Stop, res.Detail, nil)
-	if !res.OK() {
+	in := harness.Prompt(task)
+	in.RunID, in.Signals = tool.IdempotencyKey(ctx), harness.Signals(ctx)
+	harness.Emit(ctx, harness.Event{Kind: harness.KindPattern, Agent: sa.Name, Hook: "subagent", Outcome: "delegate"})
+	res, err := deliver(ctx, sa.Agent, in)
+	return sa.result(res, err)
+}
+
+// result maps a child's run onto what its tool call returns. A child that stopped or
+// parked stops or parks the call, so the lead's model never hears of either.
+func (sa Subagent) result(res *harness.Run, err error) (string, error) {
+	switch {
+	case res == nil:
+		return "", stopped(err)
+	case res.State == harness.StateSuspended:
+		return "", harness.Suspend(res.Waits...)
+	case !res.OK():
 		return fmt.Sprintf("sub-agent %s stopped (%s): %s\npartial output: %s", sa.Name, res.Stop, res.Detail, res.Output), nil
 	}
 	return res.Output, nil
@@ -103,18 +120,22 @@ func WithSubagents(lead *harness.Agent, subs ...Subagent) (*harness.Agent, error
 // subagents): start_<name> returns a job id immediately, and collect returns
 // the job's status or result. The lead can start several jobs in one turn and
 // keep working while they run. Safe for concurrent use.
+//
+// A job's id is its child's run ID, so a job survives this value and this process.
+// collect on an id it does not know attaches to the child's journal. start returns
+// only once the child's input is durable, so a crash cannot leave the lead holding
+// the id of a job that never existed.
 type Background struct {
 	subs []Subagent
 
 	mu   sync.Mutex
 	jobs map[string]*job
-	n    int
 }
 
 type job struct {
-	done   chan struct{}
-	output string
-	err    error
+	done chan struct{}
+	res  *harness.Run
+	err  error
 }
 
 // NewBackground returns a background pool over subs.
@@ -127,7 +148,7 @@ func (b *Background) Tools() []tool.Tool {
 	var out []tool.Tool
 	for _, sa := range b.subs {
 		spec := tool.Spec{Name: "start_" + sa.Name, Description: "Start in the background: " + sa.Description,
-			Parameters: taskSchema, Risk: sa.Risk}
+			Parameters: taskSchema, Risk: sa.Risk, Effect: tool.EffectIdempotent}
 		out = append(out, tool.Func(spec, func(ctx context.Context, raw json.RawMessage) (string, error) {
 			task, err := parseTask(raw)
 			if err != nil {
@@ -137,6 +158,7 @@ func (b *Background) Tools() []tool.Tool {
 		}))
 	}
 	collect := tool.Spec{Name: "collect", Description: "Get the result of a background job. Set wait=true to block until it finishes.",
+		Effect:     tool.EffectRead,
 		Parameters: json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"},"wait":{"type":"boolean"}},"required":["id"]}`)}
 	out = append(out, tool.Func(collect, func(ctx context.Context, raw json.RawMessage) (string, error) {
 		var a struct {
@@ -151,30 +173,51 @@ func (b *Background) Tools() []tool.Tool {
 	return out
 }
 
-func (b *Background) start(ctx context.Context, sa Subagent, task string) string {
+// launch runs a job, or finds the one already running.
+func (b *Background) launch(ctx context.Context, sa Subagent, in harness.Input) *job {
 	b.mu.Lock()
-	b.n++
-	id := fmt.Sprintf("job-%d", b.n)
+	defer b.mu.Unlock()
+	if j, ok := b.jobs[in.RunID]; ok {
+		return j
+	}
 	j := &job{done: make(chan struct{})}
-	b.jobs[id] = j
-	b.mu.Unlock()
+	b.jobs[in.RunID] = j
 	// The job outlives the tool call (and the turn) that started it, but
-	// keeps the context's values: event sinks, tracer, depth and parent.
+	// keeps the context's values: event sinks, journal, depth and parent.
 	ctx = context.WithoutCancel(ctx)
 	go func() {
 		defer close(j.done)
-		j.output, j.err = sa.delegate(ctx, task)
+		j.res, j.err = deliver(ctx, sa.Agent, in)
 	}()
-	return fmt.Sprintf(`{"job":%q,"status":"running"}`, id)
+	return j
+}
+
+func (b *Background) start(ctx context.Context, sa Subagent, task string) string {
+	in := harness.Prompt(task)
+	in.RunID = sa.Name + "/" + tool.IdempotencyKey(ctx)
+	durable := make(chan struct{})
+	var once sync.Once
+	ctx = harness.WithEvents(ctx, func(e harness.Event) {
+		if e.RunID == in.RunID && e.Seq > 0 {
+			once.Do(func() { close(durable) })
+		}
+	})
+	j := b.launch(ctx, sa, in)
+	select {
+	case <-durable:
+	case <-j.done:
+	}
+	return fmt.Sprintf(`{"job":%q,"status":"running"}`, in.RunID)
 }
 
 func (b *Background) collect(ctx context.Context, id string, wait bool) (string, error) {
-	b.mu.Lock()
-	j, ok := b.jobs[id]
-	b.mu.Unlock()
-	if !ok {
+	name, _, _ := strings.Cut(id, "/")
+	i := slices.IndexFunc(b.subs, func(sa Subagent) bool { return sa.Name == name })
+	if i < 0 {
 		return "", fmt.Errorf("no job %q", id)
 	}
+	sa := b.subs[i]
+	j := b.launch(ctx, sa, harness.Input{RunID: id, Signals: harness.Signals(ctx)})
 	if wait {
 		select {
 		case <-j.done:
@@ -184,13 +227,16 @@ func (b *Background) collect(ctx context.Context, id string, wait bool) (string,
 	}
 	select {
 	case <-j.done:
-		if j.err != nil {
-			return "", j.err
-		}
-		return j.output, nil
 	default:
 		return fmt.Sprintf(`{"job":%q,"status":"running"}`, id), nil
 	}
+	b.mu.Lock()
+	delete(b.jobs, id) // the journal holds the outcome, and the next collect asks it
+	b.mu.Unlock()
+	if errors.Is(j.err, harness.ErrNoSuchRun) {
+		return "", fmt.Errorf("no job %q", id) // the id came from the model
+	}
+	return sa.result(j.res, j.err)
 }
 
 // Wait blocks until every started job has finished (for tests and clean

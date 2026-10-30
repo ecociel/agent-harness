@@ -51,3 +51,32 @@ func TestPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestAskSuspendsAndAnySignalDecides(t *testing.T) {
+	for _, tt := range []struct {
+		value   string
+		wantRan bool
+	}{{approval.Approved, true}, {"no", false}} {
+		ran := false
+		pay := tool.Func(tool.Spec{Name: "pay", Risk: tool.RiskDangerous},
+			func(context.Context, json.RawMessage) (string, error) { ran = true; return "paid", nil })
+		j := harness.NewMemJournal()
+		build := func() *harness.Agent {
+			return &harness.Agent{Journal: j, Provider: fake.Script(fake.Call("pay", nil), fake.Text("done")),
+				Tools: tool.NewRegistry(pay), Hooks: []harness.Hook{&approval.Policy{Threshold: tool.RiskWrite, Ask: true}}}
+		}
+		in := harness.Prompt("pay")
+		in.RunID = "r"
+		res, err := build().Run(context.Background(), in)
+		if err != nil || res.State != harness.StateSuspended || res.Waits[0].Kind != approval.WaitKind {
+			t.Fatalf("%v %+v", err, res)
+		}
+		if ran {
+			t.Fatal("ran before the answer")
+		}
+		res, err = build().Run(context.Background(), harness.Resume("r", harness.Signal{Wait: res.Waits[0].ID, Value: tt.value, By: "alice"}))
+		if err != nil || ran != tt.wantRan {
+			t.Fatalf("%v ran=%v %+v", err, ran, res)
+		}
+	}
+}

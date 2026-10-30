@@ -2,58 +2,93 @@ package harness
 
 import (
 	"context"
-	"sync/atomic"
+	"encoding/json"
 	"time"
+
+	"github.com/ecociel/agent-harness/model"
+	"github.com/ecociel/agent-harness/tool"
 )
 
-// EventKind classifies an Event.
-type EventKind string
+// Kind classifies an Event.
+type Kind string
 
-// Event kinds.
+// Durable kinds. These are the journal: Seq > 0, recorded before anything acts
+// on them, and everything about a run is a fold over them.
 const (
-	// KindRunStart and KindRunEnd bracket one Agent.Run.
-	KindRunStart EventKind = "run.start"
-	KindRunEnd   EventKind = "run.end"
-	// KindTransition is one state-machine edge (From → To).
-	KindTransition EventKind = "transition"
-	// KindHook is one hook invocation at Point, with Outcome and Duration.
-	KindHook EventKind = "hook"
-	// KindDelta is one streamed text chunk (Text).
-	KindDelta EventKind = "delta"
-	// KindModel is one completed model call (Data: usage, finish, tool calls).
-	KindModel EventKind = "model"
-	// KindTool is one completed tool call (Hook holds the tool name).
-	KindTool EventKind = "tool"
-	// KindPattern is emitted by multi-agent patterns for their own steps
-	// (fan-out, judge verdicts, handoffs, board claims).
-	KindPattern EventKind = "pattern"
+	KindRunStarted    Kind = "run.started"    // identity, Pin, input
+	KindRunClaimed    Kind = "run.claimed"    // a worker took the run; fences the previous one
+	KindHistoryEdited Kind = "history.edited" // a Context hook's durable edit
+	KindModelStarted  Kind = "model.started"  // intent: a paid call is about to happen
+	KindModelDone     Kind = "model.done"     // the reply and its usage
+	KindModelFailed   Kind = "model.failed"   // classified failure and the recovery decided
+	KindModelLost     Kind = "model.lost"     // a started call has no outcome: billing unknown
+	KindToolGated     Kind = "tool.gated"     // a BeforeTool decision
+	KindToolStarted   Kind = "tool.started"   // intent: the effect is about to happen
+	KindToolDone      Kind = "tool.done"      // the result for the model
+	KindToolLost      Kind = "tool.lost"      // a started call has no outcome
+	KindWaitResolved  Kind = "wait.resolved"  // a signal arrived, or the wait expired
+	KindOutputChecked Kind = "output.checked" // the CheckOutput verdict
+	KindRunStopping   Kind = "run.stopping"   // the run will end for this reason
+	KindRunEnded      Kind = "run.ended"      // AfterRun hooks ran
 )
 
-// Event is the unit of observability. Every state change and every hook
-// invocation produces one, so a sink sees the complete execution of a run,
-// including nested sub-agents (which carry Depth > 0 and ParentRun).
+// Ephemeral kinds. Seq is 0. They go to sinks only and nothing depends on them.
+const (
+	KindDelta   Kind = "delta"   // one streamed text chunk
+	KindHook    Kind = "hook"    // one hook invocation: Point, Outcome, Duration
+	KindPattern Kind = "pattern" // a multi-agent pattern step
+)
+
+// Event is the one record of what happened. The journal stores events, sinks
+// receive the same events, and a run is a fold over them, so there is no second
+// vocabulary to keep in step. Kind says which payload fields are set. Only the
+// harness writes durable events.
 type Event struct {
-	Seq       int64          `json:"seq"`
-	Time      time.Time      `json:"time"`
-	Kind      EventKind      `json:"kind"`
-	RunID     string         `json:"run_id,omitempty"`
-	ParentRun string         `json:"parent_run,omitempty"`
-	Agent     string         `json:"agent,omitempty"`
-	Depth     int            `json:"depth"`
-	Turn      int            `json:"turn,omitempty"`
-	From      State          `json:"from,omitempty"`
-	To        State          `json:"to,omitempty"`
-	Hook      string         `json:"hook,omitempty"`
-	Point     Point          `json:"point,omitempty"`
-	Outcome   string         `json:"outcome,omitempty"`
-	Duration  time.Duration  `json:"duration_ns,omitempty"`
-	Text      string         `json:"text,omitempty"`
-	Data      map[string]any `json:"data,omitempty"`
+	Seq       int64     `json:"seq,omitempty"`
+	Time      time.Time `json:"time"`
+	Kind      Kind      `json:"kind"`
+	RunID     string    `json:"run_id,omitempty"`
+	RootRun   string    `json:"root_run,omitempty"`
+	ParentRun string    `json:"parent_run,omitempty"`
+	Agent     string    `json:"agent,omitempty"`
+	Depth     int       `json:"depth"`
+	Turn      int       `json:"turn,omitempty"`
+	From      State     `json:"from,omitempty"`
+	To        State     `json:"to,omitempty"`
+	// Wake is set on the last event of an append. See Journal.
+	Wake time.Time `json:"wake,omitzero"`
+
+	Hook     string        `json:"hook,omitempty"` // the hook that decided
+	Tool     string        `json:"tool,omitempty"` // tool.*
+	Point    Point         `json:"point,omitempty"`
+	Outcome  string        `json:"outcome,omitempty"`
+	Text     string        `json:"text,omitempty"`
+	Duration time.Duration `json:"duration_ns,omitempty"`
+	Index    int           `json:"index,omitempty"`   // tool.*: the call's position in the batch
+	Attempt  int           `json:"attempt,omitempty"` // model.*, tool.started
+
+	Pin      *Pin            `json:"pin,omitempty"`      // run.started
+	Messages []model.Message `json:"messages,omitempty"` // run.started
+	Drift    *Drift          `json:"drift,omitempty"`    // run.claimed
+	Edit     *Edit           `json:"edit,omitempty"`     // history.edited
+	Offered  []string        `json:"offered,omitempty"`  // model.started
+	Reply    *model.Response `json:"reply,omitempty"`    // model.done
+	Failure  *Failure        `json:"failure,omitempty"`  // model.failed, run.stopping
+	Recovery *Recovery       `json:"recovery,omitempty"` // model.failed
+	Decision *Decision       `json:"decision,omitempty"` // tool.gated
+	Effect   tool.Effect     `json:"effect,omitempty"`   // tool.gated
+	Handoff  *tool.Handoff   `json:"handoff,omitempty"`  // tool.done
+	Waits    []Wait          `json:"waits,omitempty"`    // the waits this event opens
+	Signal   *Signal         `json:"signal,omitempty"`   // wait.resolved
+	Verdict  *Verdict        `json:"verdict,omitempty"`  // output.checked
+	Stop     StopReason      `json:"stop,omitempty"`     // run.stopping
 }
 
-// EventSink receives events. It is called synchronously from the run (and,
-// for parallel patterns, from several goroutines), so it must be safe for
-// concurrent use and fast; buffer if you need to do I/O.
+// EventSink receives events. It is called synchronously from the run (and, for
+// parallel tools or patterns, from several goroutines), so it must be safe for
+// concurrent use and fast. A durable event reaches a sink after it is journaled,
+// so a sink can miss the last event before a crash; (RunID, Seq) is unique, and
+// the journal is the source to reconcile from.
 type EventSink func(Event)
 
 type ctxKey int
@@ -61,9 +96,12 @@ type ctxKey int
 const (
 	keySinks ctxKey = iota
 	keyParent
+	keyJournal
+	keyRedactors
+	keySignals
+	keyDrain
+	keyNote
 )
-
-var eventSeq atomic.Int64
 
 // WithEvents returns a context whose runs report to sink, in addition to any
 // sinks already attached. Sub-agents inherit the context and therefore the
@@ -74,19 +112,19 @@ func WithEvents(ctx context.Context, sink EventSink) context.Context {
 	return context.WithValue(ctx, keySinks, next)
 }
 
-// Emit sends ev to every sink on ctx. It fills Seq and Time. Patterns and
-// custom hooks may call it to add their own events.
+// Emit sends ev to every sink on ctx. Multi-agent patterns call it for their
+// ephemeral steps. No redactor runs here, so put step labels in Text and never
+// content.
 func Emit(ctx context.Context, ev Event) {
 	sinks, _ := ctx.Value(keySinks).([]EventSink)
 	if len(sinks) == 0 {
 		return
 	}
-	ev.Seq = eventSeq.Add(1)
 	if ev.Time.IsZero() {
 		ev.Time = time.Now()
 	}
 	if p, ok := ctx.Value(keyParent).(parentInfo); ok && ev.RunID == "" {
-		ev.ParentRun = p.runID
+		ev.ParentRun, ev.RootRun = p.runID, p.root
 		ev.Depth = p.depth + 1
 	}
 	for _, s := range sinks {
@@ -95,23 +133,26 @@ func Emit(ctx context.Context, ev Event) {
 }
 
 // parentInfo is what a run leaves in the context of its tools so that a
-// sub-agent started from a tool knows its parent and depth.
+// sub-agent started from a tool knows its parent, root and depth.
 type parentInfo struct {
 	runID string
+	root  string
 	depth int
 }
 
 // WithParent marks ctx as belonging to runID (a run, or a pattern acting as
-// one): runs and events started with the returned context are its children,
-// one level deeper. Multi-agent patterns use it so their sub-agents nest
-// under them in the event stream.
+// one): runs and events started with the returned context are its children, one
+// level deeper.
 func WithParent(ctx context.Context, runID string) context.Context {
-	return context.WithValue(ctx, keyParent, parentInfo{runID: runID, depth: Depth(ctx)})
+	root := runID
+	if p, ok := ctx.Value(keyParent).(parentInfo); ok {
+		root = p.root
+	}
+	return context.WithValue(ctx, keyParent, parentInfo{runID: runID, root: root, depth: Depth(ctx)})
 }
 
-// Depth returns the nesting depth of a run started with ctx: 0 at the top,
-// 1 inside a tool of a top-level run, and so on. Delegation tools use it to
-// cap recursion.
+// Depth returns the nesting depth of a run started with ctx: 0 at the top, 1
+// inside a tool of a top-level run, and so on.
 func Depth(ctx context.Context) int {
 	if p, ok := ctx.Value(keyParent).(parentInfo); ok {
 		return p.depth + 1
@@ -119,11 +160,138 @@ func Depth(ctx context.Context) int {
 	return 0
 }
 
-// ParentRun returns the ID of the run whose tool (or pattern step) ctx
-// belongs to, or "".
+// ParentRun returns the ID of the run whose tool (or pattern step) ctx belongs
+// to, or "".
 func ParentRun(ctx context.Context) string {
 	if p, ok := ctx.Value(keyParent).(parentInfo); ok {
 		return p.runID
 	}
 	return ""
+}
+
+// Signals returns the signals delivered to the tool call ctx belongs to. A tool
+// that parked uses them on re-invocation. multi.Subagent forwards them to its
+// child's Input.
+func Signals(ctx context.Context) []Signal {
+	s, _ := ctx.Value(keySignals).([]Signal)
+	return s
+}
+
+// WithDrain returns a context for graceful shutdown and the function that starts
+// it. After drain is called, durable runs on the context finish their current
+// step, record it and return ErrDrained, resumable by any process.
+func WithDrain(ctx context.Context) (_ context.Context, drain func()) {
+	ch := make(chan struct{})
+	closed := false
+	return context.WithValue(ctx, keyDrain, ch), func() {
+		if !closed {
+			closed = true
+			close(ch)
+		}
+	}
+}
+
+func draining(ctx context.Context) bool {
+	ch, _ := ctx.Value(keyDrain).(chan struct{})
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// redact rewrites every string an event carries, in place on deep copies.
+// visit is the one path text takes to the journal, the history, the sinks and
+// the hooks. TestRedactionCoversEveryString fails the build's tests if a new
+// string field is added to an event payload and left out of this list.
+func (e *Event) redact(visit func(*string)) {
+	visit(&e.Text)
+	e.Messages = redactMessages(e.Messages, visit)
+	if e.Pin != nil {
+		p := *e.Pin
+		visit(&p.Instructions)
+		e.Pin = &p
+	}
+	if e.Edit != nil {
+		ed := *e.Edit
+		ed.With = redactMessages(ed.With, visit)
+		e.Edit = &ed
+	}
+	if e.Reply != nil {
+		r := *e.Reply
+		visit(&r.Text)
+		r.ToolCalls = redactCalls(r.ToolCalls, visit)
+		r.Opaque = redactRaw(r.Opaque, visit)
+		e.Reply = &r
+	}
+	if e.Failure != nil {
+		f := *e.Failure
+		visit(&f.Detail)
+		e.Failure = &f
+	}
+	if e.Decision != nil {
+		d := *e.Decision
+		visit(&d.Reason)
+		e.Decision = &d
+	}
+	if e.Handoff != nil {
+		h := *e.Handoff
+		visit(&h.Note)
+		e.Handoff = &h
+	}
+	if e.Waits != nil {
+		w := append([]Wait(nil), e.Waits...)
+		for i := range w {
+			visit(&w[i].Detail)
+		}
+		e.Waits = w
+	}
+	if e.Signal != nil {
+		s := *e.Signal
+		visit(&s.Value)
+		e.Signal = &s
+	}
+	if e.Verdict != nil {
+		v := *e.Verdict
+		visit(&v.Feedback)
+		visit(&v.Rewrite)
+		e.Verdict = &v
+	}
+}
+
+func redactMessages(ms []model.Message, visit func(*string)) []model.Message {
+	if ms == nil {
+		return nil
+	}
+	out := append([]model.Message(nil), ms...)
+	for i := range out {
+		visit(&out[i].Content)
+		out[i].ToolCalls = redactCalls(out[i].ToolCalls, visit)
+		out[i].Opaque = redactRaw(out[i].Opaque, visit)
+	}
+	return out
+}
+
+func redactCalls(cs []model.ToolCall, visit func(*string)) []model.ToolCall {
+	if cs == nil {
+		return nil
+	}
+	out := append([]model.ToolCall(nil), cs...)
+	for i := range out {
+		out[i].Arguments = redactRaw(out[i].Arguments, visit)
+	}
+	return out
+}
+
+func redactRaw(raw json.RawMessage, visit func(*string)) json.RawMessage {
+	if raw == nil {
+		return nil
+	}
+	s := string(raw)
+	visit(&s)
+	return json.RawMessage(s)
 }

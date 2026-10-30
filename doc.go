@@ -1,61 +1,62 @@
-// Package harness is a small, dependency-free base for building agents in
-// Go: a model-plus-tools loop driven by an explicit state machine, with
-// plugin points where hooks attach, and multi-agent patterns (package multi)
-// built from the same pieces.
+// Package harness is a small, dependency-free base for building agents in Go: a
+// model-plus-tools loop that is durable by construction, with plugin points where
+// consumer detail attaches, and multi-agent patterns (package multi) built from
+// the same pieces.
 //
 // # The idea
 //
-// Almost every agent is "an LLM running in a loop calling tools". What makes
-// harnesses differ is what they do at specific moments of that loop:
-// summarise before the model call, wrap the model call in retries and spans,
-// veto a tool call, offload a huge tool result, check the final answer. This
-// package makes those moments explicit states and plugin points, so the core
-// loop stays tiny and every concern is a hook you can read on its own.
+// The truth about a run is an append-only journal of events. Fold computes a Run
+// from the journal, and a private pure function picks the next step from that Run.
+// A thin shell does the step, records what happened and loops. Nothing else holds
+// state, so a run survives a crash at every step, and resuming on another machine
+// is the same code as continuing on this one.
+//
+// A run with no Journal uses this same path over a slice:
+//
+//	res, err := agent.Run(ctx, harness.Prompt("hello"))
+//
+// With a Journal, Run is idempotent on Input.RunID. The same call from any process
+// starts, resumes or returns the run, and it is also how a signal is delivered:
+//
+//	res, err := agent.Run(ctx, harness.Resume(id, harness.Signal{Wait: w, Value: "yes"}))
 //
 // # The state machine
 //
-// The outer loop is one task (an episode). The inner loop is one model/tool
-// turn, repeated until the model answers without asking for tools.
+//	start ─▶ compose ─▶ model ─▶ gate ─▶ tools ─┐
+//	            ▲          │       │       │    │
+//	            └──────────┼───────┴───────┴────┘ one model/tool turn
+//	            ▲          ▼
+//	            └────── verify ─▶ closing ─▶ done | stopped | failed
 //
-//	                 ┌─────────────── outer loop ────────────────┐
-//	start ─▶ prepare ─▶ compose ─▶ model ─▶ route ─▶ verify ─▶ done
-//	                      ▲                   │        │
-//	                      │     inner loop    ▼        │ revise
-//	                      └── observe ◀── tools        │ (repair)
-//	                      ▲                            │
-//	                      └────────────────────────────┘
+//	gate, tools or a long backoff ─▶ suspended ─▶ gate | compose
+//	every live state ─▶ closing, on a decided stop
 //
-//	every non-terminal state ─▶ stopped (on purpose) | failed (error)
-//
-// The legal edges are data (Transitions); the machine refuses anything else.
-// Result.Path records the states a run visited.
+// The legal edges are data (Transitions), keyed by the event that takes them.
+// Fold refuses anything else, so a journal cannot hold a walk the machine forbids.
 //
 // # Plugin points
 //
-//	State     Point          Typical hooks
-//	prepare   BeforeRun      input guardrail, run span, budget admission
-//	compose   BeforeModel    compaction/summarisation, model profiles, budget pre-flight
-//	model     WrapModel      retry/fallback, model span, latency metrics
-//	model     OnDelta        live streaming to a UI
-//	model     AfterModel     token accounting, budget charge
-//	tools     BeforeTool     guardrail veto, scopes, human approval
-//	tools     WrapTool       tool span, result offloading, timeouts
-//	tools     AfterTool      tool metrics, trajectory recording
-//	observe   AfterTurn      loop detection, checkpoints
-//	verify    CheckOutput    output guardrail, redaction, verifiers
-//	terminal  AfterRun       close spans, run metrics, trajectories
-//	any       OnTransition   state-level tracing
+//	State     Point          Decides                          Recorded as
+//	any       Redact         what text may exist              every durable event
+//	claim     BeforeRun      admission, revocation            run.stopping
+//	compose   Context        durable history edits            history.edited
+//	compose   BeforeModel    this request only                nothing
+//	model     WrapModel      the wire stream                  nothing
+//	model     Recover        retry, backoff, fallback         model.failed
+//	gate      BeforeTool     allow, deny, halt, await         tool.gated
+//	tools     WrapTool       how one call runs                tool.done
+//	verify    CheckOutput    accept, rewrite, revise, block   output.checked
+//	closing   AfterRun       saving memory, flushing          run.ended
 //
-// A hook is any value with a Name method that also implements one or more
-// of the point interfaces (BeforeRunHook, ModelMiddleware, …). Built-in hooks
-// live under hooks/.
+// A hook is any value with a Name method that also implements one or more point
+// interfaces. A hook returns a value and the shell records it, so Fold never runs
+// a hook and a decision cannot come out differently on replay.
 //
 // # Observability
 //
-// Every transition and every hook invocation is emitted as an Event to the
-// sinks on the context (WithEvents), including those of sub-agents, which
-// carry their depth and parent run. The web chat example renders this stream
-// live.
+// The journal and the event stream are one vocabulary. Every durable event reaches
+// the sinks on the context (WithEvents) after it is stored, along with ephemeral
+// deltas and hook timings. Sub-agents inherit the sinks.
 //
 // # Providers
 //

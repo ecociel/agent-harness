@@ -14,10 +14,12 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Role says who authored a Message.
@@ -35,12 +37,21 @@ const (
 //
 // For RoleAssistant, ToolCalls holds the calls the model asked for. For
 // RoleTool, ToolCallID names the call this message answers and Name the tool.
+//
+// Source is provenance: who put a message into the history when it was neither
+// the caller nor the model ("memory:kb-12", "compact", "verify"). Guardrails use
+// it to treat injected context as untrusted. Providers ignore it.
+//
+// Opaque is provider state that must go back verbatim on the next call (thinking
+// signatures, response ids). Only the provider that produced it may read it.
 type Message struct {
-	Role       Role       `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role       Role            `json:"role"`
+	Content    string          `json:"content"`
+	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Name       string          `json:"name,omitempty"`
+	Source     string          `json:"source,omitempty"`
+	Opaque     json.RawMessage `json:"opaque,omitempty"`
 }
 
 // System returns a system message.
@@ -122,7 +133,44 @@ const (
 	FinishLength        FinishReason = "length"
 	FinishToolCalls     FinishReason = "tool_calls"
 	FinishContentFilter FinishReason = "content_filter"
+	FinishRefusal       FinishReason = "refusal"
 )
+
+// ErrorClass is the vocabulary a recovery policy reasons over. Provider
+// adapters classify; the harness records the class; a RecoverHook decides.
+type ErrorClass string
+
+// Error classes.
+const (
+	ClassUnknown       ErrorClass = "unknown"
+	ClassTransient     ErrorClass = "transient"      // 5xx, connection reset: safe to retry
+	ClassRateLimit     ErrorClass = "rate_limit"     // 429: retry after RetryAfter
+	ClassContextLength ErrorClass = "context_length" // compact, then retry
+	ClassInvalid       ErrorClass = "invalid"        // 400: retrying cannot help
+	ClassAuth          ErrorClass = "auth"           // 401, 403
+	ClassInternal      ErrorClass = "internal"       // a hook, the journal or the harness itself
+)
+
+// Error is a classified provider failure. Usage is what the provider billed
+// before failing, when it says.
+type Error struct {
+	Class      ErrorClass
+	RetryAfter time.Duration
+	Usage      Usage
+	Err        error
+}
+
+func (e *Error) Error() string { return string(e.Class) + ": " + e.Err.Error() }
+func (e *Error) Unwrap() error { return e.Err }
+
+// AsError returns err's classification. An unclassified error has ClassUnknown.
+func AsError(err error) *Error {
+	var e *Error
+	if errors.As(err, &e) {
+		return e
+	}
+	return &Error{Class: ClassUnknown, Err: err}
+}
 
 // Event is one item of a streamed model reply: TextDelta, ToolCallDelta or
 // Finish.
@@ -141,10 +189,12 @@ type ToolCallDelta struct {
 	Arguments string
 }
 
-// Finish ends the stream with the stop reason and token usage.
+// Finish ends the stream with the stop reason and token usage. Opaque is the
+// provider state to replay with this reply (see Message.Opaque).
 type Finish struct {
 	Reason FinishReason
 	Usage  Usage
+	Opaque json.RawMessage
 }
 
 func (TextDelta) isEvent()     {}
@@ -167,15 +217,16 @@ func (f ProviderFunc) Complete(ctx context.Context, req Request) iter.Seq2[Event
 
 // Response is a fully accumulated model reply.
 type Response struct {
-	Text      string       `json:"text"`
-	ToolCalls []ToolCall   `json:"tool_calls,omitempty"`
-	Finish    FinishReason `json:"finish"`
-	Usage     Usage        `json:"usage"`
+	Text      string          `json:"text"`
+	ToolCalls []ToolCall      `json:"tool_calls,omitempty"`
+	Finish    FinishReason    `json:"finish"`
+	Usage     Usage           `json:"usage"`
+	Opaque    json.RawMessage `json:"opaque,omitempty"`
 }
 
 // Message returns the assistant message that records r in the history.
 func (r Response) Message() Message {
-	return Message{Role: RoleAssistant, Content: r.Text, ToolCalls: r.ToolCalls}
+	return Message{Role: RoleAssistant, Content: r.Text, ToolCalls: r.ToolCalls, Opaque: r.Opaque}
 }
 
 // Collect drains a stream into a Response. onEvent, if non-nil, sees every
@@ -217,6 +268,7 @@ func Collect(seq iter.Seq2[Event, error], onEvent func(Event)) (Response, error)
 		case Finish:
 			resp.Finish = e.Reason
 			resp.Usage = e.Usage
+			resp.Opaque = e.Opaque
 		default:
 			return Response{}, fmt.Errorf("model: unknown event %T", ev)
 		}
@@ -235,6 +287,14 @@ func Collect(seq iter.Seq2[Event, error], onEvent func(Event)) (Response, error)
 		raw := strings.TrimSpace(args[i].String())
 		if raw == "" {
 			raw = "{}"
+		}
+		if !json.Valid([]byte(raw)) {
+			// A journal cannot store these bytes, and a tool must not run on them.
+			// The reply reads as cut off, which is what truncated JSON means.
+			raw = "{}"
+			if resp.Finish != FinishRefusal && resp.Finish != FinishContentFilter {
+				resp.Finish = FinishLength
+			}
 		}
 		c.Arguments = json.RawMessage(raw)
 		resp.ToolCalls = append(resp.ToolCalls, *c)
@@ -270,7 +330,7 @@ func Stream(r Response) iter.Seq2[Event, error] {
 				reason = FinishToolCalls
 			}
 		}
-		yield(Finish{Reason: reason, Usage: r.Usage}, nil)
+		yield(Finish{Reason: reason, Usage: r.Usage, Opaque: r.Opaque}, nil)
 	}
 }
 

@@ -7,6 +7,9 @@
 // interpret either; policy hooks (hooks/approval, hooks/guard) do. Keeping the
 // metadata next to the behaviour means a policy can never see a tool the
 // registry does not know.
+//
+// Effect and Timeout are different: they are execution facts the harness itself
+// acts on (retry safety, parallelism, the per-call deadline).
 package tool
 
 import (
@@ -15,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/ecociel/agent-harness/model"
 )
@@ -43,6 +47,34 @@ func (r Risk) String() string {
 	return fmt.Sprintf("risk(%d)", int(r))
 }
 
+// Effect says what the harness may do with a call whose outcome it does not
+// know. The zero value is the safe one: an unclassified tool is never re-run.
+type Effect int
+
+// Effect classes, from least to most repeatable.
+const (
+	// EffectOnce must not run twice. A crash mid-call suspends the run on a
+	// WaitUnknownOutcome instead of guessing.
+	EffectOnce Effect = iota
+	// EffectIdempotent may repeat because the tool honours IdempotencyKey.
+	EffectIdempotent
+	// EffectRead changes nothing. Adjacent read calls run in parallel.
+	EffectRead
+)
+
+// String returns "once", "idempotent" or "read".
+func (e Effect) String() string {
+	switch e {
+	case EffectOnce:
+		return "once"
+	case EffectIdempotent:
+		return "idempotent"
+	case EffectRead:
+		return "read"
+	}
+	return fmt.Sprintf("effect(%d)", int(e))
+}
+
 // Spec describes a tool to the model and to policy hooks.
 type Spec struct {
 	Name        string
@@ -53,6 +85,10 @@ type Spec struct {
 	// Scope, if set, is the permission a caller must hold (see
 	// hooks/approval). Empty means no scope check.
 	Scope string
+	// Effect is the retry and parallelism class.
+	Effect Effect
+	// Timeout bounds one call. Zero means no limit beyond the run's context.
+	Timeout time.Duration
 }
 
 // ModelSpec is the subset of s that is sent to the model.
@@ -72,6 +108,20 @@ func (s Spec) ModelSpec() model.ToolSpec {
 type Tool interface {
 	Spec() Spec
 	Call(ctx context.Context, args json.RawMessage) (string, error)
+}
+
+type keyCtx struct{}
+
+// WithIdempotencyKey returns a context carrying key for the tool it reaches.
+func WithIdempotencyKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, keyCtx{}, key)
+}
+
+// IdempotencyKey returns the key of the call ctx belongs to. It is stable across
+// retries, crashes and resumes of that call and differs for every other call.
+func IdempotencyKey(ctx context.Context) string {
+	k, _ := ctx.Value(keyCtx{}).(string)
+	return k
 }
 
 // Func builds a Tool from a spec and a function.

@@ -7,10 +7,12 @@
 //     (from the context) to hold that scope. Authority is checked below the
 //     model, so a prompt-injected model cannot talk its way past it
 //     (confused-deputy defence, as in ecociel/agents cmd/patterns/identity).
-//  2. Approval: a tool at or above Policy.Threshold risk needs an Approver to
-//     say yes — a human in a UI, a rule, or a second model. No approver means
-//     no.
-//  3. Audit: every decision, allowed or not, is passed to Policy.Audit.
+//  2. Approval: a tool at or above Policy.Threshold risk needs a yes. An Approver
+//     decides on the spot (a rule, a second model). With Ask set the run suspends
+//     for a person instead, and nothing blocks while it waits. Neither means no.
+//  3. Audit: every decision, allowed or not, is passed to Policy.Audit. Decisions
+//     are re-made after a crash, a claim or a resolved wait, so a record can repeat.
+//     The journal's tool.gated events are the durable record; Audit is a feed.
 //
 // Denials are fed back to the model (it can explain or choose another way);
 // set HaltOnDeny to stop the run instead.
@@ -81,14 +83,26 @@ type Record struct {
 	Reason    string    `json:"reason,omitempty"`
 }
 
+// WaitKind is the wait kind Ask opens. Approved is the signal value that means yes.
+const (
+	WaitKind = "approval"
+	Approved = "yes"
+)
+
 // Policy is the hook.
 type Policy struct {
 	// Threshold is the lowest risk that needs approval. The zero value,
 	// RiskRead, means every tool needs approval (a safe default); use New
 	// for the usual RiskWrite, and tool.RiskDangerous+1 to disable approvals.
 	Threshold tool.Risk
-	// Approver decides calls at or above Threshold. Nil denies them.
+	// Approver decides calls at or above Threshold. Nil denies them, unless Ask is
+	// set.
 	Approver Approver
+	// Ask suspends the run on a WaitKind wait instead of calling Approver. Any
+	// process resumes it with a Signal whose Value is Approved or anything else.
+	Ask bool
+	// TTL expires an unanswered ask. Zero never does. An expired ask is asked again.
+	TTL time.Duration
 	// Audit, if set, receives every decision.
 	Audit func(Record)
 	// HaltOnDeny stops the run on a denial instead of informing the model.
@@ -104,12 +118,11 @@ func New(threshold tool.Risk, approver Approver) *Policy {
 func (p *Policy) Name() string { return "approval" }
 
 // BeforeTool applies scope, approval and audit.
-func (p *Policy) BeforeTool(ctx context.Context, r *harness.Run, call model.ToolCall) harness.Decision {
-	t, ok := r.Agent.Tools.Get(call.Name)
-	if !ok {
+func (p *Policy) BeforeTool(ctx context.Context, r harness.Run, c harness.Call) harness.Decision {
+	spec := c.Spec
+	if spec.Name == "" {
 		return harness.Allow() // the registry reports unknown tools itself
 	}
-	spec := t.Spec()
 	pr, _ := PrincipalFrom(ctx)
 	rec := Record{Time: time.Now(), RunID: r.ID, Principal: pr.ID, Tool: spec.Name, Risk: spec.Risk.String()}
 	decide := func(allow bool, rule, reason string) harness.Decision {
@@ -125,7 +138,7 @@ func (p *Policy) BeforeTool(ctx context.Context, r *harness.Run, call model.Tool
 		if reason != "" {
 			note += ": " + reason
 		}
-		r.Note(p.Name(), "%s)", note)
+		harness.Note(ctx, "%s)", note)
 		switch {
 		case allow:
 			return harness.Allow()
@@ -141,10 +154,20 @@ func (p *Policy) BeforeTool(ctx context.Context, r *harness.Run, call model.Tool
 	if spec.Risk < p.Threshold {
 		return decide(true, "default", "")
 	}
+	if p.Ask {
+		s, ok := c.Signal(WaitKind)
+		switch {
+		case !ok || s.Expired:
+			return harness.Await(harness.Wait{Kind: WaitKind, Detail: fmt.Sprintf("%s tool %q needs approval", spec.Risk, spec.Name), TTL: p.TTL})
+		case s.Value != Approved:
+			return decide(false, "approval", "declined by "+s.By)
+		}
+		return decide(true, "approved", "by "+s.By)
+	}
 	if p.Approver == nil {
 		return decide(false, "approval", fmt.Sprintf("%s tool %q needs approval and no approver is configured", spec.Risk, spec.Name))
 	}
-	okd, reason := p.Approver.Approve(ctx, Request{RunID: r.ID, Agent: r.Agent.Name, Principal: pr, Tool: spec, Call: call})
+	okd, reason := p.Approver.Approve(ctx, Request{RunID: r.ID, Agent: r.Agent, Principal: pr, Tool: spec, Call: c.ToolCall})
 	if !okd {
 		if reason == "" {
 			reason = "not approved"

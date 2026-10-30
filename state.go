@@ -1,56 +1,48 @@
 package harness
 
-// State is one node of the run state machine. See the package documentation
-// for the diagram; the legal edges are the transition table below and nothing
-// else. The machine refuses any edge that is not in the table, so "that
-// transition can never happen" is enforced at runtime instead of being a
-// comment.
+// State is one node of the run state machine. A State is never stored: it is
+// what Fold computes from the journal. The legal edges are the table below and
+// nothing else, and both the live run and every replay are checked against it,
+// so a journal cannot contain a walk the machine would refuse.
 type State string
 
-// The states. Start, Prepare and Verify (plus the terminals) form the outer
-// loop: one task or episode. Compose, Model, Route, Tools and Observe form the
-// inner loop: one model/tool turn, repeated until the model answers without
-// asking for tools.
+// The states. Compose, Model, Gate and Tools form the inner loop: one model/tool
+// turn, repeated until the model answers without asking for tools.
 const (
-	// StateStart is the initial state of every run.
+	// StateStart is an empty journal.
 	StateStart State = "start"
-	// StatePrepare runs BeforeRun hooks: input guardrails, run spans, budget
-	// admission. Outer loop.
-	StatePrepare State = "prepare"
-	// StateCompose builds the model request and runs BeforeModel hooks:
-	// compaction/summarisation, model profiles, budget pre-checks. Inner loop.
+	// StateCompose assembles context: Context hooks (durable), then BeforeModel
+	// hooks (this call only).
 	StateCompose State = "compose"
-	// StateModel calls the provider through the WrapModel middleware chain,
-	// streaming deltas to OnDelta hooks, then runs AfterModel hooks. Inner loop.
+	// StateModel means a model call was recorded as started and has no outcome.
+	// In a live run it lasts for the call. Found on resume, the call is lost.
 	StateModel State = "model"
-	// StateRoute decides: tool calls go to StateTools, a plain answer goes to
-	// StateVerify. No hooks; it is pure control flow. Inner loop.
-	StateRoute State = "route"
-	// StateTools executes the requested calls: BeforeTool (veto/approval),
-	// the WrapTool chain, then AfterTool. Inner loop.
+	// StateGate decides the calls of a batch: BeforeTool hooks. No call in a
+	// batch starts until every call is decided.
+	StateGate State = "gate"
+	// StateTools runs allowed calls. Found on resume with a started call, that
+	// call's outcome is unknown.
 	StateTools State = "tools"
-	// StateObserve is the turn boundary: AfterTurn hooks (loop detection,
-	// checkpoints, metrics) before composing the next turn. Inner loop.
-	StateObserve State = "observe"
-	// StateVerify runs CheckOutput hooks on the candidate answer: output
-	// guardrails and verifiers. A Revise verdict feeds back into
-	// StateCompose; this edge is the outer loop's repair cycle.
+	// StateVerify runs CheckOutput hooks on the candidate answer.
 	StateVerify State = "verify"
-	// StateDone is the terminal state of a run that produced an accepted
-	// answer.
+	// StateSuspended holds open waits. No worker is needed: Run returns, and a
+	// later Run with a signal or past an expiry carries on.
+	StateSuspended State = "suspended"
+	// StateClosing means the outcome is decided and AfterRun hooks are due.
+	StateClosing State = "closing"
+	// StateDone ends a run that produced an accepted answer.
 	StateDone State = "done"
-	// StateStopped is the terminal state of a run that a hook, a budget, a
-	// limit, a handoff or cancellation ended on purpose.
+	// StateStopped ends a run that a hook, a limit, a handoff or cancellation
+	// ended on purpose.
 	StateStopped State = "stopped"
-	// StateFailed is the terminal state of a run that hit an infrastructure
-	// error (provider down, hook bug).
+	// StateFailed ends a run that hit an unrecoverable error.
 	StateFailed State = "failed"
 )
 
 // Loop names which loop a state belongs to: "outer", "inner" or "terminal".
 func (s State) Loop() string {
 	switch s {
-	case StateCompose, StateModel, StateRoute, StateTools, StateObserve:
+	case StateCompose, StateModel, StateGate, StateTools:
 		return "inner"
 	case StateDone, StateStopped, StateFailed:
 		return "terminal"
@@ -61,48 +53,87 @@ func (s State) Loop() string {
 // Terminal reports whether s ends the run.
 func (s State) Terminal() bool { return s.Loop() == "terminal" }
 
-// transitions is the specification of the machine. Every non-terminal state
-// may also go to StateStopped and StateFailed; those edges are added in init
-// so the table below shows only the interesting flow.
-var transitions = map[State][]State{
-	StateStart:   {StatePrepare},
-	StatePrepare: {StateCompose},
-	StateCompose: {StateModel},
-	StateModel:   {StateRoute},
-	StateRoute:   {StateTools, StateVerify},
-	StateTools:   {StateObserve},
-	StateObserve: {StateCompose},
-	StateVerify:  {StateDone, StateCompose},
+// Edge is one legal step: in state From, recording On leads to To.
+type Edge struct {
+	From State `json:"from"`
+	On   Kind  `json:"on"`
+	To   State `json:"to"`
 }
+
+// edges is the specification of the machine. Every live state also takes
+// run.claimed and run.stopping; init adds those so this table shows the flow.
+var edges = []Edge{
+	{StateStart, KindRunStarted, StateCompose},
+
+	{StateCompose, KindHistoryEdited, StateCompose},
+	{StateCompose, KindModelStarted, StateModel},
+
+	{StateModel, KindModelDone, StateGate},    // tool calls
+	{StateModel, KindModelDone, StateVerify},  // plain answer
+	{StateModel, KindModelDone, StateCompose}, // no call survived routing
+	{StateModel, KindModelDone, StateClosing}, // refused, or truncated answer
+	{StateModel, KindModelFailed, StateCompose},
+	{StateModel, KindModelFailed, StateSuspended}, // long backoff
+	{StateModel, KindModelFailed, StateClosing},   // gave up
+	{StateModel, KindModelLost, StateCompose},
+
+	{StateGate, KindToolGated, StateGate},
+	{StateGate, KindToolGated, StateTools},
+	{StateGate, KindToolGated, StateSuspended},
+	{StateGate, KindToolGated, StateCompose}, // every call denied
+	{StateGate, KindToolGated, StateClosing}, // halt
+
+	{StateTools, KindToolStarted, StateTools},
+	{StateTools, KindToolDone, StateTools},
+	{StateTools, KindToolDone, StateCompose},
+	{StateTools, KindToolDone, StateSuspended}, // a tool parked
+	{StateTools, KindToolDone, StateClosing},   // handoff
+	{StateTools, KindToolLost, StateTools},     // more lost calls in this append
+	{StateTools, KindToolLost, StateGate},      // repeatable: decide it again
+	{StateTools, KindToolLost, StateCompose},   // a drifted tool emptied the batch
+	{StateTools, KindToolLost, StateSuspended}, // EffectOnce: ask
+
+	{StateSuspended, KindWaitResolved, StateSuspended},
+	{StateSuspended, KindWaitResolved, StateGate},
+	{StateSuspended, KindWaitResolved, StateCompose},
+
+	{StateVerify, KindOutputChecked, StateCompose}, // revise
+	{StateVerify, KindOutputChecked, StateClosing},
+
+	{StateClosing, KindRunEnded, StateDone},
+	{StateClosing, KindRunEnded, StateStopped},
+	{StateClosing, KindRunEnded, StateFailed},
+
+	{StateTools, KindRunClaimed, StateGate},    // nothing unstarted survives a claim undecided
+	{StateTools, KindRunClaimed, StateCompose}, // a drifted tool emptied the batch
+	{StateGate, KindRunClaimed, StateCompose},
+}
+
+var liveStates = []State{StateCompose, StateModel, StateGate, StateTools, StateVerify,
+	StateSuspended, StateClosing}
+
+var legal = map[Edge]bool{}
 
 func init() {
-	for s, next := range transitions {
-		transitions[s] = append(next, StateStopped, StateFailed)
-	}
-}
-
-// CanTransition reports whether from → to is a legal edge.
-func CanTransition(from, to State) bool {
-	for _, s := range transitions[from] {
-		if s == to {
-			return true
+	for _, s := range liveStates {
+		edges = append(edges, Edge{s, KindRunClaimed, s})
+		if s != StateClosing {
+			edges = append(edges, Edge{s, KindRunStopping, StateClosing})
 		}
 	}
-	return false
+	for _, e := range edges {
+		legal[e] = true
+	}
 }
 
-// Transitions returns a copy of the transition table, for documentation,
-// diagrams and the web diagnostic view.
-func Transitions() map[State][]State {
-	out := make(map[State][]State, len(transitions))
-	for k, v := range transitions {
-		out[k] = append([]State(nil), v...)
-	}
-	return out
-}
+// CanTransition reports whether recording on in state from may lead to to.
+func CanTransition(from State, on Kind, to State) bool { return legal[Edge{from, on, to}] }
+
+// Transitions returns a copy of the table, for documentation and diagrams.
+func Transitions() []Edge { return append([]Edge(nil), edges...) }
 
 // States lists every state in diagram order.
 func States() []State {
-	return []State{StateStart, StatePrepare, StateCompose, StateModel, StateRoute,
-		StateTools, StateObserve, StateVerify, StateDone, StateStopped, StateFailed}
+	return []State{StateStart, StateCompose, StateModel, StateGate, StateTools, StateVerify,
+		StateSuspended, StateClosing, StateDone, StateStopped, StateFailed}
 }

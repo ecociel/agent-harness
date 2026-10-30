@@ -2,27 +2,27 @@ package harness
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ecociel/agent-harness/model"
 	"github.com/ecociel/agent-harness/tool"
 )
 
-// Runner is anything that turns an Input into a Result: a single Agent, or a
-// multi-agent pattern from package multi. Because patterns are Runners too,
-// they compose: a Router can route to a Parallel of Pipelines of Agents.
+// Runner is anything that turns an Input into a finished or paused Run: a single Agent, or a
+// multi-agent pattern from package multi. Because patterns are Runners too, they
+// compose: a Router can route to a Parallel of Pipelines of Agents.
 type Runner interface {
-	Run(ctx context.Context, in Input) (*Result, error)
+	Run(ctx context.Context, in Input) (*Run, error)
 }
 
 // RunnerFunc adapts a function to Runner.
-type RunnerFunc func(ctx context.Context, in Input) (*Result, error)
+type RunnerFunc func(ctx context.Context, in Input) (*Run, error)
 
 // Run calls f.
-func (f RunnerFunc) Run(ctx context.Context, in Input) (*Result, error) { return f(ctx, in) }
+func (f RunnerFunc) Run(ctx context.Context, in Input) (*Run, error) { return f(ctx, in) }
 
 // Named is implemented by Runners that have a display name.
 type Named interface{ RunnerName() string }
@@ -35,147 +35,75 @@ func NameOf(r Runner) string {
 	return fmt.Sprintf("%T", r)
 }
 
-// Input is what a run starts from: the conversation so far (usually ending in
-// a user message). The agent's Instructions are added as a system message at
-// request time and are not part of Input.
+// Input says which run to advance and with what. Run is idempotent on RunID:
+// an unknown ID starts a run, a known one continues it from its journal, and a
+// finished one is returned without doing anything. The same call from any
+// process, any number of times, converges on the same run.
 type Input struct {
+	// RunID names the run. Empty generates one, which is only useful for a run
+	// nobody will need to resume.
+	RunID string
+	// Messages starts the run. They are ignored once the run exists.
 	Messages []model.Message
+	// Signals resolve open waits. A repeat of a delivered signal is ignored.
+	Signals []Signal
+	// Cancel, if set, ends the run with StopCancelled from any process. A worker
+	// still running it is fenced. This is the way to end a durable run on purpose:
+	// a cancelled context only stops the worker.
+	Cancel string
 }
 
 // Prompt returns an Input holding one user message.
 func Prompt(text string) Input { return Input{Messages: []model.Message{model.User(text)}} }
 
+// Resume returns the Input that continues a run, delivering signals if any.
+func Resume(runID string, signals ...Signal) Input {
+	return Input{RunID: runID, Signals: signals}
+}
+
 // Text returns the last user message of in.
 func (in Input) Text() string { return model.LastUser(in.Messages) }
 
-// Agent is a single model-plus-tools loop driven by the state machine. The
-// zero value is not usable: Provider is required. An Agent is safe for
-// concurrent use as long as its hooks are.
+// Agent is a single model-plus-tools loop. Provider is required. An Agent is safe
+// for concurrent use as long as its hooks are.
 type Agent struct {
 	// Name identifies the agent in events, traces and patterns.
 	Name string
-	// Instructions is the system prompt.
+	// Instructions is the system prompt. Pinned when a run starts.
 	Instructions string
 	// Provider is the model backend. Required.
 	Provider model.Provider
-	// Model is passed through to the provider.
+	// Model is passed through to the provider. Pinned when a run starts.
 	Model string
 	// Tools the model may call. May be nil.
 	Tools *tool.Registry
 	// Hooks attached to every run, in order.
 	Hooks []Hook
-	// MaxTurns caps inner-loop iterations (model calls). Default 8.
+	// Journal makes runs durable. Nil inherits the journal of the run that
+	// started this one, and otherwise keeps the run in memory for this call.
+	Journal Journal
+	// Lease is how long this worker may stay silent before a sweep may treat it as
+	// dead. Set it above the slowest step: a sweep that fires early costs a needless
+	// unknown-outcome wait, never a repeated effect. Default DefaultLease.
+	Lease time.Duration
+	// MaxTurns caps model turns. Default 8. Pinned when a run starts.
 	MaxTurns int
-	// MaxRepairs caps Verify → Compose repair cycles. Default 2.
+	// MaxRepairs caps Verify to Compose repair cycles. Default 2. Pinned.
 	MaxRepairs int
-	// MaxTokens is the per-call output cap passed to the provider (0 = provider default).
+	// MaxTokens is the per-call output cap (0 = provider default). Pinned.
 	MaxTokens int
-	// Temperature is passed through to the provider when non-nil.
+	// Temperature is passed through to the provider when non-nil. Pinned.
 	Temperature *float64
 }
 
 // RunnerName implements Named.
 func (a *Agent) RunnerName() string { return a.Name }
 
-// Result is the outcome of a run.
-type Result struct {
-	RunID  string `json:"run_id"`
-	Agent  string `json:"agent"`
-	Output string `json:"output"`
-	// Messages is the full conversation after the run (without the system
-	// instructions), ready to feed into the next run of a session.
-	Messages []model.Message `json:"messages"`
-	State    State           `json:"state"`
-	Stop     StopReason      `json:"stop"`
-	Detail   string          `json:"detail,omitempty"`
-	Usage    model.Usage     `json:"usage"`
-	Turns    int             `json:"turns"`
-	Repairs  int             `json:"repairs"`
-	// ModelCalls and ToolCalls count calls made by this run only; sub-agent
-	// usage is in their own Results (and in Usage when a pattern sums it).
-	ModelCalls int           `json:"model_calls"`
-	ToolCalls  int           `json:"tool_calls"`
-	Duration   time.Duration `json:"duration_ns"`
-	// Path is the sequence of states visited, Start first.
-	Path []State `json:"path"`
-	// Handoff is set when the run ended because a tool transferred control.
-	Handoff *tool.Handoff `json:"handoff,omitempty"`
-}
-
-// OK reports whether the run completed with an accepted answer.
-func (r *Result) OK() bool { return r != nil && r.Stop == StopCompleted }
-
-// Run is the live state of one run, passed to every hook. Hooks run on the
-// run's goroutine one at a time, so they may read and write the exported
-// fields without locking. Set/Value are safe from any goroutine.
-type Run struct {
-	ID        string
-	ParentRun string
-	Agent     *Agent
-	Depth     int
-	State     State
-	Turn      int
-	Repairs   int
-	// Messages is the conversation history (no system instructions). Hooks
-	// may rewrite it, e.g. to compact.
-	Messages   []model.Message
-	Usage      model.Usage
-	ModelCalls int
-	ToolCalls  int
-	Started    time.Time
-	// Last is the most recent model response.
-	Last model.Response
-
-	mu     sync.Mutex
-	values map[string]any
-	notes  map[string]string
-}
-
-// Note attaches a human-readable remark to the current invocation of the
-// named hook, e.g. "compacted 12 messages". The machine puts it on the hook
-// Event it emits for that invocation (Event.Text), so diagnostics and logs
-// show what a hook actually did, not just that it ran. Calling Note again
-// before the event is emitted replaces the remark.
-func (r *Run) Note(hook, format string, args ...any) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.notes == nil {
-		r.notes = map[string]string{}
-	}
-	r.notes[hook] = fmt.Sprintf(format, args...)
-}
-
-// takeNote returns and clears the remark for hook.
-func (r *Run) takeNote(hook string) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	n := r.notes[hook]
-	delete(r.notes, hook)
-	return n
-}
-
-// Set stores a per-run value for hooks (scratch space shared by points).
-func (r *Run) Set(key string, v any) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.values == nil {
-		r.values = map[string]any{}
-	}
-	r.values[key] = v
-}
-
-// Value returns a value stored with Set.
-func (r *Run) Value(key string) any {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.values[key]
-}
-
-var runSeq atomic.Int64
-
 func newRunID(name string) string {
 	if name == "" {
 		name = "agent"
 	}
-	return fmt.Sprintf("%s-%d", name, runSeq.Add(1))
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return name + "-" + hex.EncodeToString(b[:])
 }

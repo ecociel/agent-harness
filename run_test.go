@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"reflect"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ecociel/agent-harness"
 	"github.com/ecociel/agent-harness/model"
@@ -16,96 +18,44 @@ import (
 	"github.com/ecociel/agent-harness/tool"
 )
 
-// Short names for the state path assertions.
 const (
 	st = harness.StateStart
-	pr = harness.StatePrepare
 	co = harness.StateCompose
 	mo = harness.StateModel
-	ro = harness.StateRoute
+	ga = harness.StateGate
 	to = harness.StateTools
-	ob = harness.StateObserve
 	ve = harness.StateVerify
+	cl = harness.StateClosing
 	dn = harness.StateDone
 	sp = harness.StateStopped
 	fl = harness.StateFailed
 )
 
 func echoTool() tool.Tool {
-	return tool.Func(tool.Spec{Name: "echo"}, func(_ context.Context, a json.RawMessage) (string, error) {
+	return tool.Func(tool.Spec{Name: "echo", Effect: tool.EffectRead}, func(_ context.Context, a json.RawMessage) (string, error) {
 		return "echo " + string(a), nil
 	})
 }
 
-func handoffTool() tool.Tool {
-	return tool.Func(tool.Spec{Name: "transfer"}, func(context.Context, json.RawMessage) (string, error) {
-		return "", &tool.Handoff{Target: "billing", Note: "invoice question"}
-	})
-}
-
-func failTool() tool.Tool {
-	return tool.Func(tool.Spec{Name: "broken"}, func(context.Context, json.RawMessage) (string, error) {
-		return "", errors.New("disk on fire")
-	})
-}
-
-// testHook is a configurable hook implementing every point.
+// testHook is a configurable hook.
 type testHook struct {
-	name      string
-	log       *[]string
 	beforeRun error
-	model     error
+	context   error
 	decision  harness.Decision
 	verdicts  []harness.Verdict
-	turnErr   error
 }
 
-func (h *testHook) Name() string { return h.name }
-func (h *testHook) rec(s string) {
-	if h.log != nil {
-		*h.log = append(*h.log, h.name+"."+s)
-	}
-}
-func (h *testHook) BeforeRun(context.Context, *harness.Run) error {
-	h.rec("BeforeRun")
+func (h *testHook) Name() string { return "test" }
+func (h *testHook) BeforeRun(context.Context, harness.Run) error {
 	return h.beforeRun
 }
-func (h *testHook) BeforeModel(context.Context, *harness.Run, *model.Request) error {
-	h.rec("BeforeModel")
-	return h.model
+func (h *testHook) Context(context.Context, harness.Run) (harness.Edit, error) {
+	return harness.Edit{}, h.context
 }
-func (h *testHook) WrapModel(_ *harness.Run, next harness.ModelCall) harness.ModelCall {
-	return func(ctx context.Context, req model.Request) (model.Response, error) {
-		h.rec("WrapModel>")
-		r, err := next(ctx, req)
-		h.rec("WrapModel<")
-		return r, err
-	}
-}
-func (h *testHook) AfterModel(context.Context, *harness.Run, *model.Response) error {
-	h.rec("AfterModel")
-	return nil
-}
-func (h *testHook) BeforeTool(context.Context, *harness.Run, model.ToolCall) harness.Decision {
-	h.rec("BeforeTool")
+func (h *testHook) BeforeTool(context.Context, harness.Run, harness.Call) harness.Decision {
 	return h.decision
 }
-func (h *testHook) WrapTool(_ *harness.Run, next harness.ToolCallFunc) harness.ToolCallFunc {
-	return func(ctx context.Context, c model.ToolCall) (string, error) {
-		h.rec("WrapTool")
-		return next(ctx, c)
-	}
-}
-func (h *testHook) AfterTool(context.Context, *harness.Run, harness.ToolOutcome) error {
-	h.rec("AfterTool")
-	return nil
-}
-func (h *testHook) AfterTurn(context.Context, *harness.Run) error {
-	h.rec("AfterTurn")
-	return h.turnErr
-}
-func (h *testHook) CheckOutput(context.Context, *harness.Run, string) harness.Verdict {
-	h.rec("CheckOutput")
+func (h *testHook) CheckOutput(context.Context, harness.Run, string) harness.Verdict {
 	if len(h.verdicts) == 0 {
 		return harness.Accept()
 	}
@@ -113,297 +63,311 @@ func (h *testHook) CheckOutput(context.Context, *harness.Run, string) harness.Ve
 	h.verdicts = h.verdicts[1:]
 	return v
 }
-func (h *testHook) AfterRun(context.Context, *harness.Run, *harness.Result) { h.rec("AfterRun") }
 
 func TestRunPaths(t *testing.T) {
+	echo := fake.Call("echo", map[string]string{"x": "1"})
 	tests := []struct {
-		name      string
-		script    []model.Response
-		tools     []tool.Tool
-		hook      *testHook
-		maxTurns  int
-		wantPath  []harness.State
-		wantStop  harness.StopReason
-		wantOut   string
-		wantError bool
+		name   string
+		script []model.Response
+		hook   testHook
+		max    int
+		path   []harness.State
+		stop   harness.StopReason
+		output string
 	}{
-		{
-			name:     "plain answer",
-			script:   []model.Response{fake.Text("hi")},
-			wantPath: []harness.State{st, pr, co, mo, ro, ve, dn},
-			wantStop: harness.StopCompleted, wantOut: "hi",
-		},
-		{
-			name:     "one tool turn",
-			script:   []model.Response{fake.Call("echo", map[string]int{"x": 1}), fake.Text("done")},
-			tools:    []tool.Tool{echoTool()},
-			wantPath: []harness.State{st, pr, co, mo, ro, to, ob, co, mo, ro, ve, dn},
-			wantStop: harness.StopCompleted, wantOut: "done",
-		},
-		{
-			name:     "tool denied is fed back and the run continues",
-			script:   []model.Response{fake.Call("echo", nil), fake.Text("ok without it")},
-			tools:    []tool.Tool{echoTool()},
-			hook:     &testHook{decision: harness.Deny("not today")},
-			wantPath: []harness.State{st, pr, co, mo, ro, to, ob, co, mo, ro, ve, dn},
-			wantStop: harness.StopCompleted, wantOut: "ok without it",
-		},
-		{
-			name:     "tool halt stops the run",
-			script:   []model.Response{fake.Call("echo", nil)},
-			tools:    []tool.Tool{echoTool()},
-			hook:     &testHook{decision: harness.Halt("forbidden")},
-			wantPath: []harness.State{st, pr, co, mo, ro, to, sp},
-			wantStop: harness.StopGuardrail,
-		},
-		{
-			name:     "input guardrail stops in prepare",
-			script:   []model.Response{fake.Text("never")},
-			hook:     &testHook{beforeRun: harness.Stop(harness.StopGuardrail, "pii")},
-			wantPath: []harness.State{st, pr, sp},
-			wantStop: harness.StopGuardrail,
-		},
-		{
-			name:     "budget stop before model",
-			script:   []model.Response{fake.Text("never")},
-			hook:     &testHook{model: harness.Stop(harness.StopBudget, "0 tokens left")},
-			wantPath: []harness.State{st, pr, co, sp},
-			wantStop: harness.StopBudget,
-		},
-		{
-			name:     "revise loops back to compose",
-			script:   []model.Response{fake.Text("draft"), fake.Text("final")},
-			hook:     &testHook{verdicts: []harness.Verdict{harness.Revise("too short")}},
-			wantPath: []harness.State{st, pr, co, mo, ro, ve, co, mo, ro, ve, dn},
-			wantStop: harness.StopCompleted, wantOut: "final",
-		},
-		{
-			name:   "repairs are capped",
-			script: []model.Response{fake.Text("a"), fake.Text("b"), fake.Text("c")},
-			hook: &testHook{verdicts: []harness.Verdict{harness.Revise("no"),
-				harness.Revise("no"), harness.Revise("still no")}},
-			wantPath: []harness.State{st, pr, co, mo, ro, ve, co, mo, ro, ve, co, mo, ro, ve, sp},
-			wantStop: harness.StopMaxRepairs, wantOut: "c",
-		},
-		{
-			name:     "output block",
-			script:   []model.Response{fake.Text("secret")},
-			hook:     &testHook{verdicts: []harness.Verdict{harness.Block("leak")}},
-			wantPath: []harness.State{st, pr, co, mo, ro, ve, sp},
-			wantStop: harness.StopGuardrail,
-		},
-		{
-			name:     "rewrite redacts",
-			script:   []model.Response{fake.Text("card 4111")},
-			hook:     &testHook{verdicts: []harness.Verdict{{Rewrite: "card ****"}}},
-			wantPath: []harness.State{st, pr, co, mo, ro, ve, dn},
-			wantStop: harness.StopCompleted, wantOut: "card ****",
-		},
-		{
-			name:     "max turns",
-			script:   []model.Response{fake.Call("echo", nil), fake.Call("echo", nil)},
-			tools:    []tool.Tool{echoTool()},
-			maxTurns: 1,
-			wantPath: []harness.State{st, pr, co, mo, ro, to, ob, co, sp},
-			wantStop: harness.StopMaxTurns,
-		},
-		{
-			name:     "after turn stop (loop detection)",
-			script:   []model.Response{fake.Call("echo", nil)},
-			tools:    []tool.Tool{echoTool()},
-			hook:     &testHook{turnErr: harness.Stop(harness.StopLoop, "same call 3x")},
-			wantPath: []harness.State{st, pr, co, mo, ro, to, ob, sp},
-			wantStop: harness.StopLoop,
-		},
-		{
-			name:     "handoff",
-			script:   []model.Response{fake.Call("transfer", nil)},
-			tools:    []tool.Tool{handoffTool()},
-			wantPath: []harness.State{st, pr, co, mo, ro, to, sp},
-			wantStop: harness.StopHandoff,
-		},
-		{
-			name:     "tool error is reported to the model",
-			script:   []model.Response{fake.Call("broken", nil), fake.Text("recovered")},
-			tools:    []tool.Tool{failTool()},
-			wantPath: []harness.State{st, pr, co, mo, ro, to, ob, co, mo, ro, ve, dn},
-			wantStop: harness.StopCompleted, wantOut: "recovered",
-		},
-		{
-			name:      "provider failure",
-			script:    nil,
-			wantPath:  []harness.State{st, pr, co, mo, fl},
-			wantStop:  harness.StopFailed,
-			wantError: true,
-		},
+		{name: "plain answer", script: []model.Response{fake.Text("hi")},
+			path: []harness.State{st, co, mo, ve, cl, dn}, stop: harness.StopCompleted, output: "hi"},
+		{name: "tool turn", script: []model.Response{echo, fake.Text("hi")},
+			path: []harness.State{st, co, mo, ga, to, co, mo, ve, cl, dn}, stop: harness.StopCompleted, output: "hi"},
+		{name: "tool denied", script: []model.Response{echo, fake.Text("ok")}, hook: testHook{decision: harness.Deny("no")},
+			path: []harness.State{st, co, mo, ga, co, mo, ve, cl, dn}, stop: harness.StopCompleted, output: "ok"},
+		{name: "tool halt", script: []model.Response{echo}, hook: testHook{decision: harness.Halt("stop")},
+			path: []harness.State{st, co, mo, ga, cl, sp}, stop: harness.StopGuardrail},
+		{name: "context stop", script: []model.Response{fake.Text("x")}, hook: testHook{context: harness.Stop(harness.StopBudget, "out")},
+			path: []harness.State{st, co, cl, sp}, stop: harness.StopBudget},
+		{name: "revise", script: []model.Response{fake.Text("a"), fake.Text("b")}, hook: testHook{verdicts: []harness.Verdict{harness.Revise("again")}},
+			path: []harness.State{st, co, mo, ve, co, mo, ve, cl, dn}, stop: harness.StopCompleted, output: "b"},
+		{name: "repairs capped", script: []model.Response{fake.Text("a"), fake.Text("b"), fake.Text("c")},
+			hook: testHook{verdicts: []harness.Verdict{harness.Revise("1"), harness.Revise("2"), harness.Revise("3")}},
+			path: []harness.State{st, co, mo, ve, co, mo, ve, co, mo, ve, cl, sp}, stop: harness.StopMaxRepairs, output: "c"},
+		{name: "block", script: []model.Response{fake.Text("bad")}, hook: testHook{verdicts: []harness.Verdict{harness.Block("no")}},
+			path: []harness.State{st, co, mo, ve, cl, sp}, stop: harness.StopGuardrail},
+		{name: "rewrite", script: []model.Response{fake.Text("secret")}, hook: testHook{verdicts: []harness.Verdict{{Rewrite: "clean"}}},
+			path: []harness.State{st, co, mo, ve, cl, dn}, stop: harness.StopCompleted, output: "clean"},
+		{name: "max turns", script: []model.Response{echo, echo}, max: 1,
+			path: []harness.State{st, co, mo, ga, to, co, cl, sp}, stop: harness.StopMaxTurns},
+		{name: "refusal", script: []model.Response{{Text: "I can't", Finish: model.FinishRefusal}},
+			path: []harness.State{st, co, mo, cl, sp}, stop: harness.StopRefused},
+		{name: "content filter with calls", script: []model.Response{{Finish: model.FinishContentFilter, ToolCalls: echo.ToolCalls}},
+			path: []harness.State{st, co, mo, cl, sp}, stop: harness.StopRefused},
+		{name: "truncated answer", script: []model.Response{{Text: "half", Finish: model.FinishLength}},
+			path: []harness.State{st, co, mo, cl, sp}, stop: harness.StopTruncated, output: "half"},
+		{name: "truncated tool arguments are never executed",
+			script: []model.Response{{ToolCalls: echo.ToolCalls, Finish: model.FinishLength}, fake.Text("sorry")},
+			path:   []harness.State{st, co, mo, co, mo, ve, cl, dn}, stop: harness.StopCompleted, output: "sorry"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := &harness.Agent{Name: "t", Provider: fake.Script(tt.script...),
-				Tools: tool.NewRegistry(tt.tools...), MaxTurns: tt.maxTurns}
-			if tt.hook != nil {
-				tt.hook.name = "h"
-				a.Hooks = []harness.Hook{tt.hook}
+			h := tt.hook
+			a := &harness.Agent{Provider: fake.Script(tt.script...), Tools: tool.NewRegistry(echoTool()),
+				Hooks: []harness.Hook{&h}, MaxTurns: tt.max}
+			res, err := a.Run(context.Background(), harness.Prompt("hello"))
+			if err != nil {
+				t.Fatal(err)
 			}
-			res, err := a.Run(context.Background(), harness.Prompt("go"))
-			if (err != nil) != tt.wantError {
-				t.Fatalf("err = %v", err)
+			if !reflect.DeepEqual(res.Path, tt.path) {
+				t.Errorf("path = %v, want %v", res.Path, tt.path)
 			}
-			if !reflect.DeepEqual(res.Path, tt.wantPath) {
-				t.Errorf("path\n got %v\nwant %v", res.Path, tt.wantPath)
+			if res.Stop != tt.stop || res.Output != tt.output {
+				t.Errorf("stop = %s, output = %q", res.Stop, res.Output)
 			}
-			if res.Stop != tt.wantStop {
-				t.Errorf("stop = %s, want %s (%s)", res.Stop, tt.wantStop, res.Detail)
-			}
-			if res.Output != tt.wantOut {
-				t.Errorf("output = %q, want %q", res.Output, tt.wantOut)
-			}
+			balanced(t, res.Messages)
 		})
 	}
 }
 
-func TestHookOrderAndMiddlewareNesting(t *testing.T) {
-	var log []string
-	a := &harness.Agent{
-		Provider: fake.Script(fake.Call("echo", nil), fake.Text("ok")),
-		Tools:    tool.NewRegistry(echoTool()),
-		Hooks:    []harness.Hook{&testHook{name: "a", log: &log}, &testHook{name: "b", log: &log}},
-	}
-	if _, err := a.Run(context.Background(), harness.Prompt("x")); err != nil {
-		t.Fatal(err)
-	}
-	want := []string{
-		"a.BeforeRun", "b.BeforeRun",
-		"a.BeforeModel", "b.BeforeModel", "a.WrapModel>", "b.WrapModel>", "b.WrapModel<", "a.WrapModel<",
-		"a.AfterModel", "b.AfterModel",
-		"a.BeforeTool", "b.BeforeTool", "a.WrapTool", "b.WrapTool", "a.AfterTool", "b.AfterTool",
-		"a.AfterTurn", "b.AfterTurn",
-		"a.BeforeModel", "b.BeforeModel", "a.WrapModel>", "b.WrapModel>", "b.WrapModel<", "a.WrapModel<",
-		"a.AfterModel", "b.AfterModel",
-		"a.CheckOutput", "b.CheckOutput",
-		"a.AfterRun", "b.AfterRun",
-	}
-	if !reflect.DeepEqual(log, want) {
-		t.Errorf("order\n got %v\nwant %v", log, want)
+func TestProviderFailureIsClassified(t *testing.T) {
+	boom := &model.Error{Class: model.ClassInvalid, Err: errors.New("bad request")}
+	a := &harness.Agent{Provider: model.ProviderFunc(func(context.Context, model.Request) iter.Seq2[model.Event, error] {
+		return model.Fail(boom)
+	})}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
+	if err == nil || res.State != fl || res.Class != model.ClassInvalid {
+		t.Fatalf("%v %+v", err, res)
 	}
 }
 
-func TestEventsCoverTransitionsAndHooks(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		events []harness.Event
-	)
-	ctx := harness.WithEvents(context.Background(), func(e harness.Event) {
-		mu.Lock()
-		defer mu.Unlock()
-		events = append(events, e)
+func TestToolErrorGoesToTheModel(t *testing.T) {
+	broken := tool.Func(tool.Spec{Name: "broken"}, func(context.Context, json.RawMessage) (string, error) {
+		return "", errors.New("disk on fire")
 	})
-	a := &harness.Agent{Name: "ev", Provider: fake.Script(fake.Call("echo", nil), fake.Text("fine")),
-		Tools: tool.NewRegistry(echoTool()), Hooks: []harness.Hook{&testHook{name: "h"}}}
-	res, err := a.Run(ctx, harness.Prompt("x"))
+	a := &harness.Agent{Provider: fake.Script(fake.Call("broken", nil), fake.Text("sorry")), Tools: tool.NewRegistry(broken)}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
+	if err != nil || !res.OK() || !strings.Contains(res.Messages[2].Content, "disk on fire") {
+		t.Fatalf("%v %+v", err, res)
+	}
+}
+
+func TestHaltMidBatchAnswersEveryCall(t *testing.T) {
+	calls := []model.ToolCall{{ID: "1", Name: "echo", Arguments: json.RawMessage(`{}`)},
+		{ID: "2", Name: "echo", Arguments: json.RawMessage(`{}`)}, {ID: "3", Name: "echo", Arguments: json.RawMessage(`{}`)}}
+	a := &harness.Agent{Provider: fake.Script(model.Response{ToolCalls: calls}), Tools: tool.NewRegistry(echoTool()),
+		Hooks: []harness.Hook{&testHook{decision: harness.Halt("no")}}}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	kinds := map[harness.EventKind]int{}
-	points := map[harness.Point]bool{}
-	for _, e := range events {
-		kinds[e.Kind]++
-		if e.Kind == harness.KindHook {
-			points[e.Point] = true
-		}
-		if e.RunID != res.RunID {
-			t.Fatalf("event from other run: %+v", e)
-		}
-	}
-	if kinds[harness.KindTransition] != len(res.Path)-1 {
-		t.Errorf("transitions = %d, path = %d", kinds[harness.KindTransition], len(res.Path))
-	}
-	for _, p := range []harness.Point{harness.PointBeforeRun, harness.PointBeforeModel, harness.PointWrapModel,
-		harness.PointAfterModel, harness.PointBeforeTool, harness.PointWrapTool, harness.PointAfterTool,
-		harness.PointAfterTurn, harness.PointCheckOutput, harness.PointAfterRun} {
-		if !points[p] {
-			t.Errorf("no hook event for %s", p)
-		}
-	}
-	if kinds[harness.KindRunStart] != 1 || kinds[harness.KindRunEnd] != 1 || kinds[harness.KindDelta] == 0 {
-		t.Errorf("kinds = %v", kinds)
+	balanced(t, res.Messages)
+	if len(res.Messages) != 5 {
+		t.Fatalf("messages: %+v", res.Messages)
 	}
 }
 
-func TestSubAgentDepthAndParent(t *testing.T) {
-	var mu sync.Mutex
-	depths := map[string]int{}
-	parents := map[string]string{}
-	ctx := harness.WithEvents(context.Background(), func(e harness.Event) {
-		if e.Kind == harness.KindRunStart {
-			mu.Lock()
-			depths[e.Agent], parents[e.Agent] = e.Depth, e.ParentRun
-			mu.Unlock()
-		}
+func TestHandoffMidBatchAnswersEveryCall(t *testing.T) {
+	transfer := tool.Func(tool.Spec{Name: "transfer"}, func(context.Context, json.RawMessage) (string, error) {
+		return "", &tool.Handoff{Target: "billing", Note: "invoice"}
 	})
-	child := &harness.Agent{Name: "child", Provider: fake.Script(fake.Text("child says hi"))}
-	delegate := tool.Func(tool.Spec{Name: "ask_child"}, func(ctx context.Context, _ json.RawMessage) (string, error) {
-		if harness.Depth(ctx) != 1 {
-			return "", fmt.Errorf("depth = %d", harness.Depth(ctx))
+	calls := []model.ToolCall{{ID: "1", Name: "transfer", Arguments: json.RawMessage(`{}`)}, {ID: "2", Name: "echo", Arguments: json.RawMessage(`{}`)}}
+	a := &harness.Agent{Provider: fake.Script(model.Response{ToolCalls: calls}), Tools: tool.NewRegistry(transfer, echoTool())}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
+	if err != nil || res.Stop != harness.StopHandoff || res.Handoff.Target != "billing" {
+		t.Fatalf("%v %+v", err, res)
+	}
+	balanced(t, res.Messages)
+}
+
+func TestAdjacentReadsRunInParallelAndWritesDoNot(t *testing.T) {
+	var live, peak atomic.Int64
+	read := func(name string) tool.Tool {
+		return tool.Func(tool.Spec{Name: name, Effect: tool.EffectRead}, func(context.Context, json.RawMessage) (string, error) {
+			n := live.Add(1)
+			defer live.Add(-1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			return name, nil
+		})
+	}
+	var order []string
+	write := tool.Func(tool.Spec{Name: "w"}, func(context.Context, json.RawMessage) (string, error) {
+		if live.Load() != 0 {
+			t.Error("a write ran alongside a read")
 		}
-		r, err := child.Run(ctx, harness.Prompt("hi"))
-		if err != nil {
-			return "", err
-		}
-		return r.Output, nil
+		order = append(order, "w")
+		return "w", nil
 	})
-	parent := &harness.Agent{Name: "parent", Provider: fake.Script(fake.Call("ask_child", nil), fake.Text("done")),
-		Tools: tool.NewRegistry(delegate)}
-	res, err := parent.Run(ctx, harness.Prompt("go"))
+	mk := func(id, name string) model.ToolCall {
+		return model.ToolCall{ID: id, Name: name, Arguments: json.RawMessage(`{}`)}
+	}
+	a := &harness.Agent{Provider: fake.Script(model.Response{ToolCalls: []model.ToolCall{
+		mk("1", "r1"), mk("2", "r2"), mk("3", "w"), mk("4", "r3"),
+	}}, fake.Text("ok")), Tools: tool.NewRegistry(read("r1"), read("r2"), read("r3"), write)}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
 	if err != nil || !res.OK() {
-		t.Fatalf("res=%+v err=%v", res, err)
+		t.Fatalf("%v %+v", err, res)
 	}
-	if depths["parent"] != 0 || depths["child"] != 1 || parents["child"] != res.RunID {
-		t.Fatalf("depths=%v parents=%v", depths, parents)
+	if peak.Load() != 2 {
+		t.Fatalf("peak concurrency %d, want 2", peak.Load())
 	}
-	if !strings.Contains(res.Messages[2].Content, "child says hi") {
-		t.Fatalf("tool result = %q", res.Messages[2].Content)
-	}
-}
-
-func TestCancellationStops(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	a := &harness.Agent{Provider: fake.Script(fake.Text("x"))}
-	res, err := a.Run(ctx, harness.Prompt("x"))
-	if err != nil || res.Stop != harness.StopCancelled {
-		t.Fatalf("res=%+v err=%v", res, err)
-	}
-}
-
-func TestInstructionsAreSentButNotStored(t *testing.T) {
-	p := fake.Script(fake.Text("ok"))
-	a := &harness.Agent{Instructions: "be brief", Provider: p}
-	res, _ := a.Run(context.Background(), harness.Prompt("hi"))
-	req := p.Requests()[0]
-	if req.Messages[0].Role != model.RoleSystem || req.Messages[0].Content != "be brief" {
-		t.Fatalf("request = %+v", req.Messages)
-	}
-	for _, m := range res.Messages {
-		if m.Role == model.RoleSystem {
-			t.Fatal("system message leaked into history")
+	want := []string{"r1", "r2", "w", "r3"}
+	for i, name := range want {
+		if res.Messages[2+i].Name != name {
+			t.Fatalf("results out of model order: %+v", res.Messages)
 		}
 	}
 }
 
-func TestSessionCarriesHistory(t *testing.T) {
-	p := fake.Script(fake.Text("one"), fake.Text("two"))
-	s := harness.NewSession(&harness.Agent{Provider: p})
-	if _, err := s.Send(context.Background(), "first"); err != nil {
+func TestPerCallTimeout(t *testing.T) {
+	slow := tool.Func(tool.Spec{Name: "slow", Timeout: time.Millisecond}, func(ctx context.Context, _ json.RawMessage) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	a := &harness.Agent{Provider: fake.Script(fake.Call("slow", nil), fake.Text("ok")), Tools: tool.NewRegistry(slow)}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
+	if err != nil || !strings.Contains(res.Messages[2].Content, "deadline") {
+		t.Fatalf("%v %+v", err, res)
+	}
+}
+
+func TestCallNotOfferedIsDenied(t *testing.T) {
+	ran := false
+	secret := tool.Func(tool.Spec{Name: "secret"}, func(context.Context, json.RawMessage) (string, error) {
+		ran = true
+		return "", nil
+	})
+	a := &harness.Agent{Provider: fake.Script(fake.Call("secret", nil), fake.Text("ok")), Tools: tool.NewRegistry(secret),
+		Hooks: []harness.Hook{hideTools{}}}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
+	if err != nil || ran || !strings.Contains(res.Messages[2].Content, "not offered") {
+		t.Fatalf("%v ran=%v %+v", err, ran, res)
+	}
+}
+
+type hideTools struct{}
+
+func (hideTools) Name() string { return "hide" }
+func (hideTools) BeforeModel(_ context.Context, _ harness.Run, req *model.Request) error {
+	req.Tools = nil
+	return nil
+}
+
+func TestCancellationIsRecorded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stopper := tool.Func(tool.Spec{Name: "stop"}, func(context.Context, json.RawMessage) (string, error) {
+		cancel()
+		return "ok", nil
+	})
+	a := &harness.Agent{Provider: fake.Script(fake.Call("stop", nil), fake.Text("no")), Tools: tool.NewRegistry(stopper)}
+	res, err := a.Run(ctx, harness.Prompt("x"))
+	if err != nil || res.Stop != harness.StopCancelled || res.State != sp {
+		t.Fatalf("%v %+v", err, res)
+	}
+	balanced(t, res.Messages)
+}
+
+// compactor is a reference hook: the summariser's nondeterminism is recorded.
+type compactor struct{ runs *int }
+
+func (compactor) Name() string { return "compact" }
+func (c compactor) Context(_ context.Context, r harness.Run) (harness.Edit, error) {
+	if len(r.Messages) < 3 {
+		return harness.Edit{}, nil
+	}
+	*c.runs++
+	return harness.Edit{To: len(r.Messages), Source: "compact",
+		With: []model.Message{model.User(fmt.Sprintf("summary #%d", *c.runs))}}, nil
+}
+
+func TestDurableEditIsRecordedWithProvenance(t *testing.T) {
+	j := harness.NewMemJournal()
+	runs := 0
+	a := &harness.Agent{Journal: j, Provider: fake.Script(fake.Call("echo", nil), fake.Text("ok")),
+		Tools: tool.NewRegistry(echoTool()), Hooks: []harness.Hook{compactor{&runs}}}
+	in := harness.Prompt("x")
+	in.RunID = "r"
+	res, err := a.Run(context.Background(), in)
+	if err != nil || !res.OK() {
+		t.Fatalf("%v %+v", err, res)
+	}
+	r, _ := harness.Fold(mustLoad(t, j, "r"))
+	if r.Messages[0].Source != "compact" || r.Messages[0].Content != "summary #1" || runs != 1 {
+		t.Fatalf("%+v runs=%d", r.Messages, runs)
+	}
+}
+
+type badEdit struct{}
+
+func (badEdit) Name() string { return "bad" }
+func (badEdit) Context(_ context.Context, r harness.Run) (harness.Edit, error) {
+	if len(r.Messages) == 3 {
+		return harness.Edit{To: 2, With: []model.Message{model.User("oops")}}, nil // orphans the result
+	}
+	return harness.Edit{}, nil
+}
+
+func TestEditThatBreaksPairingFailsTheRun(t *testing.T) {
+	a := &harness.Agent{Provider: fake.Script(fake.Call("echo", nil), fake.Text("ok")), Tools: tool.NewRegistry(echoTool()),
+		Hooks: []harness.Hook{badEdit{}}}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
+	if err == nil || res.State != fl || res.Class != model.ClassInternal {
+		t.Fatalf("%v %+v", err, res)
+	}
+}
+
+func TestHookCannotChangeTheRun(t *testing.T) {
+	a := &harness.Agent{Provider: fake.Script(fake.Text("ok")), Hooks: []harness.Hook{vandal{}}}
+	res, err := a.Run(context.Background(), harness.Prompt("x"))
+	if err != nil || res.Messages[0].Content != "x" {
+		t.Fatalf("%v %+v", err, res)
+	}
+}
+
+type vandal struct{}
+
+func (vandal) Name() string { return "vandal" }
+func (vandal) BeforeModel(_ context.Context, r harness.Run, _ *model.Request) error {
+	r.Messages[0].Content = "rewritten"
+	r.Turn = 99
+	return nil
+}
+
+func TestTableOnlyHoldsReachableKindsAndRefusesTheRest(t *testing.T) {
+	if harness.CanTransition(co, harness.KindToolDone, to) {
+		t.Error("compose cannot take tool.done")
+	}
+	_, err := harness.Fold([]harness.Event{
+		{Seq: 1, Kind: harness.KindRunStarted, Pin: &harness.Pin{Schema: 1}},
+		{Seq: 2, Kind: harness.KindModelDone, Reply: &model.Response{Text: "x"}},
+	})
+	if !errors.Is(err, harness.ErrIllegalTransition) {
+		t.Fatalf("a journal with an illegal walk folded: %v", err)
+	}
+}
+
+func TestNoteLandsOnTheHookEvent(t *testing.T) {
+	var text string
+	ctx := harness.WithEvents(context.Background(), func(e harness.Event) {
+		if e.Kind == harness.KindHook && e.Hook == "noter" {
+			text = e.Text
+		}
+	})
+	a := &harness.Agent{Provider: fake.Script(fake.Text("ok")), Hooks: []harness.Hook{noter{}}}
+	if _, err := a.Run(ctx, harness.Prompt("hi")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Send(context.Background(), "second"); err != nil {
-		t.Fatal(err)
+	if text != "saw 1 messages" {
+		t.Errorf("note = %q", text)
 	}
-	if got := len(p.Requests()[1].Messages); got != 3 {
-		t.Fatalf("second request has %d messages, want 3", got)
-	}
-	if len(s.History()) != 4 {
-		t.Fatalf("history = %v", s.History())
-	}
+}
+
+type noter struct{}
+
+func (noter) Name() string { return "noter" }
+func (noter) BeforeModel(ctx context.Context, r harness.Run, _ *model.Request) error {
+	harness.Note(ctx, "saw %d messages", len(r.Messages))
+	return nil
 }
