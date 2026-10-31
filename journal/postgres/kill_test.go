@@ -1,6 +1,7 @@
 package postgres_test
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -35,6 +36,7 @@ const (
 	rootEnv = "AGENT_HARNESS_KILL_ROOT"
 	once    = "pay_a"
 	onceToo = "pay_c"
+	ready   = "ready"
 )
 
 // worker is what the killed process does: it drives one run to its end. Everything it
@@ -49,6 +51,11 @@ func worker(root string) int {
 		return 2
 	}
 	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	fmt.Fprintln(os.Stderr, ready) // from here on a kill can land on work
 	r := tree(db, root)
 	in := harness.Prompt("the task")
 	in.RunID = root
@@ -137,10 +144,47 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func spawn(root string) *exec.Cmd {
-	cmd := exec.Command(os.Args[0])
-	cmd.Env = append(os.Environ(), rootEnv+"="+root)
-	return cmd
+// proc is a running worker.
+type proc struct {
+	cmd    *exec.Cmd
+	stdout strings.Builder
+	ready  chan struct{} // closed when the worker can do work, or has died
+	died   chan error
+}
+
+// spawn starts a worker. A kill is timed from ready and not from the start, because
+// starting takes far longer under the race detector than the work does, and a kill
+// that lands during start proves nothing.
+func spawn(t *testing.T, root string) *proc {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &proc{cmd: exec.Command(os.Args[0]), ready: make(chan struct{}), died: make(chan error, 1)}
+	// The race detector sleeps a second at exit by default, which would read as work.
+	p.cmd.Env = append(os.Environ(), rootEnv+"="+root, "GORACE=atexit_sleep_ms=0")
+	p.cmd.Stdout, p.cmd.Stderr = &p.stdout, w
+	if err := p.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	go func() {
+		defer r.Close()
+		sc := bufio.NewScanner(r)
+		signalled := false
+		for sc.Scan() {
+			if sc.Text() == ready && !signalled {
+				signalled = true
+				close(p.ready)
+			}
+		}
+		if !signalled {
+			close(p.ready)
+		}
+	}()
+	go func() { p.died <- p.cmd.Wait() }()
+	return p
 }
 
 // A process SIGKILLed at random points, restarted from the run ID alone, again and
@@ -170,40 +214,36 @@ func TestKillTheWorkerAtRandomPoints(t *testing.T) {
 	rng := rand.New(rand.NewPCG(seed, 1))
 
 	clean := newID("kill-clean")
+	first := spawn(t, clean)
+	<-first.ready
 	start := time.Now()
-	out, err := spawn(clean).Output()
-	if err != nil {
-		t.Fatalf("uncrashed run: %v\n%s", err, out)
+	if err := <-first.died; err != nil {
+		t.Fatalf("uncrashed run: %v\n%s", err, first.stdout.String())
 	}
 	whole := time.Since(start)
-	t.Logf("an uncrashed run takes %v", whole)
+	out := first.stdout.String()
+	t.Logf("an uncrashed run works for %v", whole)
 
 	kills, midRun, unknown, lost := 0, 0, 0, 0
 	for round := range rounds {
 		root := newID("kill")
-		var last []byte
+		var last string
 		finished := false
 		for attempt := 0; attempt < 300 && !finished; attempt++ {
-			cmd := spawn(root)
-			stdout := new(strings.Builder)
-			cmd.Stdout = stdout
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
-			died := make(chan error, 1)
-			go func() { died <- cmd.Wait() }()
+			p := spawn(t, root)
+			<-p.ready
 			select {
-			case err := <-died:
+			case err := <-p.died:
 				if err != nil {
 					t.Fatalf("round %d: a worker failed by itself: %v", round, err)
 				}
-				last, finished = []byte(stdout.String()), true
+				last, finished = p.stdout.String(), true
 			case <-time.After(time.Duration(rng.Int64N(int64(whole) * 3 / 2))):
-				if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 					t.Fatal(err)
 				}
-				if err := <-died; err == nil {
-					last, finished = []byte(stdout.String()), true
+				if err := <-p.died; err == nil {
+					last, finished = p.stdout.String(), true
 				} else {
 					kills++
 					if parked(t, ctx, j, root) {
@@ -215,7 +255,7 @@ func TestKillTheWorkerAtRandomPoints(t *testing.T) {
 		if !finished {
 			t.Fatalf("round %d: did not finish in 300 restarts", round)
 		}
-		if string(last) != string(out) {
+		if last != out {
 			t.Errorf("round %d: output\n%s\nwant\n%s", round, last, out)
 		}
 		u, l := audit(t, ctx, db, j, root)
