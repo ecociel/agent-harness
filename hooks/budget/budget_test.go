@@ -273,3 +273,30 @@ func TestATreeBudgetUsesTheConsumersProjection(t *testing.T) {
 		t.Fatalf("without the projection: stop %s after %d child calls", res.Stop, paid)
 	}
 }
+
+// A pattern writes no model event, so the projection is one line with no exceptions,
+// and a shared limit on the branches stops the pipeline.
+func TestATreeBudgetOverAPatternIsAPlainSum(t *testing.T) {
+	l := &ledger{Journal: harness.NewMemJournal(), trees: map[string]model.Usage{}}
+	paid := 0
+	step := func(name string) *harness.Agent {
+		return &harness.Agent{Name: name, Hooks: []harness.Hook{budget.New(budget.Limits{Tokens: 170}).WithPool(l.pool)},
+			Provider: fake.NewFunc(func(model.Request) (model.Response, error) {
+				paid++
+				return model.Response{Text: "done", Usage: used(90, 0)}, nil
+			})}
+	}
+	p := &multi.Sequential{Journal: l, Steps: []harness.Runner{step("a"), step("b"), step("c")}}
+	in := harness.Prompt("x")
+	in.RunID = "root"
+	res, err := p.Run(context.Background(), in)
+	if err != nil || res.Stop != harness.StopBudget {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if paid != 2 {
+		t.Fatalf("paid for %d steps, want the two that fit under the shared limit", paid)
+	}
+	if got := l.trees["root"].Input; got != paid*90 {
+		t.Fatalf("the projection holds %d for %d paid calls", got, paid)
+	}
+}

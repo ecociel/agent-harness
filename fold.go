@@ -27,6 +27,7 @@ var ErrIllegalTransition = errors.New("harness: illegal transition")
 type Pin struct {
 	Schema       int               `json:"schema"`
 	Instructions string            `json:"instructions,omitempty"`
+	Shape        string            `json:"shape,omitempty"` // what a composite run runs; empty for an agent
 	Model        string            `json:"model,omitempty"`
 	MaxTurns     int               `json:"max_turns"`
 	MaxRepairs   int               `json:"max_repairs"`
@@ -40,6 +41,25 @@ type Pin struct {
 type Drift struct {
 	Instructions bool     `json:"instructions,omitempty"`
 	Tools        []string `json:"tools,omitempty"` // changed or removed since the pin
+	// Shape means the run's work changed: a composite's parts were reordered, or the
+	// run belongs to something else entirely. The run fails rather than hand one
+	// part's journal to another.
+	Shape bool `json:"shape,omitempty"`
+}
+
+// Spend is what model and tool calls added up to.
+type Spend struct {
+	Usage      model.Usage `json:"usage"`
+	Turns      int         `json:"turns"`
+	ModelCalls int         `json:"model_calls"`
+	LostCalls  int         `json:"lost_calls,omitempty"`
+	ToolCalls  int         `json:"tool_calls"`
+}
+
+// Add returns s plus o.
+func (s Spend) Add(o Spend) Spend {
+	return Spend{Usage: s.Usage.Add(o.Usage), Turns: s.Turns + o.Turns, ModelCalls: s.ModelCalls + o.ModelCalls,
+		LostCalls: s.LostCalls + o.LostCalls, ToolCalls: s.ToolCalls + o.ToolCalls}
 }
 
 // callStatus is where one tool call of a batch stands.
@@ -121,9 +141,10 @@ type Run struct {
 	Usage    model.Usage     `json:"usage"`
 	Turn     int             `json:"turns"` // model turns begun
 	Repairs  int             `json:"repairs"`
-	// ModelCalls and ToolCalls count this run only. LostCalls are model calls a
-	// crash cut off, billed or not, so what the provider charged lies between
-	// ModelCalls and ModelCalls+LostCalls calls.
+	// ModelCalls and ToolCalls count this run only, so a sum over the runs of a tree
+	// counts each call once. LostCalls are model calls a crash or a cancel cut off,
+	// billed or not, so what the provider charged lies between ModelCalls and
+	// ModelCalls+LostCalls calls. Spent adds what a composite run's children reported.
 	ModelCalls int `json:"model_calls"`
 	LostCalls  int `json:"lost_calls,omitempty"`
 	ToolCalls  int `json:"tool_calls"`
@@ -143,6 +164,8 @@ type Run struct {
 	attempt   int
 	last      model.Response
 	batch     []Call
+	below     Spend    // what a composite's children had spent when it last reported
+	heard     []Signal // answers to the waits a composite last parked on
 	offered   []string
 	retryAt   time.Time
 	modelName string // a recovery's replacement, until the next reply
@@ -154,6 +177,15 @@ func (r *Run) OK() bool { return r != nil && r.Stop == StopCompleted }
 
 // Duration is the time from start to the last recorded event.
 func (r *Run) Duration() time.Duration { return r.Updated.Sub(r.Started) }
+
+// Spent is this run's own spend plus what its body last reported for the runs below
+// it, which is all a composite run knows. It is a report, not a projection: an agent
+// cannot see its tools' children, and a run ended from outside reports nothing more.
+// For a tree, sum the runs' own counters.
+func (r *Run) Spent() Spend {
+	return r.below.Add(Spend{Usage: r.Usage, Turns: r.Turn, ModelCalls: r.ModelCalls,
+		LostCalls: r.LostCalls, ToolCalls: r.ToolCalls})
+}
 
 // Fold computes a run from its journal. It reads no clock, calls no hook and does
 // no I/O. Every question about a run has one answer, and this is where it comes
@@ -192,6 +224,9 @@ func (r *Run) apply(ev Event) error {
 		r.Pin, r.Started = *ev.Pin, ev.Time
 		r.Messages = slices.Clone(ev.Messages)
 		r.State = StateCompose
+		if r.composite() {
+			r.State = StateBody
+		}
 
 	case KindRunClaimed:
 		r.claim(ev)
@@ -285,6 +320,9 @@ func (r *Run) apply(ev Event) error {
 		}
 		r.settle(ev.Time)
 
+	case KindBodyDone:
+		r.bodyDone(ev)
+
 	case KindWaitResolved:
 		r.resolve(*ev.Signal, ev.Time)
 
@@ -292,11 +330,10 @@ func (r *Run) apply(ev Event) error {
 		r.check(*ev.Verdict, ev.Text)
 
 	case KindRunStopping:
-		class := model.ErrorClass("")
-		if ev.Failure != nil {
-			class = ev.Failure.Class
+		if r.State == StateModel {
+			r.LostCalls++ // a cancel cut it off: it may be billed, and its reply is gone
 		}
-		r.stop(ev.Stop, class, ev.Text)
+		r.stop(ev.Stop, failureClass(ev), ev.Text)
 
 	case KindRunEnded:
 		switch r.Stop {
@@ -312,6 +349,13 @@ func (r *Run) apply(ev Event) error {
 		return fmt.Errorf("%w: unknown event %q", ErrIllegalTransition, ev.Kind)
 	}
 	return r.commit(from, ev)
+}
+
+func failureClass(ev Event) model.ErrorClass {
+	if ev.Failure != nil {
+		return ev.Failure.Class
+	}
+	return ""
 }
 
 // commit checks the edge an event took against the table.
@@ -335,6 +379,29 @@ func (r *Run) commit(from State, ev Event) error {
 		}
 	}
 	return nil
+}
+
+// composite reports whether this run's work is a body, not a model and tools.
+func (r *Run) composite() bool { return r.Pin.Shape != "" }
+
+// bodyDone takes a body's report. What it spent below replaces the last report,
+// because a body walks all its children each time. A run that parks starts hearing
+// answers afresh, so one to an earlier ask cannot reach a child that has moved on.
+func (r *Run) bodyDone(ev Event) {
+	r.below = *ev.Below
+	if len(ev.Waits) > 0 {
+		r.heard = nil
+		r.open(ev.Waits, ev.Time)
+		return
+	}
+	r.last = *ev.Reply
+	r.Messages = append(r.Messages, ev.Reply.Message())
+	if ev.Stop == "" {
+		r.State = StateVerify
+		return
+	}
+	r.Output = ev.Reply.Text
+	r.stop(ev.Stop, failureClass(ev), ev.Text)
 }
 
 // claim fences the previous worker and voids decisions about calls that have not
@@ -417,6 +484,10 @@ func (r *Run) route(resp model.Response) {
 // decided, then every wait resolved, then every allowed call run, then the batch
 // closes. Started calls hold it in tools until they report or are declared lost.
 func (r *Run) settle(now time.Time) {
+	if r.composite() {
+		r.State = StateBody
+		return
+	}
 	var started, pending, allowed bool
 	for _, c := range r.batch {
 		started = started || c.status == callStarted
@@ -440,14 +511,19 @@ func (r *Run) settle(now time.Time) {
 
 // closeBatch moves a batch's results into the history in call order. Every call
 // gets exactly one result, even the ones that never ran. This is what keeps a
-// transcript valid for the provider on the next turn, whatever ended the batch.
+// transcript valid for the provider on the next turn, whatever ended the batch. A
+// started call may have happened, so the model is not told it was skipped: a
+// transcript can start another run, and a model told that would do it again.
 func (r *Run) closeBatch(reason string) {
 	for _, c := range r.batch {
 		content := c.content
-		if c.status != callDone {
-			content = fmt.Sprintf(`{"skipped":true,"tool":%q,"reason":%q}`, c.Name, reason)
-		} else {
+		switch c.status {
+		case callDone:
 			r.ToolCalls++
+		case callStarted:
+			content = fmt.Sprintf(`{"unknown":true,"tool":%q,"reason":%q}`, c.Name, reason)
+		default:
+			content = fmt.Sprintf(`{"skipped":true,"tool":%q,"reason":%q}`, c.Name, reason)
 		}
 		r.Messages = append(r.Messages, model.ToolResult(c.ID, c.Name, content))
 	}
@@ -479,7 +555,9 @@ func (r *Run) resolve(s Signal, now time.Time) {
 	}
 	w := r.Waits[i]
 	r.Waits = slices.Delete(slices.Clone(r.Waits), i, i+1)
-	if w.Call >= 0 && w.Call < len(r.batch) {
+	if r.composite() {
+		r.heard = append(r.heard, s)
+	} else if w.Call >= 0 && w.Call < len(r.batch) {
 		c := &r.batch[w.Call]
 		c.Signals = append(c.Signals, s)
 		if w.Kind == WaitUnknownOutcome && w.Run == r.ID {
@@ -525,6 +603,8 @@ func (r *Run) wake(lease time.Time) time.Time {
 	switch {
 	case r.State.Terminal():
 		return time.Time{}
+	case r.composite() && r.ParentRun != "":
+		return time.Time{} // never swept, and no sign of life: only its children work
 	case r.State != StateSuspended:
 		return lease
 	}
@@ -554,6 +634,7 @@ type (
 		detail string
 	} // stop on a pinned limit
 	stepLoseModel struct{}                // a started model call has no outcome
+	stepBody      struct{}                // a composite's work
 	stepGate      struct{ calls []Call }  // BeforeTool on each
 	stepExecute   struct{ calls []Call }  // run these together
 	stepLoseTools struct{ calls []Call }  // started calls have no outcome
@@ -566,6 +647,7 @@ type (
 func (stepCompose) isStep()   {}
 func (stepLimit) isStep()     {}
 func (stepLoseModel) isStep() {}
+func (stepBody) isStep()      {}
 func (stepGate) isStep()      {}
 func (stepExecute) isStep()   {}
 func (stepLoseTools) isStep() {}
@@ -577,7 +659,12 @@ func (stepEnd) isStep()       {}
 // next is the decider: a pure function from a fold to the next step. It mirrors
 // corporate-admin's agent.Next(limits, turn), with the limits pinned in the run.
 func next(r *Run) step {
+	if r.Drift.Shape && r.State.Loop() == "inner" {
+		return stepLimit{StopFailed, "the parts of this run changed after it started"}
+	}
 	switch r.State {
+	case StateBody:
+		return stepBody{}
 	case StateCompose:
 		if r.attempt == 0 && r.Turn >= r.Pin.MaxTurns {
 			return stepLimit{StopMaxTurns, fmt.Sprintf("reached %d turns", r.Pin.MaxTurns)}

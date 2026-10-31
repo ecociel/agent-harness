@@ -7,7 +7,8 @@ package harness
 type State string
 
 // The states. Compose, Model, Gate and Tools form the inner loop: one model/tool
-// turn, repeated until the model answers without asking for tools.
+// turn, repeated until the model answers without asking for tools. A composite run
+// has Body in their place.
 const (
 	// StateStart is an empty journal.
 	StateStart State = "start"
@@ -23,6 +24,10 @@ const (
 	// StateTools runs allowed calls. Found on resume with a started call, that
 	// call's outcome is unknown.
 	StateTools State = "tools"
+	// StateBody means a composite run's work is due or under way. It has no outcome
+	// to lose: found on resume, the work runs again and finished children answer from
+	// their journals.
+	StateBody State = "body"
 	// StateVerify runs CheckOutput hooks on the candidate answer.
 	StateVerify State = "verify"
 	// StateSuspended holds open waits. No worker is needed: Run returns, and a
@@ -42,7 +47,7 @@ const (
 // Loop names which loop a state belongs to: "outer", "inner" or "terminal".
 func (s State) Loop() string {
 	switch s {
-	case StateCompose, StateModel, StateGate, StateTools:
+	case StateCompose, StateModel, StateGate, StateTools, StateBody:
 		return "inner"
 	case StateDone, StateStopped, StateFailed:
 		return "terminal"
@@ -64,6 +69,7 @@ type Edge struct {
 // run.claimed and run.stopping; init adds those so this table shows the flow.
 var edges = []Edge{
 	{StateStart, KindRunStarted, StateCompose},
+	{StateStart, KindRunStarted, StateBody}, // a composite run
 
 	{StateCompose, KindHistoryEdited, StateCompose},
 	{StateCompose, KindModelStarted, StateModel},
@@ -93,9 +99,14 @@ var edges = []Edge{
 	{StateTools, KindToolLost, StateCompose},   // a drifted tool emptied the batch
 	{StateTools, KindToolLost, StateSuspended}, // EffectOnce: ask
 
+	{StateBody, KindBodyDone, StateVerify},
+	{StateBody, KindBodyDone, StateSuspended}, // a child waits
+	{StateBody, KindBodyDone, StateClosing},   // a child stopped, or the body failed
+
 	{StateSuspended, KindWaitResolved, StateSuspended},
 	{StateSuspended, KindWaitResolved, StateGate},
 	{StateSuspended, KindWaitResolved, StateCompose},
+	{StateSuspended, KindWaitResolved, StateBody},
 
 	{StateVerify, KindOutputChecked, StateCompose}, // revise
 	{StateVerify, KindOutputChecked, StateClosing},
@@ -109,7 +120,7 @@ var edges = []Edge{
 	{StateGate, KindRunClaimed, StateCompose},
 }
 
-var liveStates = []State{StateCompose, StateModel, StateGate, StateTools, StateVerify,
+var liveStates = []State{StateCompose, StateModel, StateGate, StateTools, StateBody, StateVerify,
 	StateSuspended, StateClosing}
 
 var legal = map[Edge]bool{}
@@ -134,6 +145,6 @@ func Transitions() []Edge { return append([]Edge(nil), edges...) }
 
 // States lists every state in diagram order.
 func States() []State {
-	return []State{StateStart, StateCompose, StateModel, StateGate, StateTools, StateVerify,
+	return []State{StateStart, StateCompose, StateModel, StateGate, StateTools, StateBody, StateVerify,
 		StateSuspended, StateClosing, StateDone, StateStopped, StateFailed}
 }

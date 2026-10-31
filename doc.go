@@ -31,6 +31,14 @@
 //	gate, tools or a long backoff ─▶ suspended ─▶ gate | compose
 //	every live state ─▶ closing, on a decided stop
 //
+// A Composite run is a run whose work is to run others, so body takes the place of
+// the inner loop. It writes no model or tool event, and its answer goes through the
+// same verify and closing:
+//
+//	start ─▶ body ─▶ verify ─▶ closing ─▶ done | stopped | failed
+//	          ▲ │
+//	          └─┴─▶ suspended, while a child waits
+//
 // The legal edges are data (Transitions), keyed by the event that takes them.
 // Fold refuses anything else, so a journal cannot hold a walk the machine forbids.
 //

@@ -56,13 +56,25 @@ func (sa Subagent) maxDepth() int {
 func (sa Subagent) Tool() tool.Tool {
 	spec := tool.Spec{Name: sa.Name, Description: sa.Description, Parameters: taskSchema, Risk: sa.Risk,
 		Effect: tool.EffectIdempotent}
-	return tool.Func(spec, func(ctx context.Context, raw json.RawMessage) (string, error) {
+	return childTool{Tool: tool.Func(spec, func(ctx context.Context, raw json.RawMessage) (string, error) {
 		task, err := parseTask(raw)
 		if err != nil {
 			return "", err
 		}
 		return sa.delegate(ctx, task)
-	})
+	}), child: sa.Agent}
+}
+
+// childTool is a tool that starts a run named by its prefix and the call's key.
+type childTool struct {
+	tool.Tool
+	child  harness.Runner
+	prefix string
+}
+
+// CancelChild implements harness.ChildTool.
+func (t childTool) CancelChild(ctx context.Context, reason string) error {
+	return cancelChild(ctx, t.child, t.prefix+tool.IdempotencyKey(ctx), reason)
 }
 
 func (sa Subagent) delegate(ctx context.Context, task string) (string, error) {
@@ -149,13 +161,13 @@ func (b *Background) Tools() []tool.Tool {
 	for _, sa := range b.subs {
 		spec := tool.Spec{Name: "start_" + sa.Name, Description: "Start in the background: " + sa.Description,
 			Parameters: taskSchema, Risk: sa.Risk, Effect: tool.EffectIdempotent}
-		out = append(out, tool.Func(spec, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		out = append(out, childTool{Tool: tool.Func(spec, func(ctx context.Context, raw json.RawMessage) (string, error) {
 			task, err := parseTask(raw)
 			if err != nil {
 				return "", err
 			}
 			return b.start(ctx, sa, task), nil
-		}))
+		}), child: sa.Agent, prefix: jobPrefix(sa)})
 	}
 	collect := tool.Spec{Name: "collect", Description: "Get the result of a background job. Set wait=true to block until it finishes.",
 		Effect:     tool.EffectRead,
@@ -194,7 +206,7 @@ func (b *Background) launch(ctx context.Context, sa Subagent, in harness.Input) 
 
 func (b *Background) start(ctx context.Context, sa Subagent, task string) string {
 	in := harness.Prompt(task)
-	in.RunID = sa.Name + "/" + tool.IdempotencyKey(ctx)
+	in.RunID = jobPrefix(sa) + tool.IdempotencyKey(ctx)
 	durable := make(chan struct{})
 	var once sync.Once
 	ctx = harness.WithEvents(ctx, func(e harness.Event) {
@@ -209,6 +221,8 @@ func (b *Background) start(ctx context.Context, sa Subagent, task string) string
 	}
 	return fmt.Sprintf(`{"job":%q,"status":"running"}`, in.RunID)
 }
+
+func jobPrefix(sa Subagent) string { return sa.Name + "/" }
 
 func (b *Background) collect(ctx context.Context, id string, wait bool) (string, error) {
 	name, _, _ := strings.Cut(id, "/")

@@ -201,15 +201,12 @@ func (w *world) agent(name, toolName string, hooks ...harness.Hook) *harness.Age
 		Tools: tool.NewRegistry(w.tool(toolName, tool.Spec{Effect: tool.EffectOnce, Risk: tool.RiskDangerous}))}
 }
 
-// spend is the projection a consumer would keep: model calls and usage over every
-// run in the journal, skipping the scripted leads of patterns.
+// spend is the projection a consumer would keep: a plain sum over every run in the
+// journal.
 func spend(t *testing.T, j *jsonJournal) (calls, lost, input int) {
 	t.Helper()
 	for _, id := range j.ids() {
 		r := fold(t, j, id)
-		if r.Pin.Model == multi.ScriptedModel {
-			continue
-		}
 		calls += r.ModelCalls
 		lost += r.LostCalls
 		input += r.Usage.Input
@@ -382,8 +379,8 @@ func (s scenario) check(t *testing.T, name string, clean *harness.Run, run strin
 		t.Errorf("%s: usage %d for %d calls", name, input, calls)
 	}
 	if s.reportsTree {
-		if res.ModelCalls != calls || res.LostCalls != lost || res.Usage.Input != input {
-			t.Errorf("%s: the pattern reports %d/%d/%d, its tree holds %d/%d/%d", name, res.ModelCalls, res.LostCalls, res.Usage.Input, calls, lost, input)
+		if got := res.Spent(); got.ModelCalls != calls || got.LostCalls != lost || got.Usage.Input != input {
+			t.Errorf("%s: the pattern reports %d/%d/%d, its tree holds %d/%d/%d", name, got.ModelCalls, got.LostCalls, got.Usage.Input, calls, lost, input)
 		}
 	}
 	for _, id := range inner.ids() {
@@ -518,8 +515,8 @@ func TestApprovalInOneBranchDoesNotHoldUpTheOther(t *testing.T) {
 	if b := fold(t, j, "root/1"); !b.OK() {
 		t.Fatalf("the free branch did not finish: %+v", b)
 	}
-	if res.ModelCalls != 3 {
-		t.Fatalf("a suspended pattern reports what it has spent so far, got %d calls", res.ModelCalls)
+	if got := res.Spent().ModelCalls; got != 3 {
+		t.Fatalf("a suspended pattern reports what it has spent so far, got %d calls", got)
 	}
 	paid := w.billed()
 	res, err = build().Run(ctx, harness.Resume("root", harness.Signal{Wait: res.Waits[0].ID, Value: approval.Approved, By: "alice"}))

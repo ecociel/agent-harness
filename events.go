@@ -18,6 +18,7 @@ const (
 	KindRunStarted    Kind = "run.started"    // identity, Pin, input
 	KindRunClaimed    Kind = "run.claimed"    // a worker took the run; fences the previous one
 	KindHistoryEdited Kind = "history.edited" // a Context hook's durable edit
+	KindBodyDone      Kind = "body.done"      // how a composite run's work came out
 	KindModelStarted  Kind = "model.started"  // intent: a paid call is about to happen
 	KindModelDone     Kind = "model.done"     // the reply and its usage
 	KindModelFailed   Kind = "model.failed"   // classified failure and the recovery decided
@@ -72,7 +73,8 @@ type Event struct {
 	Drift    *Drift          `json:"drift,omitempty"`    // run.claimed
 	Edit     *Edit           `json:"edit,omitempty"`     // history.edited
 	Offered  []string        `json:"offered,omitempty"`  // model.started
-	Reply    *model.Response `json:"reply,omitempty"`    // model.done
+	Reply    *model.Response `json:"reply,omitempty"`    // model.done, and a body's answer on body.done
+	Below    *Spend          `json:"below,omitempty"`    // body.done
 	Failure  *Failure        `json:"failure,omitempty"`  // model.failed, run.stopping
 	Recovery *Recovery       `json:"recovery,omitempty"` // model.failed
 	Decision *Decision       `json:"decision,omitempty"` // tool.gated
@@ -81,7 +83,7 @@ type Event struct {
 	Waits    []Wait          `json:"waits,omitempty"`    // the waits this event opens
 	Signal   *Signal         `json:"signal,omitempty"`   // wait.resolved
 	Verdict  *Verdict        `json:"verdict,omitempty"`  // output.checked
-	Stop     StopReason      `json:"stop,omitempty"`     // run.stopping
+	Stop     StopReason      `json:"stop,omitempty"`     // run.stopping, body.done
 }
 
 // EventSink receives events. It is called synchronously from the run (and, for
@@ -214,6 +216,7 @@ func (e *Event) redact(visit func(*string)) {
 	if e.Pin != nil {
 		p := *e.Pin
 		visit(&p.Instructions)
+		visit(&p.Shape)
 		e.Pin = &p
 	}
 	if e.Edit != nil {

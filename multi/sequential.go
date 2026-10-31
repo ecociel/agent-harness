@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/ecociel/agent-harness"
 )
@@ -28,6 +29,8 @@ type Sequential struct {
 	Journal harness.Journal
 	// Hooks attach to the pipeline's own run. A Redactor here covers every step.
 	Hooks []harness.Hook
+	// Lease is the same as Parallel.Lease.
+	Lease time.Duration
 }
 
 // RunnerName implements harness.Named.
@@ -35,8 +38,8 @@ func (p *Sequential) RunnerName() string { return p.Name }
 
 // Run implements harness.Runner.
 func (p *Sequential) Run(ctx context.Context, in harness.Input) (*harness.Run, error) {
-	spec := pattern{kind: "sequential", name: p.Name, journal: p.Journal, hooks: p.Hooks, parts: names(p.Steps)}
-	return spec.run(ctx, in, func(s *scope) (string, error) {
+	spec := pattern{kind: "sequential", name: p.Name, journal: p.Journal, hooks: p.Hooks, lease: p.Lease, parts: positional(p.Steps)}
+	return spec.run(ctx, in, func(s *scope) (string, harness.Spend, error) {
 		cur, output := s.in, ""
 		for i, step := range p.Steps {
 			s.emit("step", fmt.Sprintf("%d/%d %s", i+1, len(p.Steps), harness.NameOf(step)))
@@ -44,7 +47,7 @@ func (p *Sequential) Run(ctx context.Context, in harness.Input) (*harness.Run, e
 			res, err := s.advance(step, cur)
 			switch {
 			case res == nil:
-				return "", err
+				return s.halt(err)
 			case res.State == harness.StateSuspended:
 				return s.park(res.Waits...)
 			case err != nil:

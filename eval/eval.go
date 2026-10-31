@@ -70,7 +70,7 @@ func Run(ctx context.Context, r harness.Runner, tasks []Task, parallel int) Repo
 			res, err := r.Run(ctx, harness.Prompt(t.Instruction))
 			tr := TaskResult{Task: t.Name, Duration: time.Since(t0)}
 			if res != nil {
-				tr.Stop, tr.Output, tr.Usage = string(res.Stop), res.Output, res.Usage
+				tr.Stop, tr.Output, tr.Usage = string(res.Stop), res.Output, res.Spent().Usage
 			}
 			if err != nil {
 				tr.Err, tr.Note = err.Error(), "run failed"

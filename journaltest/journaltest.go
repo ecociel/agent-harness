@@ -55,6 +55,8 @@ var checks = []check{
 	{"TwoWorkersRepeatNothing", twoWorkersRepeatNothing},
 	{"CrashSweepOneAgent", func(t testing.TB, j harness.Journal) { sweep(t, j, oneAgent) }},
 	{"CrashSweepParallel", func(t testing.TB, j harness.Journal) { sweep(t, j, parallel) }},
+	{"CancelStopsARunningChild", cancelStopsARunningChild},
+	{"CancelEndsAParkedBranch", cancelEndsAParkedBranch},
 }
 
 func newID(prefix string) string {
@@ -92,11 +94,12 @@ func everyFieldSurvives(t testing.TB, j harness.Journal) {
 		From: harness.StateTools, To: harness.StateCompose, Wake: time.Date(2026, 10, 30, 12, 0, 1, 987654321, time.UTC),
 		Hook: "h", Tool: "t", Point: harness.PointBeforeTool, Outcome: "ok", Text: "text",
 		Duration: 1500 * time.Millisecond, Index: 4, Attempt: 5,
-		Pin:      &harness.Pin{Instructions: "be careful", Model: "m", MaxTurns: 8, Temperature: &temperature},
+		Pin:      &harness.Pin{Instructions: "be careful", Shape: "parallel: a, b", Model: "m", MaxTurns: 8, Temperature: &temperature},
 		Messages: []model.Message{model.User("hello"), {Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "c", Name: "t", Arguments: json.RawMessage(`{"a":[1,2]}`)}}}},
 		Edit:     &harness.Edit{From: 1, To: 2, With: []model.Message{model.Assistant("short")}, Source: "compact"},
 		Offered:  []string{"t", "u"},
 		Reply:    &model.Response{Text: "answer", Usage: model.Usage{Input: 10, Output: 2}},
+		Below:    &harness.Spend{Usage: model.Usage{Input: 7}, Turns: 2, ModelCalls: 3, LostCalls: 1, ToolCalls: 4},
 		Waits:    []harness.Wait{{ID: "w", Run: "r", Kind: "approval", Detail: "sure?", Expires: time.Date(2026, 11, 1, 0, 0, 0, 1, time.UTC)}},
 		Signal:   &harness.Signal{Wait: "w", Value: "yes", By: "op"},
 		Stop:     harness.StopCompleted,
@@ -271,6 +274,108 @@ func twoWorkersRepeatNothing(t testing.TB, j harness.Journal) {
 		if n := w.count("pay"); n != 1 {
 			t.Fatalf("a once-only tool ran %d times after recovery", n)
 		}
+	}
+}
+
+// parks asks for a person before any tool runs.
+type parks struct{}
+
+func (parks) Name() string { return "parks" }
+func (parks) BeforeTool(context.Context, harness.Run, harness.Call) harness.Decision {
+	return harness.Await(harness.Wait{Kind: "approval"})
+}
+
+// A cancel reaches a parked branch through the store, and a late answer moves nothing.
+func cancelEndsAParkedBranch(t testing.TB, j harness.Journal) {
+	ctx := context.Background()
+	w := newWorld()
+	id := newID("cancel-parked")
+	build := func() harness.Runner {
+		a := w.agent("a", "pay")
+		a.Hooks = []harness.Hook{parks{}}
+		return &multi.Parallel{Name: "both", Journal: j, Branches: []harness.Runner{a}}
+	}
+	in := harness.Prompt("the task")
+	in.RunID = id
+	res, err := build().Run(ctx, in)
+	if err != nil || res.State != harness.StateSuspended {
+		t.Fatalf("start: %v %+v", err, res)
+	}
+	wait := res.Waits[0]
+	if res, err = build().Run(ctx, harness.Input{RunID: id, Cancel: "stop now"}); err != nil || res.Stop != harness.StopCancelled {
+		t.Fatalf("cancel: %v %+v", err, res)
+	}
+	branch, err := harness.Fold(load(t, j, id+"/0"))
+	if err != nil || branch.Stop != harness.StopCancelled || !branch.State.Terminal() {
+		t.Fatalf("the parked branch did not end: %v %+v", err, branch)
+	}
+	if _, err := build().Run(ctx, harness.Resume(id, harness.Signal{Wait: wait.ID, Value: "yes"})); err != nil {
+		t.Fatalf("late answer: %v", err)
+	}
+	if n := w.count("pay"); n != 0 {
+		t.Fatalf("a cancelled branch ran its tool %d times", n)
+	}
+}
+
+// A child under a name of its own reads the cancel from the store, past a parent that
+// holds it in a tool, so it depends on Load showing another run's latest event.
+func cancelStopsARunningChild(t testing.TB, j harness.Journal) {
+	ctx := context.Background()
+	w := newWorld()
+	id := newID("cancel-running")
+	childID := id + "-child"
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	first := tool.Func(tool.Spec{Name: "first", Effect: tool.EffectIdempotent}, func(context.Context, json.RawMessage) (string, error) {
+		close(started)
+		<-release
+		return "first ok", nil
+	})
+	child := &harness.Agent{Name: "child", Tools: tool.NewRegistry(first), Provider: w.provider("child", "first")}
+	start := tool.Func(tool.Spec{Name: "start", Effect: tool.EffectIdempotent}, func(ctx context.Context, _ json.RawMessage) (string, error) {
+		in := harness.Prompt("sub task")
+		in.RunID = childID
+		res, err := child.Run(ctx, in)
+		if err != nil {
+			return "", err
+		}
+		return res.Output, nil
+	})
+	root := &harness.Agent{Name: "root", Journal: j, Tools: tool.NewRegistry(start), Provider: w.provider("root", "start")}
+	in := harness.Prompt("the task")
+	in.RunID = id
+	done := make(chan error, 1)
+	go func() {
+		_, err := root.Run(ctx, in)
+		done <- err
+	}()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("the child never started: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the child never started")
+	}
+	if res, err := root.Run(ctx, harness.Input{RunID: id, Cancel: "stop now"}); err != nil || res.Stop != harness.StopCancelled {
+		t.Fatalf("cancel: %v %+v", err, res)
+	}
+	paid := w.billed()
+	once.Do(func() { close(release) })
+	select {
+	case err := <-done:
+		if !errors.Is(err, harness.ErrFenced) {
+			t.Fatalf("the root's worker must be fenced, got %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the worker never stopped")
+	}
+	r, err := harness.Fold(load(t, j, childID))
+	if err != nil || r.Stop != harness.StopCancelled || !r.State.Terminal() {
+		t.Fatalf("the child did not stop: %v %+v", err, r)
+	}
+	if w.billed() != paid {
+		t.Fatalf("the child paid for %d calls after the cancel", w.billed()-paid)
 	}
 }
 
@@ -533,10 +638,8 @@ func (s scenario) check(t testing.TB, base harness.Journal, want, suffix string,
 		if !r.State.Terminal() {
 			t.Errorf("%s: run %s left in %s", name, run, r.State)
 		}
-		if r.Pin.Model != multi.ScriptedModel {
-			calls += r.ModelCalls
-			lost += r.LostCalls
-		}
+		calls += r.ModelCalls
+		lost += r.LostCalls
 	}
 	if calls > w.billed() || w.billed() > calls+lost {
 		t.Errorf("%s: billed %d outside [%d, %d]", name, w.billed(), calls, calls+lost)

@@ -2,120 +2,64 @@ package multi
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"iter"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ecociel/agent-harness"
-	"github.com/ecociel/agent-harness/model"
-	"github.com/ecociel/agent-harness/tool"
 )
 
-const bodyTool = "pattern"
+// part is one child of a pattern. Its run ID is the pattern's plus "/" and id, taken
+// from its position, so an ID never depends on which goroutine ran first.
+type part struct {
+	id     string
+	runner harness.Runner
+}
 
-// ScriptedModel is the Pin.Model of a pattern's lead. Its model events are not paid
-// calls, so a consumer projecting spend from the journal skips runs pinned to it.
-const ScriptedModel = "multi.scripted"
-
-// pattern is what every multi-agent pattern has in common: it is a run. A lead agent
-// whose model is a script calls one tool, the pattern's body, and answers with what
-// the body returned. That gives a pattern everything a run has with no code of its
-// own: its input survives in the journal, its waits are recorded and validated, a
-// finished pattern answers from its journal, and a sweep finds it.
-//
-// The body keeps no state. It is run again after a crash or a signal, and it walks
-// its children, whose IDs come from their position: finished ones return from their
-// journals and the rest carry on.
+// pattern is what every multi-agent pattern has in common: it is a composite run
+// whose body walks its children. The body keeps no state. It runs again after a crash
+// or a signal, and the children's IDs come from their position: finished ones return
+// from their journals and the rest carry on.
 type pattern struct {
 	kind, name string
 	journal    harness.Journal
 	hooks      []harness.Hook
-	parts      []string // the children, in order: a resume must find them unchanged
+	lease      time.Duration
+	parts      []part // pinned: a resume must find them unchanged
 }
 
-// run advances the pattern. Its parts are the tool's description, so they are pinned
-// with the run, and a resume that finds them changed fails instead of giving a
-// child's journal to a different agent.
-func (p pattern) run(ctx context.Context, in harness.Input, body func(*scope) (string, error)) (*harness.Run, error) {
+// run advances the pattern.
+func (p pattern) run(ctx context.Context, in harness.Input, body func(*scope) (string, harness.Spend, error)) (*harness.Run, error) {
 	if p.name == "" {
 		p.name = p.kind
 	}
-	spec := tool.Spec{Name: bodyTool, Effect: tool.EffectIdempotent, Description: p.kind + ": " + strings.Join(p.parts, ", ")}
-	lead := &harness.Agent{Name: p.name, Model: ScriptedModel, Journal: p.journal, Hooks: p.hooks, Provider: script{},
-		Tools: tool.NewRegistry(tool.Func(spec, func(ctx context.Context, args json.RawMessage) (string, error) {
-			var msgs []model.Message
-			if err := json.Unmarshal(args, &msgs); err != nil {
-				return "", err
+	c := &harness.Composite{Name: p.name, Shape: p.shape(), Hooks: p.hooks, Journal: p.journal, Lease: p.lease,
+		Body: func(ctx context.Context, in harness.Input) (string, harness.Spend, error) {
+			return body(&scope{id: in.RunID, name: p.name, kind: p.kind, ctx: ctx,
+				in: harness.Input{Messages: in.Messages}, signals: in.Signals})
+		},
+		Cancel: func(ctx context.Context, id, reason string) error {
+			for _, c := range p.parts {
+				if err := cancelChild(ctx, c.runner, id+"/"+c.id, reason); err != nil {
+					return err
+				}
 			}
-			s := &scope{id: harness.ParentRun(ctx), name: p.name, kind: p.kind, ctx: ctx,
-				in: harness.Input{Messages: msgs}, signals: harness.Signals(ctx)}
-			return body(s)
-		}))}
-	res, err := lead.Run(ctx, in)
-	if res == nil {
-		return nil, err
-	}
-	return settled(res), err
+			return nil
+		}}
+	return c.Run(ctx, in)
 }
 
-// script is the model of a pattern's lead: call the body with the input, then answer
-// with its output. The input travels as the call's arguments, which is how a resume
-// that carries no Messages gets it back.
-type script struct{}
-
-func (script) Complete(_ context.Context, req model.Request) iter.Seq2[model.Event, error] {
-	last := req.Messages[len(req.Messages)-1]
-	if last.Role != model.RoleTool {
-		args, err := json.Marshal(req.Messages)
-		if err != nil {
-			return model.Fail(err)
-		}
-		return model.Stream(model.Response{ToolCalls: []model.ToolCall{{ID: bodyTool, Name: bodyTool, Arguments: args}}})
+// shape names the parts by position, so that moving an agent changes it.
+func (p pattern) shape() string {
+	names := make([]string, len(p.parts))
+	for i, c := range p.parts {
+		names[i] = c.id + ":" + harness.NameOf(c.runner)
 	}
-	t, ok := parseTally(last.Content)
-	if !ok {
-		return model.Fail(errors.New(last.Content)) // the call was denied: its parts changed
-	}
-	return model.Stream(model.Response{Text: t.Output})
-}
-
-// tally is the body's report, recorded as its tool result. A pattern's lead pays
-// nothing, so what a caller wants to know is the sum over its children.
-type tally struct {
-	Output     string             `json:"output"`
-	Stop       harness.StopReason `json:"stop"`
-	Usage      model.Usage        `json:"usage"`
-	Turns      int                `json:"turns"`
-	ModelCalls int                `json:"model_calls"`
-	LostCalls  int                `json:"lost_calls"`
-	ToolCalls  int                `json:"tool_calls"`
-}
-
-func parseTally(s string) (tally, bool) {
-	var t tally
-	return t, json.Unmarshal([]byte(s), &t) == nil && t.Stop != ""
-}
-
-// settled turns the lead's run into the pattern's: the children's totals and a
-// transcript of input and answer, without the lead's scripted turns.
-func settled(res *harness.Run) *harness.Run {
-	out := *res
-	for i := len(res.Events) - 1; i >= 0; i-- {
-		e := res.Events[i]
-		if t, ok := parseTally(e.Text); ok && e.Kind == harness.KindToolDone {
-			out.Usage, out.Turn, out.ModelCalls, out.LostCalls, out.ToolCalls = t.Usage, t.Turns, t.ModelCalls, t.LostCalls, t.ToolCalls
-			out.Output = t.Output
-			out.Messages = append(slices.Clone(res.Events[0].Messages), model.Assistant(t.Output))
-			break
-		}
-	}
-	return &out
+	return p.kind + ": " + strings.Join(names, ", ")
 }
 
 // scope is one execution of a pattern's body.
@@ -125,12 +69,11 @@ type scope struct {
 	in             harness.Input   // the pattern's input, from the journal
 	signals        []harness.Signal
 
-	mu sync.Mutex // children may finish concurrently
-	t  tally
+	mu    sync.Mutex // children may finish concurrently
+	below harness.Spend
 }
 
-// fork names a child by its position in the pattern. Goroutines take their ID from
-// the loop that starts them, so an ID never depends on which one ran first.
+// fork names a child by its position in the pattern.
 func (s *scope) fork(part string) string { return s.id + "/" + part }
 
 // emit reports one step of the pattern. No redactor runs here, so text is a label.
@@ -155,11 +98,7 @@ func (s *scope) advance(r harness.Runner, in harness.Input) (*harness.Run, error
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.t.Usage = s.t.Usage.Add(res.Usage)
-	s.t.Turns += res.Turn
-	s.t.ModelCalls += res.ModelCalls
-	s.t.LostCalls += res.LostCalls
-	s.t.ToolCalls += res.ToolCalls
+	s.below = s.below.Add(res.Spent())
 	return res, err
 }
 
@@ -184,6 +123,17 @@ func deliver(ctx context.Context, r harness.Runner, in harness.Input) (*harness.
 	return r.Run(ctx, in)
 }
 
+// cancelChild ends one child. It may never have started. Or a live worker may have
+// moved it on in the same instant, and then that worker meets the cancel at its next
+// step, so losing the race is not a failure.
+func cancelChild(ctx context.Context, r harness.Runner, id, reason string) error {
+	res, err := r.Run(ctx, harness.Input{RunID: id, Cancel: reason})
+	if res != nil || errors.Is(err, harness.ErrNoSuchRun) || errors.Is(err, harness.ErrFenced) {
+		return nil
+	}
+	return err
+}
+
 func stopped(err error) error {
 	if errors.Is(err, harness.ErrFenced) || errors.Is(err, harness.ErrDrained) {
 		return err
@@ -191,38 +141,24 @@ func stopped(err error) error {
 	return fmt.Errorf("%w: %w", harness.ErrDrained, err)
 }
 
-// finish ends the body. A pattern that did not complete stops its own run with the
-// same reason, and the tally still goes on record.
-func (s *scope) finish(output string, stop harness.StopReason, detail string) (string, error) {
-	s.t.Output, s.t.Stop = output, stop
-	if stop == harness.StopCompleted {
-		return s.report(), nil
-	}
-	return s.report(), harness.Stop(stop, detail)
+// ok ends the body with an answer.
+func (s *scope) ok(output string) (string, harness.Spend, error) { return output, s.below, nil }
+
+// halt stops the worker, not the pattern.
+func (s *scope) halt(err error) (string, harness.Spend, error) { return "", s.below, err }
+
+func (s *scope) fail(err error) (string, harness.Spend, error) {
+	return "", s.below, harness.Stop(harness.StopFailed, err.Error())
 }
 
-func (s *scope) ok(output string) (string, error) {
-	return s.finish(output, harness.StopCompleted, "")
-}
-
-func (s *scope) fail(err error) (string, error) {
-	return s.finish("", harness.StopFailed, err.Error())
-}
-
-// stoppedChild reports a child that did not complete.
-func (s *scope) stoppedChild(who string, res *harness.Run) (string, error) {
-	return s.finish(res.Output, res.Stop, fmt.Sprintf("%s stopped: %s %s", who, res.Stop, res.Detail))
+// stoppedChild stops the pattern for the reason its child stopped.
+func (s *scope) stoppedChild(who string, res *harness.Run) (string, harness.Spend, error) {
+	return res.Output, s.below, harness.Stop(res.Stop, fmt.Sprintf("%s stopped: %s %s", who, res.Stop, res.Detail))
 }
 
 // park suspends the pattern on its children's waits.
-func (s *scope) park(waits ...harness.Wait) (string, error) {
-	s.t.Stop = harness.StopSuspended
-	return s.report(), harness.Suspend(waits...)
-}
-
-func (s *scope) report() string {
-	b, _ := json.Marshal(s.t)
-	return string(b)
+func (s *scope) park(waits ...harness.Wait) (string, harness.Spend, error) {
+	return "", s.below, harness.Suspend(waits...)
 }
 
 var winnerRE = regexp.MustCompile(`(?i)winner\s*[:=]\s*#?(\d+)`)
@@ -249,10 +185,11 @@ func numbered(title string, outputs []string) string {
 	return b.String()
 }
 
-func names(rs []harness.Runner) []string {
-	out := make([]string, len(rs))
+// positional gives runners the IDs of their positions.
+func positional(rs []harness.Runner) []part {
+	out := make([]part, len(rs))
 	for i, r := range rs {
-		out[i] = harness.NameOf(r)
+		out[i] = part{strconv.Itoa(i), r}
 	}
 	return out
 }

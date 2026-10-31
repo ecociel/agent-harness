@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ecociel/agent-harness"
 )
@@ -44,6 +45,11 @@ type Parallel struct {
 	Journal harness.Journal
 	// Hooks attach to the pattern's own run. A Redactor here covers every branch.
 	Hooks []harness.Hook
+	// Lease says how soon a sweep may look at this tree. A working branch holds the
+	// sweep off with its own Lease, so this need not outlast the slowest branch: set it
+	// to how soon a crashed branch should be found. Only a tree's root is swept, so it
+	// does nothing on a nested pattern. Default harness.DefaultLease.
+	Lease time.Duration
 }
 
 // RunnerName implements harness.Named.
@@ -51,15 +57,15 @@ func (p *Parallel) RunnerName() string { return p.Name }
 
 // Run implements harness.Runner.
 func (p *Parallel) Run(ctx context.Context, in harness.Input) (*harness.Run, error) {
-	parts := names(p.Branches)
+	parts := positional(p.Branches)
 	if p.Aggregator != nil {
-		parts = append(parts, "aggregate:"+harness.NameOf(p.Aggregator))
+		parts = append(parts, part{"aggregate", p.Aggregator})
 	}
-	spec := pattern{kind: "parallel", name: p.Name, journal: p.Journal, hooks: p.Hooks, parts: parts}
-	return spec.run(ctx, in, func(s *scope) (string, error) { return p.body(s) })
+	spec := pattern{kind: "parallel", name: p.Name, journal: p.Journal, hooks: p.Hooks, lease: p.Lease, parts: parts}
+	return spec.run(ctx, in, p.body)
 }
 
-func (p *Parallel) body(s *scope) (string, error) {
+func (p *Parallel) body(s *scope) (string, harness.Spend, error) {
 	in := s.in
 	results, errs := fanOut(s, p.Branches, func(int) harness.Input { return in }, p.MaxConcurrent)
 	var failed []string
@@ -67,7 +73,7 @@ func (p *Parallel) body(s *scope) (string, error) {
 	for i, r := range results {
 		switch {
 		case r == nil:
-			return "", errs[i]
+			return s.halt(errs[i])
 		case r.State == harness.StateSuspended:
 			waits = append(waits, r.Waits...)
 		case errs[i] != nil:
@@ -102,7 +108,7 @@ func (p *Parallel) body(s *scope) (string, error) {
 		agg, err := s.advance(p.Aggregator, sub)
 		switch {
 		case agg == nil:
-			return "", err
+			return s.halt(err)
 		case agg.State == harness.StateSuspended:
 			return s.park(agg.Waits...)
 		case err != nil:

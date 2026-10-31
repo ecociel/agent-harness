@@ -54,7 +54,7 @@ type machine struct {
 // run. A run with no Journal has no later, so for it a cancelled context records
 // StopCancelled.
 func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
-	if a.Provider == nil {
+	if a.Provider == nil && a.composite == nil {
 		return nil, errors.New("harness: agent has no Provider")
 	}
 	m := &machine{a: a, hooks: indexHooks(a.Hooks), journal: a.Journal, durable: a.Journal != nil}
@@ -110,6 +110,9 @@ func (m *machine) start(ctx context.Context, id string, in Input) error {
 }
 
 func (a *Agent) pin() *Pin {
+	if a.composite != nil {
+		return &Pin{Schema: schemaVersion, Shape: cmp.Or(a.composite.Shape, "composite")}
+	}
 	p := &Pin{Schema: schemaVersion, Instructions: a.Instructions, Model: a.Model, MaxTurns: a.MaxTurns,
 		MaxRepairs: a.MaxRepairs, MaxTokens: a.MaxTokens, Temperature: a.Temperature,
 		Tools: map[string]string{}}
@@ -148,7 +151,7 @@ func (m *machine) attach(ctx context.Context, in Input) error {
 	host, _ := os.Hostname()
 	evs := []Event{{Kind: KindRunClaimed, Text: fmt.Sprintf("%s/%d", host, os.Getpid()), Drift: drift}}
 	evs = append(evs, resolved...)
-	if in.Cancel != "" {
+	if in.Cancel != "" && r.State != StateClosing {
 		evs = append(evs, Event{Kind: KindRunStopping, Stop: StopCancelled, Text: in.Cancel})
 	}
 	return m.record(ctx, evs...)
@@ -196,7 +199,7 @@ func (m *machine) drift(ctx context.Context) (*Drift, error) {
 	if err := m.scrub(ctx, &live); err != nil {
 		return nil, err
 	}
-	d := &Drift{Instructions: live.Pin.Instructions != m.run.Pin.Instructions}
+	d := &Drift{Instructions: live.Pin.Instructions != m.run.Pin.Instructions, Shape: live.Pin.Shape != m.run.Pin.Shape}
 	for name, fp := range m.run.Pin.Tools {
 		if live.Pin.Tools[name] != fp {
 			d.Tools = append(d.Tools, name)
@@ -239,6 +242,8 @@ func (m *machine) loop(ctx context.Context) (*Run, error) {
 			err = m.record(ctx, Event{Kind: KindRunStopping, Stop: s.reason, Text: s.detail})
 		case stepLoseModel:
 			err = m.record(ctx, Event{Kind: KindModelLost, Attempt: m.run.attempt})
+		case stepBody:
+			err = m.body(ctx)
 		case stepGate:
 			err = m.gate(ctx, s.calls)
 		case stepExecute:
@@ -650,6 +655,9 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 	if err := m.record(ctx, Event{Kind: KindModelStarted, Attempt: attempt, Offered: offered, Text: hash(string(b))}); err != nil {
 		return err
 	}
+	if stopped, err := m.cancelledAbove(ctx); stopped || err != nil {
+		return err
+	}
 	v := m.view()
 	p := m.ringModel(v)
 	for i := len(m.hooks.wrapModel) - 1; i >= 0; i-- {
@@ -735,6 +743,38 @@ func (m *machine) modelFailed(ctx context.Context, err error, attempt int, took 
 	return m.record(ctx, ev)
 }
 
+// body runs a composite's work and records how it came out. Nothing is recorded
+// before it, because it has no effect of its own: its children record theirs, and a
+// crash anywhere leaves the state where it was for the next worker to run it again.
+func (m *machine) body(ctx context.Context) error {
+	r := &m.run
+	output, below, err := m.a.composite.Body(m.nest(ctx, *r),
+		Input{RunID: r.ID, Messages: slices.Clone(r.Messages), Signals: slices.Clone(r.heard)})
+	ev := Event{Kind: KindBodyDone, Reply: &model.Response{Text: output}, Below: &below}
+	var parked *suspension
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrFenced) || errors.Is(err, ErrDrained):
+		return err
+	case errors.As(err, &parked):
+		ev.Waits = slices.Clone(parked.waits)
+	default:
+		stop := m.stopEvent(err)
+		ev.Stop, ev.Text, ev.Failure = cmp.Or(stop.Stop, StopFailed), stop.Text, stop.Failure
+	}
+	return m.record(ctx, ev)
+}
+
+// nest is the context a run hands to what it starts: a child takes its parent, its
+// journal and its redactors from here.
+func (m *machine) nest(ctx context.Context, v Run) context.Context {
+	ctx = context.WithValue(ctx, keyParent, parentInfo{runID: v.ID, root: v.RootRun, depth: v.Depth})
+	if m.durable {
+		ctx = context.WithValue(ctx, keyJournal, m.journal)
+	}
+	return context.WithValue(ctx, keyRedactors, m.hooks.redact)
+}
+
 // gate decides each call and records all the decisions together.
 func (m *machine) gate(ctx context.Context, calls []Call) error {
 	evs := make([]Event, 0, len(calls))
@@ -778,6 +818,9 @@ func (m *machine) execute(ctx context.Context, calls []Call) error {
 		started[i] = Event{Kind: KindToolStarted, Index: c.Index, Tool: c.Name, Attempt: c.attempt + 1}
 	}
 	if err := m.record(ctx, started...); err != nil {
+		return err
+	}
+	if stopped, err := m.cancelledAbove(ctx); stopped || err != nil {
 		return err
 	}
 	type outcome struct {
@@ -852,13 +895,9 @@ func (m *machine) invoke1(ctx context.Context, v Run, c Call) (Event, error) {
 	if t, ok := m.a.Tools.Get(c.Name); ok {
 		c.Spec = t.Spec()
 	}
-	ctx = context.WithValue(ctx, keyParent, parentInfo{runID: v.ID, root: v.RootRun, depth: v.Depth})
+	ctx = m.nest(ctx, v)
 	ctx = context.WithValue(ctx, keySignals, c.toolSignals())
 	ctx = tool.WithIdempotencyKey(ctx, c.Key)
-	if m.durable {
-		ctx = context.WithValue(ctx, keyJournal, m.journal)
-	}
-	ctx = context.WithValue(ctx, keyRedactors, m.hooks.redact)
 	if c.Spec.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.Spec.Timeout)
@@ -917,10 +956,71 @@ func (m *machine) verify(ctx context.Context, output string) error {
 	return m.record(ctx, ev)
 }
 
-// close runs AfterRun, then marks the run ended. The order makes AfterRun at
-// least once: a crash between them runs it again on the next attach.
+// cancelledAbove stops this run if a run above it was cancelled, and reports whether
+// it did. It runs after an intent is recorded and before the effect, so nothing whose
+// intent lands after the cancel goes ahead. It needs no child ID, because every run
+// knows its parent. That is how a cancel reaches a child no walk can find: one a tool
+// started under a name of its own, or one that did not exist when the cancel went by.
+// An ancestor that cannot be read stops the worker, because it may say to stop.
+func (m *machine) cancelledAbove(ctx context.Context) (bool, error) {
+	above, ok := ctx.Value(keyJournal).(Journal)
+	if !ok {
+		return false, nil // nothing above is durable, so nothing can cancel it from outside
+	}
+	for id := m.run.ParentRun; id != ""; {
+		evs, err := above.Load(ctx, id)
+		if err != nil {
+			return false, fmt.Errorf("harness: load %s: %w: %w", id, ErrDrained, err)
+		}
+		if i := slices.IndexFunc(evs, isCancel); i >= 0 {
+			return true, m.record(ctx, Event{Kind: KindRunStopping, Stop: StopCancelled, Text: evs[i].Text})
+		}
+		if len(evs) == 0 {
+			break
+		}
+		id = evs[0].ParentRun
+	}
+	return false, nil
+}
+
+func isCancel(e Event) bool { return e.Kind == KindRunStopping && e.Stop == StopCancelled }
+
+// cancelBelow ends what a cancelled run leaves with no worker to read the cancel: a
+// parked child, or one whose worker died. It goes through each child's own Runner, the
+// way a signal does, so the child's hooks and journal are its own.
+func (m *machine) cancelBelow(ctx context.Context) error {
+	v := m.view()
+	ctx = m.nest(ctx, v)
+	if c := m.a.composite; c != nil {
+		if c.Cancel == nil {
+			return nil
+		}
+		return c.Cancel(ctx, v.ID, v.Detail)
+	}
+	for _, e := range v.Events {
+		if e.Kind != KindToolStarted {
+			continue
+		}
+		t, _ := m.a.Tools.Get(e.Tool)
+		if c, ok := t.(ChildTool); ok {
+			if err := c.CancelChild(tool.WithIdempotencyKey(ctx, callKey(v.ID, e.Turn, e.Index)), v.Detail); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// close runs AfterRun, then marks the run ended. The order makes both this and the
+// cancel below it at least once: a crash before the mark repeats them on the next
+// attach.
 func (m *machine) close(ctx context.Context) error {
 	ctx = context.WithoutCancel(ctx)
+	if m.run.Stop == StopCancelled {
+		if err := m.cancelBelow(ctx); err != nil {
+			return err
+		}
+	}
 	for _, h := range m.hooks.afterRun {
 		_ = m.invoke(ctx, h, PointAfterRun, func(ctx context.Context) (string, error) {
 			h.AfterRun(ctx, m.view())

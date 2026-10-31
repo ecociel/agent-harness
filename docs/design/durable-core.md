@@ -1,6 +1,6 @@
 # Durable core
 
-**Status: design agreed, 2026-10-30. Units 1 and 2 of the plan are done on the `durable-core` branch.** Patterns and hooks that aren't ported yet sit in `_unported/`, which Go ignores. The earlier evidence comes from the working sketch at `.audit/durable-core/spike-sketch/`.
+**Status: design agreed, 2026-10-30. Units 1, 2 and 3 of the plan are done on the `durable-core` branch.** Patterns and hooks that aren't ported yet sit in `_unported/`, which Go ignores. The earlier evidence comes from the working sketch at `.audit/durable-core/spike-sketch/`.
 
 ## Problem
 
@@ -83,7 +83,8 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 |---|---|
 | `Event` | The only record. The journal stores it, sinks receive it, `Fold` reads it. |
 | `Journal` | `Append` and `Load`. The unique index is both the ownership fence and the outbox. |
-| `Run` | The fold. No mutex, no `Agent` pointer, no scratch map. Hooks get it by value, as a shallow copy (see Recommendations). It replaces `Result`. |
+| `Run` | The fold. No mutex, no `Agent` pointer, no scratch map. Hooks get it by value, as a shallow copy (see Agreed decisions not yet built). It replaces `Result`. |
+| `Composite` | A run whose work is to run others. Every pattern is one. It has a body and no model. |
 | `Input` | `RunID`, `Messages`, `Signals`, `Cancel`. |
 | `Pin` | Recorded at start: instructions, model, limits, schema, tool fingerprints. Wiring stays live. |
 | `Wait`, `Signal` | What a suspended run needs, and the answer. |
@@ -100,6 +101,8 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 7. **`Event.Wake`** is on the last event of every append. Projected into a row inside the `Append` transaction, it gives one sweep query for crashed workers, due timers and drained runs, with no third `Journal` method.
 8. **Every tool call gets exactly one result.** `closeBatch` answers each call in call order, whatever ended the batch. A call that never ran gets a synthetic `{"skipped":true}` result. An unanswered tool call can't reach history.
 9. **Child identity is derived.** A sub-agent's run ID is the parent's idempotency key. A parallel branch is `<parent>/<index>`, taken from the loop that starts the goroutine, never from the scheduler.
+10. **A composite run spends nothing.** It writes no `model.*` or `tool.*` event, and `Fold` gives it no spend, so a sum over a tree's runs needs no exceptions. What its children spent reaches its caller through `Run.Spent`, as a report on `body.done`.
+11. **Cancel has two paths, because a worker and its absence need different things.** A running branch reads its ancestors after recording each intent, so it needs no child ID. A parked or crashed branch has no worker to read anything, so its parent ends it through the child's own `Runner`, the way a signal travels.
 
 ### State machine
 
@@ -128,9 +131,16 @@ stateDiagram-v2
   closing --> done
   closing --> stopped
   closing --> failed
+  start --> body: run.started, composite
+  body --> verify: body.done, an answer
+  body --> suspended: body.done, a child waits
+  body --> closing: body.done, a child stopped
+  suspended --> body: waits resolved
 ```
 
 Every live state also takes `run.claimed` and `run.stopping`. The table in `state.go` is data, keyed by the event that takes the edge. `Fold` checks it on every replay, so a journal can't hold a forbidden walk.
+
+A composite has `body.done` and no `body.started`. An intent event guards an effect that must not repeat, and a body has none of its own: its children record theirs. A crash anywhere in a body leaves the state where it was, and the next worker runs it again.
 
 `prepare`, `route` and `observe` go away. Admission happens at each claim, routing is a pure function, and the turn boundary is `compose`. `gate` and `closing` are new, because "all calls decided" and "outcome known but `AfterRun` not finished" are real crash points.
 
@@ -165,6 +175,8 @@ AfterRun(ctx, r Run)                                                    // at le
 
 `OnDelta`, `AfterTurn` and `OnTransition` go away. Streaming guardrails live in `WrapModel`. Metrics and tracing read events, which are now complete.
 
+A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `CheckOutput` and `AfterRun` reach it. `CheckOutput` stays a real guardrail: it can block or rewrite the answer. A revise ends the run with `StopMaxRepairs`, because no model is there to try again.
+
 ## Concern matrix
 
 | # | Concern | The package owns | The consumer supplies |
@@ -174,16 +186,16 @@ AfterRun(ctx, r Run)                                                    // at le
 | 3 | Suspension | `suspended`, `Wait`, `Signal`, `Await`, expiry, re-decide on resolve | Approval UI, who may approve, a sweeper |
 | 4 | Context, compaction | `Context` returns a recorded `Edit`, `BeforeModel` edits are per call | Summariser, retrieval, token counting |
 | 5 | Memory | Load in `Context` with `Edit.Source`, save in `AfterRun` | Memory store and policy |
-| 6 | Token spend | Usage in `model.done`, folded once, `LostCalls` as the honest bound | Price table, limits, tenant totals inside `Append` |
+| 6 | Token spend | Usage in `model.done`, folded once, `LostCalls` as the honest bound. A tree is a plain sum over its runs | Price table, limits, tenant totals inside `Append` |
 | 7 | Tracing | Stable `RunID`, `RootRun`, `ParentRun`, `Seq`. Span IDs hash run and step | Exporter, as a sink |
 | 8 | Metrics | The event vocabulary | Backend, as a sink |
 | 9 | Guardrails | `BeforeRun`, `BeforeTool`, `AfterModel`, `AfterTool`, `CheckOutput`, `WrapModel` for streams | Rules |
 | 10 | Redaction | The ring, the `record` backstop, inheritance by child runs, fail closed | Patterns |
 | 11 | Permissions | `Risk`, `Scope`, `Effect`, per-turn `Offered` enforced in the fold | Policy, principal |
 | 12 | Retry, fallback | `model.Error` classes, `Recover`, recorded decisions, durable backoff | Policy, classification in adapters |
-| 13 | Timeouts, shutdown | `Spec.Timeout`, `WithDrain`, `ErrDrained`, `Input.Cancel`, the fence | Deadlines, when to call `Run` |
+| 13 | Timeouts, shutdown | `Spec.Timeout`, `WithDrain`, `ErrDrained`, tree-wide `Input.Cancel`, the fence | Deadlines, when to call `Run` |
 | 14 | Tool execution | Batch order, adjacent reads in parallel, single writer, `closeBatch` | Tools |
-| 15 | Multi-agent | Derived child IDs, finished children answer from their journals, wait forwarding | Which patterns |
+| 15 | Multi-agent | `Composite`, derived child IDs, finished children answer from their journals, wait forwarding | Which patterns, `ChildTool` on a tool that starts runs |
 | 16 | Sessions | A run is workflow state. `Session{ID, Turn, History}` is conversation only | Where to save those fields |
 | 17 | Evaluation | `Fold` needs no provider, tool or hook. A what-if copies an event prefix | Eval suites |
 | 18 | Versioning | `Pin`, `Drift`, calls to a changed tool denied and replanned | Migrations in `Journal.Load` |
@@ -200,30 +212,38 @@ AfterRun(ctx, r Run)                                                    // at le
 | `tool.started` | No effect, decisions redone | `tool.lost`: `EffectOnce` suspends on an unknown outcome. Others return to `gate`, so `BeforeTool` hooks and approvals run again, then the tool reruns under the same key |
 | `tool.done` | Effect happened, result lost, same as the cell above | The result stands |
 | `wait.resolved` | The sender retries | A duplicate is ignored |
-| `run.ended` | `AfterRun` reruns | `Run` returns the stored outcome |
+| `body.done` | The body reruns, and finished children answer from their journals | The outcome stands, and the body doesn't run again |
+| `run.stopping` on a cancel | The sender retries, and any process may | A repeat finishes the walk below, then `run.ended` |
+| `run.ended` | `AfterRun` reruns, and so does a cancel's walk below | `Run` returns the stored outcome |
 
-Spend is a bound, not exact: `ModelCalls <= billed <= ModelCalls + LostCalls`. No client can know whether a call that died in flight was billed.
+Spend is a bound, not exact: `ModelCalls <= billed <= ModelCalls + LostCalls`. No client can know whether a call that died in flight was billed. A cancel that cuts a call off counts it as lost too. A branch that stops at the ancestor check, after its intent and before the call, also counts one. That is the check's price: it widens the bound by one and can't make it false.
 
 ## Evidence
 
-Rerun by the design's author, separately from the agent that built the sketch:
+Measured on the working tree at the end of unit 3:
 
-- `go build ./...` and `go vet ./...` pass, and `go test -race -count=3 ./...` passes for all 9 tested packages. That run includes the six crash sweeps.
-- The mutation script reports 64 of 64 safety mutants caught by a named test.
+- `go build ./...`, `go vet ./...` and `gofmt -l .` are clean at the root and in `journal/postgres`.
+- `go test -race -count=10 -timeout 560s ./...` exits 0 at the root, across all 11 tested packages. `multi` took 154s.
+- The six sweeps run 764 cases, counted from their logs. That is fewer than the spike's 900 because a two-branch `Parallel` now appends 24 times, not 30, and they still kill every append of every run in a tree, before and after the write, with and without a second crash on restart. They cover `Parallel`, `Sequential`, an aggregator, an approval inside a sub-agent, a background job, and a lead over a `Parallel` over a `Sequential` with an approval. Every case asserts that each once-only tool ran exactly once, that the output equals the uncrashed run, and that `ModelCalls <= billed <= ModelCalls + LostCalls` holds for a plain sum over the tree. Pattern roots also assert that `Run.Spent` equals that sum.
+- `TestCrashSweepOfACancel` runs 96 more cases, killing a cancel at every append of every run it touches. Every run must end cancelled, with nothing paid for and nothing run, once the sender retries.
+- `TestNoPatternWritesAModelEvent` covers five tree shapes, and a plain sum there equals what the provider billed. `TestCancelStopsABranchThatIsAlreadyRunning`, its agent-root twin, and the tests for a child no walk can find assert that a cancelled branch pays for no further call and starts no further tool.
+- The mutation script reports 118 of 118 caught by a named test, with no survivor and no mutant that failed to build. 54 of them are for the mechanisms of unit 3 and 5 of those ran on real SQL. The first full run gave 111 of 118. Three survivors were real: two tests hid a swallowed error behind a crash that also stopped the next write, and removing the scripted lead had left one agent edge untested. Three named the wrong test, and one did not compile. The tests changed and the mutants did not get easier.
 
-Reported by the spike in `.audit/durable-core/spike-report.md`, and not separately rerun:
+Review found two defects that no test or mutant had caught. A cancel that fenced a model call in flight left it out of `LostCalls`, which broke the billing bound (`billed 1 outside [0, 0]`, now `TestACallInFlightAtACancelCountsAgainstTheBound`). A call in flight also closed as `{"skipped":true}`, which told the next turn that a payment that ran had not.
 
-- The six sweeps give 900 cases. I confirmed that the per-sweep counts add up to 900, not the count of cases executed. They kill every append of every run in a tree, before and after the write, with and without a second crash on restart. They cover `Parallel`, `Sequential`, an aggregator, an approval inside a sub-agent, a background job, and a lead over a `Parallel` over a `Sequential` with an approval. Every once-only tool ran at most once in every case.
-- `go test -race -count=10` exits 0. Its first run failed 6 times in 10, which is how the mutual fence below was found. A single pass would have missed it.
-- Nine defects were found, six of them on the untouched base. The worst left a child suspended forever. All nine are fixed in the sketch and have tests.
+Measured on real PostgreSQL 17.6 through `journal/postgres`, at the end of unit 3:
 
-Measured on real PostgreSQL 17.6 through `journal/postgres`:
-
-- All 11 conformance checks in `journaltest` pass, under `-race -count=3`. They include crash sweeps through one agent and through `Parallel`, two workers racing one run, and concurrent writers racing every position. The sweeps here are a smaller set than the 900 cases above.
+- `go test -race -count=3 ./...` exits 0. With `-v`, all 8 tests and all 13 conformance checks ran, and none skipped. The checks include crash sweeps through one agent and through `Parallel`, two workers racing one run, concurrent writers racing every position, and a cancel reaching a running child and a parked branch. These sweeps are a smaller set than the 764 cases above.
 - `journaltest` refuses all 11 deliberately broken journals, each at the check named for its bug.
-- All 7 mutants of the Postgres journal are caught, including the sweep query run as real SQL.
 
-**Not verified.** No real process kill, and no real provider through the ring. Those crash sweeps kill the journal, not the process. Seven of eleven patterns and eight of eleven hooks are not ported, and `Handoff` and `Team` are expected to be the hard ones (a guess).
+Measured on real PostgreSQL at unit 1, and not rerun: all 7 mutants of the Postgres journal itself are caught.
+
+Reported by the spike in `.audit/durable-core/spike-report.md`, and not rerun:
+
+- Nine defects were found, six of them on the untouched base. The worst left a child suspended forever. All nine are fixed and have tests.
+- `go test -race -count=10` failed 6 times in 10 on its first run, which is how the mutual fence below was found. A single pass would have missed it.
+
+**Not verified.** No real process kill, and no real provider through the ring. The crash sweeps kill the journal, not the process, and the cancel tests run their workers in one process. A cancel recorded after a worker's check and before its provider call starts is not tested as an interleaving: by reading the code, it is the same as a call already in flight, which counts as lost. Seven of eleven patterns and eight of eleven hooks are not ported, and `Handoff` and `Team` are expected to be the hard ones (a guess).
 
 ## Synthesis decision
 
@@ -239,25 +259,36 @@ Grafted into the base: the redaction ring (candidates 1 and 3), `AfterModel` and
 
 ## Design changes the spike forced
 
-1. **A pattern needs a durable row.** The base claimed a pattern could stay stateless and resume by rerunning. That failed with `no such run: root/1`, because an unstarted branch has no recorded input. Signals also could not reach the right branch. The sketch makes a pattern a lead agent with a scripted model. That works and needs no new core API, but it writes `model.*` events for calls nobody paid for, and consumers must skip them.
-2. **`ErrFenced` no longer means someone else owns the run.** In a tree, each run has its own fence, so two live workers can stop each other. This is safe, but it means a sweep is required for trees.
+1. **A pattern needs a durable row.** The base claimed a pattern could stay stateless and resume by rerunning. That failed with `no such run: root/1`, because an unstarted branch has no recorded input. Signals also could not reach the right branch. The sketch made a pattern a lead agent with a scripted model, which wrote `model.*` events for calls nobody paid for and made consumers skip them. Unit 3 replaced that with `Composite`, one state and one event. The skips are gone.
+2. **`ErrFenced` no longer means someone else owns the run.** In a tree, each run has its own fence, so two live workers can stop each other. This is safe, but it means a sweep is required for trees. Unit 3 does not change this. A cancel fences runs one at a time and adds no owner for the tree, and `TestTwoLiveWorkersCanFenceEachOtherAndTheNextRunConverges` still forces the stall.
 
 ## Agreed decisions not yet built
 
-None of these is in the sketch. Each changes or adds to it.
-
-- **Composite runs are first-class.** Replace the scripted model with a small body event pair, so patterns stop producing fake model events. It adds event kinds and edges, against the sketch's zero new core API. Composite runs also need their own `Lease`. Today a pattern takes `DefaultLease`, so a crashed branch isn't found until the root's 10 minutes pass, however short the branch's lease is (`TestDueFindsACrashedBranchBesideAParkedOne`).
-- **Cancel stops running branches before 1.0.** Today `Input.Cancel` can't stop a branch that is already running, so that branch keeps paying for model calls. The fix walks the tree from derived child IDs. Walking through an agent root needs a way to find a child from a tool key, which is still unsolved.
 - **A test check guards the `Run` copy.** `view()` clones the `Messages` slice but not each message's `ToolCalls`, so a hook can change shared state despite having no setters. A deep copy per hook costs O(history). Test helpers fail if a hook changed its `Run`, and production stays unchecked, so a careless hook that slips past tests can still corrupt a live run.
-- **The package ships a journal conformance suite** that runs the crash sweeps against any `Journal`, because a store that gets the unique index wrong loses every guarantee silently. One real SQL journal lives in a separate module, so the core stays dependency-free.
+
+## Known limits
+
+Each of these was left on purpose.
+
+- **Two live workers can still fence each other.** See above. It is safe, and the tree waits at most one `Lease` for a sweep.
+- **A child with no worker needs a way down.** A parked or crashed child is ended through a pattern's parts or a `ChildTool`. A child started by a plain tool stays parked, because only the tool holds its `Runner`. That is safe: its parent no longer holds the wait, and the ancestor check stops it if a worker ever takes it (`TestCancelStopsAChildNoWalkCanFindBeforeItsNextModelCall` proves the running case).
+- **A cancel can lose a race with a live worker.** `Input.Cancel` is an append, so it returns `ErrFenced` and writes nothing, and the sender sends it again (`TestACancelThatLosesARaceSaysSoAndARetryLands`).
+- **Cancelling a finished run does nothing, so a background job can outlive its lead.** Cancel the job by its own ID (`TestACancelAfterTheLeadFinishedDoesNotReachItsJob`).
+- **Only a cancel reaches down.** A `Parallel` that fails on one branch leaves a parked sibling parked, as it did before. Safe, by reading the code.
+- **A `Context` hook runs before the ancestor check.** A summariser that calls a model from that hook can pay once more after a cancel. That call is the hook's own, and the journal can't see it. By reading the code.
+- **`Run.Spent` is a report.** A composite's is what its body last said, and a run ended from outside reports nothing further. An agent's leaves out children its tools started. For a tree, sum the runs.
+- **A sweep can land between two steps of a `Sequential`.** Nothing is working in that instant, so a root past its `Lease` is due and the tree is taken over. By reading the code, that is the zombie case, and it repeats nothing.
+- **Ancestors are read through the parent's journal.** A child with its own `Journal` still sees its parent. A grandparent in a third journal is out of its sight. By reading the code.
 
 ## Tradeoffs accepted
 
-- We accept 311 exported names against 204, and 2,067 code lines against 974 in the root package, in exchange for covering all 19 concerns.
+- We accept 336 exported names against 204, and 2,240 code lines against 974 in the root package, in exchange for covering all 19 concerns. Unit 3 added 25 names, counted by hand, and 173 lines, and took 35 lines out of the four ported `multi` files.
 - We accept a journal write per step, about 15 appends for a 2-turn run with 4 tools, in exchange for a crash point at every step.
 - We accept that the model and tools work from redacted text, in exchange for a guarantee with no exceptions. A tool that needs the real value detokenises in `WrapTool`.
 - We accept at-least-once hooks in exchange for one recovery rule.
 - We accept no lease in the core. A sweep that fires early costs a needless unknown-outcome wait, never a repeated effect.
+- We accept that a nested run reads its ancestors' journals once per model call and tool start, in exchange for a cancel that needs no child ID. Measured on a two-branch `Parallel` with one tool each: 24 appends, 9 loads, 6 of them for this check. A root reads nothing extra.
+- We accept that a root's `Wake` is a floor and not a sign of life. A tree is due at the latest of its root's `Wake` and the `Wake` of whatever below it is working. A pattern only waits, so its `Lease` says how soon to look and need not outlast its slowest branch. A nested pattern has no `Wake`, so its lease can't hide a crash below it.
 - We accept a flat `Event` struct, in exchange for one vocabulary and no decode registry.
 
 ## Settled questions
@@ -274,7 +305,7 @@ Each unit lands on its own and ends in a check. Unit 2 ran first, because the su
 |---|---|---|
 | 1 | Done. Journal conformance suite, plus a real Postgres journal in a separate module | Crash sweeps pass against a real database, and the sweep query runs as SQL |
 | 2 | Done. Land root, `model`, `tool` from the sketch | The sketch's crash sweeps and tests pass here |
-| 3 | First-class composite runs and tree cancel | No pattern writes a `model.*` event, and a cancelled branch pays for no further call |
+| 3 | Done. First-class composite runs, a `Lease` on patterns, tree cancel | No pattern writes a `model.*` event, and a cancelled branch pays for no further call |
 | 4 | Provider adapters: error classes, `Opaque` | Real providers pass the redaction and retry tests |
 | 5 | Port 8 hooks | Each uses only exported API, proven from an external test package |
 | 6 | Port 7 patterns, `Handoff` and `Team` last | A crash sweep through each pattern |

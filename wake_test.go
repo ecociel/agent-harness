@@ -231,6 +231,40 @@ func TestSweepLeavesAHealthyTreeAlone(t *testing.T) {
 	}
 }
 
+func TestEveryAppendOfACompositeEndsWithAWakeOrAReasonForNone(t *testing.T) {
+	j := newJSONJournal()
+	asks := 0
+	c := &harness.Composite{Name: "c", Shape: "test", Journal: j, Lease: time.Minute,
+		Body: func(context.Context, harness.Input) (string, harness.Spend, error) {
+			if asks++; asks == 1 {
+				return "", harness.Spend{}, harness.Suspend(harness.Wait{ID: "w", Run: "child", Kind: "approval"})
+			}
+			return "done", harness.Spend{}, nil
+		}}
+	in := harness.Prompt("x")
+	in.RunID = "r"
+	res, err := c.Run(context.Background(), in)
+	if err != nil || res.State != harness.StateSuspended {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if res, err = c.Run(context.Background(), harness.Resume("r", harness.Signal{Wait: "w", Value: "go"})); err != nil || !res.OK() {
+		t.Fatalf("%v %+v", err, res)
+	}
+	limit := time.Now().Add(time.Minute + time.Second)
+	for _, e := range mustLoad(t, j, "r") {
+		switch {
+		case e.To == harness.StateSuspended || e.Kind == harness.KindRunEnded:
+			if !e.Wake.IsZero() {
+				t.Errorf("%s to %s should not wake: %v", e.Kind, e.To, e.Wake)
+			}
+		case e.Wake.IsZero() && e.Kind != harness.KindRunClaimed:
+			t.Errorf("%s has no wake", e.Kind)
+		case e.Wake.After(limit):
+			t.Errorf("%s wakes past the Lease: %v", e.Kind, e.Wake)
+		}
+	}
+}
+
 func TestEveryAppendEndsWithAWakeOrAReasonForNone(t *testing.T) {
 	j := newJSONJournal()
 	w := newWorld()

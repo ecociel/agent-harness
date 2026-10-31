@@ -30,6 +30,12 @@ import (
 // Children are never swept: their parent resumes them. The NOT EXISTS is what lets
 // a root sit quiet for hours while a child works, and its state test is what stops
 // a child parked until next week from hiding a sibling that crashed.
+//
+// So a root's Wake is a floor, not a claim that it is alive. A tree is due at the
+// latest of its root's Wake and the Wakes of whatever below it is working. A pattern
+// only waits for its children, so its Lease need not outlast them: it says how soon
+// to look, and a working child holds the sweep off by itself. A nested pattern does no
+// work of its own, so it has no Wake at all and cannot hide a crash below it.
 type Journal interface {
 	// Append stores evs for runID, all or nothing. Seq in evs is consecutive and
 	// starts one past the last stored event. If any position is already taken,

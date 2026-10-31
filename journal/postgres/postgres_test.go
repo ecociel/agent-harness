@@ -197,27 +197,68 @@ func TestDueFindsACrashedBranchBesideAParkedOne(t *testing.T) {
 	})}
 	in := harness.Prompt("go")
 	in.RunID = id
-	p := &multi.Parallel{Name: "tree", Journal: tree, Branches: []harness.Runner{parked, agent(tree, time.Minute, "crashes")}}
+	p := &multi.Parallel{Name: "tree", Journal: tree, Lease: time.Minute,
+		Branches: []harness.Runner{parked, agent(tree, time.Minute, "crashes")}}
 	if _, err := p.Run(context.Background(), in); !errors.Is(err, harness.ErrDrained) {
 		t.Fatalf("want a drained worker, got %v", err)
 	}
 	if tree.writes <= 2 {
 		t.Fatalf("branch 1 was not killed: %d writes", tree.writes)
 	}
-	// A pattern has no Lease of its own, so the root's default decides when a tree
-	// is looked at, however short a branch's lease is.
+	// The consumer's Lease on the pattern decides, well inside DefaultLease.
 	now := time.Now()
-	if slices.Contains(due(t, j, now.Add(2*time.Minute)), id) {
+	if slices.Contains(due(t, j, now), id) {
 		t.Fatal("a tree is not due inside its root's lease")
 	}
-	found := due(t, j, now.Add(harness.DefaultLease+time.Minute))
+	found := due(t, j, now.Add(2*time.Minute))
 	if !slices.Contains(found, id) {
-		t.Fatal("a parked branch hid its crashed sibling")
+		t.Fatal("the crashed branch was not found on the pattern's lease")
 	}
 	for _, run := range found {
 		if strings.HasPrefix(run, id+"/") {
 			t.Fatalf("a sweep must not resume child %s: its parent does that", run)
 		}
+	}
+}
+
+// A pattern between the root and the crash does no work, so its own lease must not
+// read as a sign of life. Its default would otherwise hide the crash for ten minutes.
+func TestDueSeesThroughANestedPattern(t *testing.T) {
+	j := open(t)
+	id := newID("nested")
+	in := harness.Prompt("go")
+	in.RunID = id
+	crashing := &dies{Journal: j, left: 4} // both patterns start, then the agent writes twice
+	p := &multi.Sequential{Name: "root", Journal: crashing, Lease: time.Minute, Steps: []harness.Runner{
+		&multi.Sequential{Name: "inner", Steps: []harness.Runner{agent(nil, time.Minute, "crashes")}},
+	}}
+	if _, err := p.Run(context.Background(), in); !errors.Is(err, harness.ErrDrained) {
+		t.Fatalf("want a drained worker, got %v", err)
+	}
+	if !slices.Contains(due(t, j, time.Now().Add(2*time.Minute)), id) {
+		t.Fatal("a nested pattern's lease hid the crash below it")
+	}
+}
+
+// A root's lease is a floor. A branch still inside its own lease is working, so a
+// short lease on the pattern cannot fire over it.
+func TestDueLeavesAWorkingBranchAloneOnAShortPatternLease(t *testing.T) {
+	j := open(t)
+	id := newID("working")
+	in := harness.Prompt("go")
+	in.RunID = id
+	crashing := &dies{Journal: j, left: 3}
+	p := &multi.Parallel{Name: "root", Journal: crashing, Lease: time.Minute,
+		Branches: []harness.Runner{agent(nil, time.Hour, "slow")}}
+	if _, err := p.Run(context.Background(), in); !errors.Is(err, harness.ErrDrained) {
+		t.Fatalf("want a drained worker, got %v", err)
+	}
+	now := time.Now()
+	if slices.Contains(due(t, j, now.Add(30*time.Minute)), id) {
+		t.Fatal("a branch inside its own lease is working, so its tree is not due")
+	}
+	if !slices.Contains(due(t, j, now.Add(2*time.Hour)), id) {
+		t.Fatal("a tree whose branch went quiet must be found")
 	}
 }
 

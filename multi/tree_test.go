@@ -61,10 +61,22 @@ func TestSequentialStopsWithTheStepsReason(t *testing.T) {
 	}
 }
 
+// A Runner can hand back a run that did not complete and gives no reason. It must not
+// read as an answer.
+func TestAChildThatStoppedWithNoReasonDoesNotCompleteThePattern(t *testing.T) {
+	odd := harness.RunnerFunc(func(context.Context, harness.Input) (*harness.Run, error) {
+		return &harness.Run{State: harness.StateStopped, Output: "partial"}, nil
+	})
+	res, err := (&multi.Sequential{Steps: []harness.Runner{odd}}).Run(context.Background(), harness.Prompt("x"))
+	if err == nil || res.OK() || res.State != harness.StateFailed {
+		t.Fatalf("%v %+v", err, res)
+	}
+}
+
 func TestPatternsNeedNoJournalForOneLine(t *testing.T) {
 	p := &multi.Sequential{Steps: []harness.Runner{bot("a", "1"), bot("b", "2")}}
 	res, err := p.Run(context.Background(), harness.Prompt("x"))
-	if err != nil || res.Output != "2" || res.ModelCalls != 2 {
+	if err != nil || res.Output != "2" || res.Spent().ModelCalls != 2 {
 		t.Fatalf("%v %+v", err, res)
 	}
 	if want := []model.Role{model.RoleUser, model.RoleAssistant}; len(res.Messages) != 2 || res.Messages[0].Role != want[0] || res.Messages[1].Content != "2" {
@@ -289,15 +301,15 @@ func TestAStaleAnswerDoesNotSwallowAFreshOne(t *testing.T) {
 	}
 }
 
-// Input.Cancel ends the run it names. It does not reach a child, so a parked child
-// stays parked, unreachable: the root no longer holds its wait, so no answer can get
-// through to run the tool. This pins what happens today. See the spike report.
-func TestCancelEndsTheRootAndStrandsAParkedChildSafely(t *testing.T) {
+// Input.Cancel ends a parked child too. Its hooks run in the process that cancelled,
+// and a late answer finds nothing to move.
+func TestCancelEndsAParkedChild(t *testing.T) {
 	ctx := context.Background()
 	j := newJournal()
 	w := newWorld()
+	closed := &closings{}
 	build := func() *multi.Parallel {
-		return &multi.Parallel{Journal: j, Branches: []harness.Runner{w.agent("a", "send", asks())}}
+		return &multi.Parallel{Journal: j, Branches: []harness.Runner{w.agent("a", "send", asks(), closed)}}
 	}
 	in := harness.Prompt("x")
 	in.RunID = "root"
@@ -310,8 +322,12 @@ func TestCancelEndsTheRootAndStrandsAParkedChildSafely(t *testing.T) {
 	if err != nil || res.Stop != harness.StopCancelled || !res.State.Terminal() {
 		t.Fatalf("%v %+v", err, res)
 	}
-	if s := fold(t, j, "root/0").State; s != harness.StateSuspended {
-		t.Fatalf("child %s", s)
+	child := fold(t, j, "root/0")
+	if child.Stop != harness.StopCancelled || !child.State.Terminal() || child.Detail != "operator" || len(child.Waits) != 0 {
+		t.Fatalf("child %s %s %q waits %v", child.State, child.Stop, child.Detail, child.Waits)
+	}
+	if closed.count() != 1 {
+		t.Fatalf("the child's AfterRun ran %d times", closed.count())
 	}
 	if _, err = build().Run(ctx, harness.Resume("root", harness.Signal{Wait: wait.ID, Value: approval.Approved})); err != nil {
 		t.Fatal(err)
@@ -321,15 +337,16 @@ func TestCancelEndsTheRootAndStrandsAParkedChildSafely(t *testing.T) {
 	}
 }
 
-// Input.Cancel fences the run it names, and only that run. A branch already running
-// is not told: it finishes its loop, pays for its model calls and runs its tools.
-// Only the join is lost. This pins a limit of one fence per run. See the spike report.
-func TestCancelDoesNotStopABranchThatIsAlreadyRunning(t *testing.T) {
+// Input.Cancel reaches a branch another worker is running. The tool in flight
+// finishes, because nothing can recall it, and its result is not recorded. The branch
+// pays for no further model call and starts no further tool.
+func TestCancelStopsABranchThatIsAlreadyRunning(t *testing.T) {
 	j := newJournal()
 	w := newWorld()
 	started, release := make(chan struct{}), make(chan struct{})
 	build := func() *multi.Parallel {
-		a := &harness.Agent{Name: "a", Provider: w.provider("a", "pay"), Tools: tool.NewRegistry(blocking(w, "pay", started, release))}
+		a := &harness.Agent{Name: "a", Provider: w.turns("a", "pay", "next"),
+			Tools: tool.NewRegistry(blocking(w, "pay", started, release), w.tool("next", tool.Spec{Effect: tool.EffectOnce}))}
 		return &multi.Parallel{Journal: j, Branches: []harness.Runner{a}}
 	}
 	in := harness.Prompt("x")
@@ -344,16 +361,22 @@ func TestCancelDoesNotStopABranchThatIsAlreadyRunning(t *testing.T) {
 	if err != nil || res.Stop != harness.StopCancelled {
 		t.Fatalf("%v %+v", err, res)
 	}
+	if b := fold(t, j, "root/0"); b.Stop != harness.StopCancelled || !b.State.Terminal() {
+		t.Fatalf("the cancel did not reach the branch: %s %s", b.State, b.Stop)
+	}
 	paidAtCancel := w.billed()
 	close(release)
 	if err := <-worker; !errors.Is(err, harness.ErrFenced) {
 		t.Fatalf("got %v", err)
 	}
-	if b := fold(t, j, "root/0"); !b.OK() {
-		t.Fatalf("branch %+v", b)
+	if b := fold(t, j, "root/0"); b.Stop != harness.StopCancelled || b.ToolCalls != 0 {
+		t.Fatalf("the fenced worker moved the branch: %+v", b)
 	}
-	if w.billed() != paidAtCancel+1 {
+	if w.billed() != paidAtCancel {
 		t.Fatalf("billed %d after the cancel", w.billed()-paidAtCancel)
+	}
+	if w.count("next") != 0 {
+		t.Fatal("a cancelled branch started another tool")
 	}
 }
 
@@ -547,6 +570,102 @@ func TestSweepFindsACrashedBranchBesideAParkedOne(t *testing.T) {
 	}
 	if due := j.due(late); len(due) != 1 || due[0] != "root" {
 		t.Fatalf("a parked sibling hid a crashed branch: %v", due)
+	}
+}
+
+// crashTree starts a tree over a sweep journal and kills it at one append of one run.
+func crashTree(t *testing.T, j *sweepJournal, run string, at int, build func(harness.Journal) harness.Runner) {
+	t.Helper()
+	in := harness.Prompt("x")
+	in.RunID = "root"
+	if _, err := build(kill(j, run, at, false)).Run(context.Background(), in); !errors.Is(err, errDead) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// The consumer's Lease on a pattern decides when a crashed branch is found. The
+// control is the same tree on the default.
+func TestAPatternsLeaseDecidesWhenACrashedBranchIsFound(t *testing.T) {
+	run := func(lease time.Duration) []string {
+		j := newSweep()
+		w := newWorld()
+		crashTree(t, j, "root/0", 3, func(jj harness.Journal) harness.Runner {
+			b := w.agent("b", "pay")
+			b.Lease = time.Minute
+			return &multi.Parallel{Journal: jj, Lease: lease, Branches: []harness.Runner{b}}
+		})
+		return j.due(time.Now().Add(2 * time.Minute))
+	}
+	if due := run(time.Minute); len(due) != 1 || due[0] != "root" {
+		t.Fatalf("the crash was not found on the pattern's lease: %v", due)
+	}
+	if due := run(0); len(due) != 0 {
+		t.Fatalf("a pattern with no Lease takes the default: %v", due)
+	}
+}
+
+func TestASequentialsLeaseDecidesToo(t *testing.T) {
+	j := newSweep()
+	w := newWorld()
+	crashTree(t, j, "root/0", 3, func(jj harness.Journal) harness.Runner {
+		b := w.agent("b", "pay")
+		b.Lease = time.Minute
+		return &multi.Sequential{Journal: jj, Lease: time.Minute, Steps: []harness.Runner{b}}
+	})
+	if due := j.due(time.Now().Add(2 * time.Minute)); len(due) != 1 {
+		t.Fatalf("due %v", due)
+	}
+}
+
+// A pattern's Lease is a floor. Its branch is working inside a much longer lease, so
+// the root's Wake passing means nothing yet.
+func TestAShortPatternLeaseDoesNotFireOverAWorkingBranch(t *testing.T) {
+	j := newSweep()
+	w := newWorld()
+	started, release := make(chan struct{}), make(chan struct{})
+	slow := &harness.Agent{Name: "slow", Lease: 2 * time.Hour, Provider: w.provider("slow", "pay"),
+		Tools: tool.NewRegistry(blocking(w, "pay", started, release))}
+	p := &multi.Parallel{Journal: j, Lease: time.Minute, Branches: []harness.Runner{slow}}
+	in := harness.Prompt("x")
+	in.RunID = "root"
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(context.Background(), in)
+		done <- err
+	}()
+	<-started
+	if due := j.due(time.Now().Add(time.Hour)); len(due) != 0 {
+		t.Errorf("a working branch was swept: %v", due)
+	}
+	if due := j.due(time.Now().Add(3 * time.Hour)); len(due) != 1 {
+		t.Errorf("a tree whose branch went quiet must be found: %v", due)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if due := j.due(time.Now().Add(3 * time.Hour)); len(due) != 0 {
+		t.Fatalf("a finished tree stays due: %v", due)
+	}
+}
+
+// A nested pattern does no work, so its row must not read as a sign of life. On its
+// default lease it would hide this crash for ten minutes.
+func TestANestedPatternCannotHideACrash(t *testing.T) {
+	j := newSweep()
+	w := newWorld()
+	crashTree(t, j, "root/0/0", 3, func(jj harness.Journal) harness.Runner {
+		b := w.agent("b", "pay")
+		b.Lease = time.Minute
+		return &multi.Sequential{Journal: jj, Lease: time.Minute, Steps: []harness.Runner{
+			&multi.Parallel{Branches: []harness.Runner{b}},
+		}}
+	})
+	if r := j.rows["root/0"]; r.state != harness.StateBody || !r.wake.IsZero() {
+		t.Fatalf("a nested pattern should have no Wake: %+v", r)
+	}
+	if due := j.due(time.Now().Add(2 * time.Minute)); len(due) != 1 || due[0] != "root" {
+		t.Fatalf("a nested pattern hid a crash below it: %v", due)
 	}
 }
 
