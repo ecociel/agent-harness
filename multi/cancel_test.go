@@ -528,6 +528,91 @@ func (b *blindTo) Load(ctx context.Context, id string) ([]harness.Event, error) 
 	return b.Journal.Load(ctx, id)
 }
 
+// lined answers Lineage from a table of one, as a store with a projection does, and
+// counts the Loads it is spared.
+type lined struct {
+	harness.Journal
+	mu     sync.Mutex
+	loads  map[string]int
+	broken bool
+}
+
+func (l *lined) Load(ctx context.Context, id string) ([]harness.Event, error) {
+	l.mu.Lock()
+	l.loads[id]++
+	l.mu.Unlock()
+	return l.Journal.Load(ctx, id)
+}
+
+func (l *lined) Lineage(ctx context.Context, id string) (harness.Lineage, error) {
+	if l.broken {
+		return harness.Lineage{}, errDead
+	}
+	evs, err := l.Journal.Load(ctx, id)
+	if err != nil || len(evs) == 0 {
+		return harness.Lineage{}, err
+	}
+	out := harness.Lineage{Parent: evs[0].ParentRun}
+	if i := slices.IndexFunc(evs, harness.Event.IsCancel); i >= 0 {
+		out.Cancelled, out.Reason = true, evs[i].Text
+	}
+	return out, nil
+}
+
+func (l *lined) count(id string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.loads[id]
+}
+
+// With a Lineage the check reads no events, past a parent that does not know, and the
+// cancel lands the same. The root is loaded to start it and to cancel it, the middle
+// to start it, and every other read would be the check.
+func TestLineageCarriesACancelWithoutLoadingAnAncestor(t *testing.T) {
+	inner := newJournal()
+	j := &lined{Journal: inner, loads: map[string]int{}}
+	w := newWorld()
+	started, release := make(chan struct{}), make(chan struct{})
+	leaf := &harness.Agent{Name: "leaf", Provider: w.turns("leaf", "pay", "next"),
+		Tools: tool.NewRegistry(blocking(w, "pay", started, release), w.tool("next", tool.Spec{Effect: tool.EffectOnce}))}
+	mid := &harness.Agent{Name: "mid", Provider: w.turns("mid", "start"), Tools: tool.NewRegistry(starter("start", "leaf-run", leaf))}
+	root := &harness.Agent{Name: "root", Journal: j, Provider: w.turns("root", "start"), Tools: tool.NewRegistry(starter("start", "mid-run", mid))}
+	in := harness.Prompt("x")
+	in.RunID = "root"
+	worker := async(func() error { _, err := root.Run(context.Background(), in); return err })
+	<-started
+	cancel(t, root, "root")
+	paid := w.billed()
+	close(release)
+	if err := <-worker; !errors.Is(err, harness.ErrFenced) {
+		t.Fatalf("got %v", err)
+	}
+	if r := cancelled(t, inner, "leaf-run"); r.Detail != "stop now" {
+		t.Fatalf("detail %q", r.Detail)
+	}
+	if w.billed() != paid || w.count("next") != 0 {
+		t.Fatalf("paid %d more, next ran %d times", w.billed()-paid, w.count("next"))
+	}
+	if j.count("root") != 2 || j.count("mid-run") != 1 {
+		t.Fatalf("the check loaded events: root %d, mid %d", j.count("root"), j.count("mid-run"))
+	}
+}
+
+// The same rule as a failed Load: it may be saying stop.
+func TestAFailedLineageStopsTheWorkerBeforeItPays(t *testing.T) {
+	j := &lined{Journal: newJournal(), loads: map[string]int{}, broken: true}
+	w := newWorld()
+	p := &multi.Parallel{Journal: j, Branches: []harness.Runner{w.agent("a", "pay")}}
+	in := harness.Prompt("x")
+	in.RunID = "root"
+	if _, err := p.Run(context.Background(), in); !errors.Is(err, harness.ErrDrained) {
+		t.Fatalf("got %v", err)
+	}
+	if w.billed() != 0 {
+		t.Fatalf("paid %d calls with no idea whether the tree was cancelled", w.billed())
+	}
+}
+
 // Kills a cancel at every append of every run it touches, before and after the write,
 // with and without a second crash on the retry. The sender retries because it cannot
 // know the cancel landed. Every run must end cancelled, nothing may be paid for or

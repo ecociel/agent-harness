@@ -57,6 +57,7 @@ var checks = []check{
 	{"CrashSweepParallel", func(t testing.TB, j harness.Journal) { sweep(t, j, parallel) }},
 	{"CancelStopsARunningChild", cancelStopsARunningChild},
 	{"CancelEndsAParkedBranch", cancelEndsAParkedBranch},
+	{"LineageAgreesWithTheEvents", lineageAgreesWithTheEvents},
 }
 
 func newID(prefix string) string {
@@ -377,6 +378,67 @@ func cancelStopsARunningChild(t testing.TB, j harness.Journal) {
 	if w.billed() != paid {
 		t.Fatalf("the child paid for %d calls after the cancel", w.billed()-paid)
 	}
+}
+
+// A wrong Lineage fails silently: a cancel that a child never hears. So a journal that
+// has one must say exactly what its events say, wherever in an append the cancel fell.
+func lineageAgreesWithTheEvents(t testing.TB, j harness.Journal) {
+	r, ok := j.(harness.LineageReader)
+	if !ok {
+		return // runs fall back to Load
+	}
+	ctx := context.Background()
+	id, parent := newID("lineage"), newID("parent")
+	plain := func(seq int64) harness.Event {
+		e := event(seq, "work")
+		e.ParentRun = parent
+		return e
+	}
+	stop := func(seq int64, why harness.StopReason, text string) harness.Event {
+		e := plain(seq)
+		e.Kind, e.Stop, e.Text = harness.KindRunStopping, why, text
+		return e
+	}
+	want := func(step string, l harness.Lineage, runID string) {
+		t.Helper()
+		got, err := r.Lineage(ctx, runID)
+		if err != nil {
+			t.Fatalf("%s: lineage: %v", step, err)
+		}
+		if got != l {
+			t.Fatalf("%s: got %+v, want %+v", step, got, l)
+		}
+	}
+	appendAll := func(evs ...harness.Event) {
+		t.Helper()
+		if err := j.Append(ctx, id, evs); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	const reason = "stop\x00now 🦀"
+	want("an unknown run", harness.Lineage{}, id)
+	appendAll(plain(1), stop(2, harness.StopCompleted, "finished"))
+	want("a stop that is no cancel", harness.Lineage{Parent: parent}, id)
+
+	lost := []harness.Event{stop(2, harness.StopCancelled, "lost"), plain(3)}
+	if err := j.Append(ctx, id, lost); !errors.Is(err, harness.ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+	want("a cancel in a refused append", harness.Lineage{Parent: parent}, id)
+
+	appendAll(plain(3), stop(4, harness.StopCancelled, reason), plain(5))
+	cancelled := harness.Lineage{Parent: parent, Cancelled: true, Reason: reason}
+	want("a cancel inside an append", cancelled, id)
+	appendAll(stop(6, harness.StopCancelled, "second"))
+	want("a later cancel", cancelled, id)
+
+	silent := newID("silent")
+	e := stop(1, harness.StopCancelled, "")
+	e.ParentRun = ""
+	if err := j.Append(ctx, silent, []harness.Event{e}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	want("a root cancelled with no reason", harness.Lineage{Cancelled: true}, silent)
 }
 
 var errDead = errors.New("process died")

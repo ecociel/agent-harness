@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 )
 
@@ -43,6 +44,40 @@ type Journal interface {
 	Append(ctx context.Context, runID string, evs []Event) error
 	// Load returns the run's events in Seq order, and none for an unknown run.
 	Load(ctx context.Context, runID string) ([]Event, error)
+}
+
+// Lineage is what a run needs from a run above it, before its next step.
+type Lineage struct {
+	Parent    string // the run above this one, empty at the root
+	Cancelled bool   // an event of this run says Event.IsCancel
+	Reason    string // the Text of the first such event
+}
+
+// LineageReader is a Journal that can answer for one run without reading its events.
+// It is optional. A nested run asks about each ancestor before every model call and
+// tool start, and a plain Journal answers that with Load, so without this each step
+// costs the length of every ancestor's history. A long-lived parent wants it. Project
+// Lineage in the same transaction as Append: a stale answer is a cancel that goes
+// unheard. A wrapper around a journal hides this method unless it forwards it, and
+// runs then fall back to Load. An unknown run has the zero Lineage.
+type LineageReader interface {
+	Lineage(ctx context.Context, runID string) (Lineage, error)
+}
+
+// lineage asks j for one run, through Load if j has no faster way.
+func lineage(ctx context.Context, j Journal, runID string) (Lineage, error) {
+	if r, ok := j.(LineageReader); ok {
+		return r.Lineage(ctx, runID)
+	}
+	evs, err := j.Load(ctx, runID)
+	if err != nil || len(evs) == 0 {
+		return Lineage{}, err
+	}
+	l := Lineage{Parent: evs[0].ParentRun}
+	if i := slices.IndexFunc(evs, Event.IsCancel); i >= 0 {
+		l.Cancelled, l.Reason = true, evs[i].Text
+	}
+	return l, nil
 }
 
 var (

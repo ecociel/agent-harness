@@ -968,22 +968,17 @@ func (m *machine) cancelledAbove(ctx context.Context) (bool, error) {
 		return false, nil // nothing above is durable, so nothing can cancel it from outside
 	}
 	for id := m.run.ParentRun; id != ""; {
-		evs, err := above.Load(ctx, id)
+		l, err := lineage(ctx, above, id)
 		if err != nil {
 			return false, fmt.Errorf("harness: load %s: %w: %w", id, ErrDrained, err)
 		}
-		if i := slices.IndexFunc(evs, isCancel); i >= 0 {
-			return true, m.record(ctx, Event{Kind: KindRunStopping, Stop: StopCancelled, Text: evs[i].Text})
+		if l.Cancelled {
+			return true, m.record(ctx, Event{Kind: KindRunStopping, Stop: StopCancelled, Text: l.Reason})
 		}
-		if len(evs) == 0 {
-			break
-		}
-		id = evs[0].ParentRun
+		id = l.Parent
 	}
 	return false, nil
 }
-
-func isCancel(e Event) bool { return e.Kind == KindRunStopping && e.Stop == StopCancelled }
 
 // cancelBelow ends what a cancelled run leaves with no worker to read the cancel: a
 // parked child, or one whose worker died. It goes through each child's own Runner, the

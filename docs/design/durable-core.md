@@ -28,6 +28,11 @@ type Journal interface {
 	Load(ctx context.Context, runID string) ([]Event, error)
 }
 
+// Optional, for trees with long-lived parents. Without it, the same answer comes from Load.
+type LineageReader interface {
+	Lineage(ctx context.Context, runID string) (Lineage, error)
+}
+
 agent := &harness.Agent{Name: "refunds", Provider: p, Tools: tools, Journal: pgJournal{db},
 	Hooks: []harness.Hook{approvals{}, redactAHV{}}}
 
@@ -103,6 +108,7 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 9. **Child identity is derived.** A sub-agent's run ID is the parent's idempotency key. A parallel branch is `<parent>/<index>`, taken from the loop that starts the goroutine, never from the scheduler.
 10. **A composite run spends nothing.** It writes no `model.*` or `tool.*` event, and `Fold` gives it no spend, so a sum over a tree's runs needs no exceptions. What its children spent reaches its caller through `Run.Spent`, as a report on `body.done`.
 11. **Cancel has two paths, because a worker and its absence need different things.** A running branch reads its ancestors after recording each intent, so it needs no child ID. A parked or crashed branch has no worker to read anything, so its parent ends it through the child's own `Runner`, the way a signal travels.
+12. **The ancestor check has an optional fast path.** Loading a parent's journal on every step makes each child step cost the parent's whole history. A `Journal` may also implement `LineageReader`, one projected row per run. It stays optional so that `Journal` stays two methods, and a store without it is slower, not wrong. A cache was rejected, because it would let a child pay after a cancel it could have seen.
 
 ### State machine
 
@@ -233,8 +239,9 @@ Review found two defects that no test or mutant had caught. A cancel that fenced
 
 Measured on real PostgreSQL 17.6 through `journal/postgres`, at the end of unit 3:
 
-- `go test -race -count=3 ./...` exits 0. With `-v`, all 8 tests and all 13 conformance checks ran, and none skipped. The checks include crash sweeps through one agent and through `Parallel`, two workers racing one run, concurrent writers racing every position, and a cancel reaching a running child and a parked branch. These sweeps are a smaller set than the 764 cases above.
-- `journaltest` refuses all 11 deliberately broken journals, each at the check named for its bug.
+- `go test -race -count=3 ./...` exits 0. With `-v`, all 8 tests and all 14 conformance checks ran, and none skipped. The checks include crash sweeps through one agent and through `Parallel`, two workers racing one run, concurrent writers racing every position, and a cancel reaching a running child and a parked branch. These sweeps are a smaller set than the 764 cases above.
+- `journaltest` refuses all 11 deliberately broken journals, each at the check named for its bug, and all 6 wrong `Lineage` projections.
+- One ancestor read, averaged over 50, on a run of 2 KB events: `Load` takes 0.9 ms at 100 events, 6.2 ms at 1,000 and 54.7 ms at 10,000. `Lineage` takes 0.24 to 0.29 ms at all three.
 
 Measured on real PostgreSQL at unit 1, and not rerun: all 7 mutants of the Postgres journal itself are caught.
 
@@ -279,6 +286,7 @@ Each of these was left on purpose.
 - **`Run.Spent` is a report.** A composite's is what its body last said, and a run ended from outside reports nothing further. An agent's leaves out children its tools started. For a tree, sum the runs.
 - **A sweep can land between two steps of a `Sequential`.** Nothing is working in that instant, so a root past its `Lease` is due and the tree is taken over. By reading the code, that is the zombie case, and it repeats nothing.
 - **Ancestors are read through the parent's journal.** A child with its own `Journal` still sees its parent. A grandparent in a third journal is out of its sight. By reading the code.
+- **A wrapper can hide the fast path.** A journal wrapped for tracing or fault injection has no `Lineage` unless the wrapper forwards it. Runs then fall back to `Load`, which is correct and slower. Nothing reports the fallback.
 
 ## Tradeoffs accepted
 
@@ -287,7 +295,7 @@ Each of these was left on purpose.
 - We accept that the model and tools work from redacted text, in exchange for a guarantee with no exceptions. A tool that needs the real value detokenises in `WrapTool`.
 - We accept at-least-once hooks in exchange for one recovery rule.
 - We accept no lease in the core. A sweep that fires early costs a needless unknown-outcome wait, never a repeated effect.
-- We accept that a nested run reads its ancestors' journals once per model call and tool start, in exchange for a cancel that needs no child ID. Measured on a two-branch `Parallel` with one tool each: 24 appends, 9 loads, 6 of them for this check. A root reads nothing extra.
+- We accept that a nested run reads each ancestor once per model call and tool start, in exchange for a cancel that needs no child ID. Measured on a two-branch `Parallel` with one tool each and a plain `Journal`: 24 appends, 9 loads, 6 of them for this check. With `LineageReader` those 6 become one-row reads. Depth still multiplies them, and a root reads nothing extra.
 - We accept that a root's `Wake` is a floor and not a sign of life. A tree is due at the latest of its root's `Wake` and the `Wake` of whatever below it is working. A pattern only waits, so its `Lease` says how soon to look and need not outlast its slowest branch. A nested pattern has no `Wake`, so its lease can't hide a crash below it.
 - We accept a flat `Event` struct, in exchange for one vocabulary and no decode registry.
 

@@ -206,6 +206,10 @@ func draining(ctx context.Context) bool {
 	}
 }
 
+// IsCancel reports whether this event cancels its run. A cancel reaches every run
+// below, which no other stop does, so a store that projects Lineage looks for this.
+func (e Event) IsCancel() bool { return e.Kind == KindRunStopping && e.Stop == StopCancelled }
+
 // redact rewrites every string an event carries, in place on deep copies.
 // visit is the one path text takes to the journal, the history, the sinks and
 // the hooks. TestRedactionCoversEveryString fails the build's tests if a new

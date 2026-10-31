@@ -120,6 +120,64 @@ func (s *store) Load(_ context.Context, id string) ([]harness.Event, error) {
 	return out, nil
 }
 
+// projected is a correct store with a Lineage kept apart from its events, as a table
+// would be. The bugs below each make it disagree with them.
+type projected struct {
+	*store
+	mu   sync.Mutex
+	rows map[string]harness.Lineage
+
+	lastOnly    bool // looks at the last event of an append
+	lastWins    bool // a second cancel replaces the first
+	early       bool // projects before it knows the append landed
+	everyStop   bool // takes any stop for a cancel
+	losesParent bool // a projection that loses a field
+	stripsNul   bool // keeps the reason in a text column
+}
+
+func newProjected() *projected {
+	return &projected{store: newStore(), rows: map[string]harness.Lineage{}}
+}
+
+func (p *projected) Append(ctx context.Context, id string, evs []harness.Event) error {
+	if p.early {
+		p.project(id, evs)
+	}
+	if err := p.store.Append(ctx, id, evs); err != nil {
+		return err
+	}
+	p.project(id, evs)
+	return nil
+}
+
+func (p *projected) project(id string, evs []harness.Event) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	l := p.rows[id]
+	if !p.losesParent && len(evs) > 0 {
+		l.Parent = evs[len(evs)-1].ParentRun
+	}
+	seen := evs
+	if p.lastOnly {
+		seen = evs[len(evs)-1:]
+	}
+	for _, e := range seen {
+		if (e.IsCancel() || p.everyStop && e.Kind == harness.KindRunStopping) && (!l.Cancelled || p.lastWins) {
+			l.Cancelled, l.Reason = true, e.Text
+			if p.stripsNul {
+				l.Reason = strings.ReplaceAll(l.Reason, "\x00", "")
+			}
+		}
+	}
+	p.rows[id] = l
+}
+
+func (p *projected) Lineage(_ context.Context, id string) (harness.Lineage, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.rows[id], nil
+}
+
 // failure stands in for testing.T so a check's failure can be observed.
 type failure struct {
 	testing.TB
@@ -173,6 +231,37 @@ func TestACorrectJournalPasses(t *testing.T) {
 
 func TestTheInMemoryJournalPasses(t *testing.T) {
 	Run(t, func(*testing.T) harness.Journal { return harness.NewMemJournal() })
+}
+
+func TestACorrectLineagePasses(t *testing.T) {
+	Run(t, func(*testing.T) harness.Journal { return newProjected() })
+}
+
+func TestTheSuiteRefusesAWrongLineage(t *testing.T) {
+	cases := map[string]func(*projected){
+		"only the last event counts": func(p *projected) { p.lastOnly = true },
+		"a later cancel replaces it": func(p *projected) { p.lastWins = true },
+		"a refused append counts":    func(p *projected) { p.early = true },
+		"any stop is a cancel":       func(p *projected) { p.everyStop = true },
+		"the parent is lost":         func(p *projected) { p.losesParent = true },
+		"the reason loses a NUL":     func(p *projected) { p.stripsNul = true },
+	}
+	for name, bug := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := newProjected()
+			bug(p)
+			f := &failure{}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				lineageAgreesWithTheEvents(f, p)
+			}()
+			<-done
+			if !f.failed {
+				t.Fatal("the check did not refuse it")
+			}
+		})
+	}
 }
 
 // A conformance suite is only worth trusting if it fails. Each broken journal must

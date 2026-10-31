@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/ecociel/agent-harness"
@@ -31,7 +32,8 @@ CREATE TABLE IF NOT EXISTS journal_runs (
 	parent text NOT NULL,
 	root   text NOT NULL,
 	state  text NOT NULL,
-	wake   timestamptz
+	wake   timestamptz,
+	cancel bigint
 );
 CREATE INDEX IF NOT EXISTS journal_runs_due ON journal_runs (wake) WHERE parent = '';
 CREATE INDEX IF NOT EXISTS journal_runs_root ON journal_runs (root);
@@ -81,12 +83,42 @@ func (j *Journal) Append(ctx context.Context, runID string, evs []harness.Event)
 	if !last.Wake.IsZero() {
 		wake = sql.NullTime{Time: last.Wake, Valid: true}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO journal_runs (run_id, parent, root, state, wake) VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (run_id) DO UPDATE SET state = COALESCE(NULLIF(EXCLUDED.state, ''), journal_runs.state), wake = EXCLUDED.wake`,
-		runID, last.ParentRun, last.RootRun, string(last.To), wake); err != nil {
+	var cancel sql.NullInt64
+	if i := slices.IndexFunc(evs, harness.Event.IsCancel); i >= 0 {
+		cancel = sql.NullInt64{Int64: evs[i].Seq, Valid: true}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO journal_runs (run_id, parent, root, state, wake, cancel) VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (run_id) DO UPDATE SET state = COALESCE(NULLIF(EXCLUDED.state, ''), journal_runs.state), wake = EXCLUDED.wake,
+			cancel = COALESCE(journal_runs.cancel, EXCLUDED.cancel)`,
+		runID, last.ParentRun, last.RootRun, string(last.To), wake, cancel); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// Lineage implements harness.LineageReader with two primary-key reads, so it costs
+// the same whatever the run's history. The row holds the cancel's position, not its
+// text, because the text can hold a NUL byte, like any event's.
+func (j *Journal) Lineage(ctx context.Context, runID string) (harness.Lineage, error) {
+	var l harness.Lineage
+	var doc []byte
+	err := j.db.QueryRowContext(ctx, `SELECT r.parent, e.doc FROM journal_runs r
+		LEFT JOIN journal e ON e.run_id = r.run_id AND e.seq = r.cancel
+		WHERE r.run_id = $1`, runID).Scan(&l.Parent, &doc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return harness.Lineage{}, nil
+	}
+	if err != nil {
+		return harness.Lineage{}, err
+	}
+	if doc != nil {
+		var e harness.Event
+		if err := json.Unmarshal(doc, &e); err != nil {
+			return harness.Lineage{}, fmt.Errorf("postgres: decode %s cancel: %w", runID, err)
+		}
+		l.Cancelled, l.Reason = true, e.Text
+	}
+	return l, nil
 }
 
 // Load implements harness.Journal.
