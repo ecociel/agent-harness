@@ -1,20 +1,16 @@
-// Package hooks is the home of the built-in hooks. Each sub-package is one
-// cross-cutting concern and depends only on the harness core:
+// Package hooks is the home of the built-in hooks and sinks. Each sub-package is one
+// cross-cutting concern and depends only on the harness core's exported API. State
+// lives in the journal: a hook holds limits and rules, and reads the Run it is given.
 //
-//   - guard: input, tool-call and output guardrails (veto, revise, redact)
-//   - budget: token, cost, wall-clock and tool-call limits; loop detection;
-//     hierarchical budgets for sub-agents
-//   - metrics: counters and latency histograms with an in-memory registry
-//   - trace: OpenTelemetry-shaped spans (gen_ai semantic conventions) with a
-//     dependency-free exporter interface; spans nest across sub-agents
-//   - approval: security, policy and approval ("SPA"): caller scopes and a
-//     human-approval gate for risky tools, with an audit trail
-//   - compact: summarise or window old context before the model call
+//   - guard: input, tool-call and output guardrails, and a rule-based Redactor
+//   - budget: token, cost, wall-clock and tool-call limits; loop detection
+//   - approval: caller scopes and a human-approval gate for risky tools
+//   - compact: summarise old context, durably, before the model call
 //   - offload: move oversized tool results out of the context window
-//   - retry: retries with backoff and a fallback provider around the model
-//   - profile: per-model profiles (instructions, tool variants)
-//   - trajectory: record full runs for evals and replay
-//   - logging: log/slog output for every plugin point
+//   - retry: backoff, retries and a fallback model, as recorded decisions
+//   - profile: per-model request changes (instructions, tool variants)
+//   - trajectory: full runs for evals and replay, read from the events
+//   - trace, metrics, logging: sinks, attached once with harness.WithEvents
 //
-// Every hook is an ordinary value: construct it, put it in Agent.Hooks.
+// A hook is an ordinary value: construct it, put it in Agent.Hooks.
 package hooks

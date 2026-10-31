@@ -62,6 +62,7 @@ type Event struct {
 	Hook     string        `json:"hook,omitempty"` // the hook that decided
 	Tool     string        `json:"tool,omitempty"` // tool.*
 	Point    Point         `json:"point,omitempty"`
+	Model    string        `json:"model,omitempty"` // model.started, model.done, model.failed: empty means the provider's default
 	Outcome  string        `json:"outcome,omitempty"`
 	Text     string        `json:"text,omitempty"`
 	Duration time.Duration `json:"duration_ns,omitempty"`

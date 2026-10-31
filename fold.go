@@ -439,7 +439,11 @@ func (r *Run) edit(e Edit) {
 	for i := range with {
 		with[i].Source = e.Source
 	}
-	r.Messages = slices.Concat(r.Messages[:e.From:e.From], with, r.Messages[e.To:])
+	tail := slices.Clone(r.Messages[e.To:])
+	for i := range tail {
+		tail[i].Opaque = nil
+	}
+	r.Messages = slices.Concat(r.Messages[:e.From:e.From], with, tail)
 }
 
 // route turns a reply into the next state. It is the whole of what the finish

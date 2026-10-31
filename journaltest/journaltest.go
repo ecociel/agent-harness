@@ -93,7 +93,7 @@ func everyFieldSurvives(t testing.TB, j harness.Journal) {
 		Seq: 1, Time: time.Date(2026, 10, 30, 12, 0, 0, 123456789, time.UTC), Kind: harness.KindToolDone,
 		RunID: "r", RootRun: "root", ParentRun: "parent", Agent: "a", Depth: 2, Turn: 3,
 		From: harness.StateTools, To: harness.StateCompose, Wake: time.Date(2026, 10, 30, 12, 0, 1, 987654321, time.UTC),
-		Hook: "h", Tool: "t", Point: harness.PointBeforeTool, Outcome: "ok", Text: "text",
+		Hook: "h", Tool: "t", Model: "m", Point: harness.PointBeforeTool, Outcome: "ok", Text: "text",
 		Duration: 1500 * time.Millisecond, Index: 4, Attempt: 5,
 		Pin:      &harness.Pin{Instructions: "be careful", Shape: "parallel: a, b", Model: "m", MaxTurns: 8, Temperature: &temperature},
 		Messages: []model.Message{model.User("hello"), {Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "c", Name: "t", Arguments: json.RawMessage(`{"a":[1,2]}`)}}}},

@@ -5,7 +5,7 @@
 // The canonical example is file editing: one model family is best with a
 // string-replace editor, another with a patch tool. Register both tools and
 // let the profile hide the one the current model is out of distribution on.
-// A hidden tool is also refused if the model calls it anyway.
+// A tool a request did not offer is denied by the core if the model calls it anyway.
 package profile
 
 import (
@@ -44,13 +44,12 @@ func (ps Profiles) find(modelName string) (Profile, bool) {
 }
 
 // BeforeModel applies the matching profile to req.
-func (ps Profiles) BeforeModel(_ context.Context, r *harness.Run, req *model.Request) error {
+func (ps Profiles) BeforeModel(ctx context.Context, _ harness.Run, req *model.Request) error {
 	p, ok := ps.find(req.Model)
 	if !ok {
 		return nil
 	}
-	r.Set("profile", p.Match)
-	r.Note(ps.Name(), "profile %q for model %q", p.Match, req.Model)
+	harness.Note(ctx, "profile %q for model %q", p.Match, req.Model)
 	if p.Instructions != "" {
 		if len(req.Messages) > 0 && req.Messages[0].Role == model.RoleSystem {
 			req.Messages[0].Content += "\n\n" + p.Instructions
@@ -65,12 +64,4 @@ func (ps Profiles) BeforeModel(_ context.Context, r *harness.Run, req *model.Req
 		req.MaxTokens = p.MaxTokens
 	}
 	return nil
-}
-
-// BeforeTool refuses tools the profile hides.
-func (ps Profiles) BeforeTool(_ context.Context, r *harness.Run, call model.ToolCall) harness.Decision {
-	if p, ok := ps.find(r.Agent.Model); ok && slices.Contains(p.Hide, call.Name) {
-		return harness.Deny("tool " + call.Name + " is not available for this model")
-	}
-	return harness.Allow()
 }

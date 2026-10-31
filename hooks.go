@@ -172,7 +172,9 @@ func Note(ctx context.Context, format string, args ...any) {
 
 // Edit replaces Messages[From:To] with With, stamping Source on each new message.
 // The zero Edit changes nothing. Inserting is From == To. The result must keep
-// every tool call paired with its result, or the run fails.
+// every tool call paired with its result, or the run fails. Messages after the edit
+// lose their Opaque: provider state can depend on everything before it, as an
+// Anthropic signature does, so an edit would otherwise leave it stale.
 type Edit struct {
 	From   int             `json:"from"`
 	To     int             `json:"to"`

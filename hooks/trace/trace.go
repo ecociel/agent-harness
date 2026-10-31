@@ -87,7 +87,7 @@ func Sink(exporters ...Exporter) harness.EventSink {
 			return
 		case harness.KindModelDone, harness.KindModelFailed:
 			s.SpanID, s.Name = id(8, "model", e.RunID, e.Turn, e.Attempt), "chat"
-			s.Attrs = map[string]any{"gen_ai.operation.name": "chat", "harness.turn": e.Turn}
+			s.Attrs = map[string]any{"gen_ai.operation.name": "chat", "gen_ai.request.model": e.Model, "harness.turn": e.Turn}
 			if e.Reply != nil {
 				s.Attrs["gen_ai.usage.input_tokens"] = e.Reply.Usage.Input
 				s.Attrs["gen_ai.usage.output_tokens"] = e.Reply.Usage.Output

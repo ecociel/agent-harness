@@ -655,7 +655,7 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 		offered[i] = t.Name
 	}
 	b, _ := json.Marshal(req)
-	if err := m.record(ctx, Event{Kind: KindModelStarted, Attempt: attempt, Offered: offered, Text: hash(string(b))}); err != nil {
+	if err := m.record(ctx, Event{Kind: KindModelStarted, Model: req.Model, Attempt: attempt, Offered: offered, Text: hash(string(b))}); err != nil {
 		return err
 	}
 	if stopped, err := m.cancelledAbove(ctx); stopped || err != nil {
@@ -669,7 +669,7 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 	start := time.Now()
 	resp, err := model.Collect(p.Complete(ctx, req), m.deltaSink(ctx))
 	if err != nil {
-		return m.modelFailed(ctx, err, attempt, time.Since(start))
+		return m.modelFailed(ctx, req.Model, err, attempt, time.Since(start))
 	}
 	billed := resp.Usage
 	for _, h := range m.hooks.afterModel {
@@ -682,11 +682,11 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 			err = checkReply(h, resp)
 		}
 		if err != nil {
-			return m.modelFailed(ctx, &model.Error{Class: model.ClassInternal, Usage: billed, Err: err}, attempt, time.Since(start))
+			return m.modelFailed(ctx, req.Model, &model.Error{Class: model.ClassInternal, Usage: billed, Err: err}, attempt, time.Since(start))
 		}
 	}
 	resp.Usage = billed
-	return m.record(ctx, Event{Kind: KindModelDone, Attempt: attempt, Reply: &resp, Duration: time.Since(start)})
+	return m.record(ctx, Event{Kind: KindModelDone, Model: req.Model, Attempt: attempt, Reply: &resp, Duration: time.Since(start)})
 }
 
 // checkReply validates hook output at the boundary, so the journal can store it.
@@ -710,13 +710,13 @@ func (m *machine) deltaSink(ctx context.Context) func(model.Event) {
 	}
 }
 
-func (m *machine) modelFailed(ctx context.Context, err error, attempt int, took time.Duration) error {
+func (m *machine) modelFailed(ctx context.Context, name string, err error, attempt int, took time.Duration) error {
 	if draining(ctx) || context.Cause(ctx) != nil {
 		return m.record(ctx, Event{Kind: KindModelLost, Attempt: attempt})
 	}
 	e := model.AsError(err)
 	f := Failure{Class: e.Class, Detail: err.Error(), Attempt: attempt, RetryAfter: e.RetryAfter, Usage: e.Usage}
-	ev := Event{Kind: KindModelFailed, Attempt: attempt, Failure: &f, Duration: took, Text: f.Detail}
+	ev := Event{Kind: KindModelFailed, Model: name, Attempt: attempt, Failure: &f, Duration: took, Text: f.Detail}
 	if s, ok := AsStop(err); ok {
 		ev.Stop, ev.Text = s.Reason, s.Detail
 		return m.record(ctx, ev)
@@ -1025,7 +1025,7 @@ func (m *machine) close(ctx context.Context) error {
 			return "ok", nil
 		})
 	}
-	return m.record(ctx, Event{Kind: KindRunEnded, Outcome: string(m.run.Stop), Text: m.run.Detail})
+	return m.record(ctx, Event{Kind: KindRunEnded, Outcome: string(m.run.Stop), Text: m.run.Detail, Duration: m.run.Duration()})
 }
 
 // invoke runs one hook body and reports it as an ephemeral event.

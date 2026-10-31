@@ -21,9 +21,9 @@ func Example() {
 		Model:    "fake-1",
 		Provider: fake.Script(fake.Call("clock", nil), fake.Text("It is noon.")),
 		Tools:    tool.NewRegistry(clock),
-		Hooks:    []harness.Hook{metrics.New(reg)},
 	}
-	if _, err := a.Run(context.Background(), harness.Prompt("time?")); err != nil {
+	ctx := harness.WithEvents(context.Background(), metrics.Sink(reg))
+	if _, err := a.Run(ctx, harness.Prompt("time?")); err != nil {
 		panic(err)
 	}
 	s := reg.Snapshot()

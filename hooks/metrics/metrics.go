@@ -3,7 +3,12 @@
 //
 // The Registry is a small, dependency-free in-memory store with Snapshot for
 // dashboards and tests. To export to Prometheus or OpenTelemetry, implement
-// Recorder over your client and pass it to Hook instead.
+// Recorder over your client and pass it to Sink instead.
+//
+// It is a sink, not a hook, like trace. A hook can repeat after a crash and would count
+// twice, and it never sees a call that failed or was lost. A sink gets each durable
+// event once. It can still miss the last event before a crash: the journal is the
+// source to reconcile a total from.
 //
 // Metric names (labels in braces):
 //
@@ -11,14 +16,15 @@
 //	agent_run_duration_ms{agent}         histogram
 //	agent_turns{agent}                   histogram
 //	model_calls_total{model}             counter
+//	model_errors_total{model,class}      counter
+//	model_lost_total{agent}              counter
 //	model_latency_ms{model}              histogram
 //	model_tokens_total{model,kind}       counter (kind = input|output)
-//	tool_calls_total{tool,outcome}       counter (outcome = ok|error|denied)
+//	tool_calls_total{tool,outcome}       counter (outcome = ok|error|denied|lost|...)
 //	tool_latency_ms{tool}                histogram
 package metrics
 
 import (
-	"context"
 	"fmt"
 	"slices"
 	"sort"
@@ -121,58 +127,42 @@ func quantile(sorted []float64, q float64) float64 {
 	return sorted[i]
 }
 
-// Hook records metrics for every run it is attached to.
-type Hook struct {
-	R Recorder
-}
-
-// New returns a hook writing to r.
-func New(r Recorder) *Hook { return &Hook{R: r} }
-
-// Name implements harness.Hook.
-func (h *Hook) Name() string { return "metrics" }
-
-// WrapModel measures model latency.
-func (h *Hook) WrapModel(_ *harness.Run, next harness.ModelCall) harness.ModelCall {
-	return func(ctx context.Context, req model.Request) (model.Response, error) {
-		start := time.Now()
-		resp, err := next(ctx, req)
-		h.R.Observe("model_latency_ms", map[string]string{"model": modelName(req.Model)}, ms(time.Since(start)))
-		return resp, err
+// Sink returns an event sink writing to r. Pass it to harness.WithEvents.
+func Sink(r Recorder) harness.EventSink {
+	tokens := func(name string, u model.Usage) {
+		r.Add("model_tokens_total", map[string]string{"model": name, "kind": "input"}, float64(u.Input))
+		r.Add("model_tokens_total", map[string]string{"model": name, "kind": "output"}, float64(u.Output))
 	}
-}
-
-// AfterModel counts calls and tokens.
-func (h *Hook) AfterModel(_ context.Context, r *harness.Run, resp *model.Response) error {
-	m := modelName(r.Agent.Model)
-	h.R.Add("model_calls_total", map[string]string{"model": m}, 1)
-	h.R.Add("model_tokens_total", map[string]string{"model": m, "kind": "input"}, float64(resp.Usage.Input))
-	h.R.Add("model_tokens_total", map[string]string{"model": m, "kind": "output"}, float64(resp.Usage.Output))
-	return nil
-}
-
-// AfterTool counts tool calls by outcome.
-func (h *Hook) AfterTool(_ context.Context, _ *harness.Run, out harness.ToolOutcome) error {
-	outcome := "ok"
-	switch {
-	case out.Denied:
-		outcome = "denied"
-	case out.Err != nil:
-		outcome = "error"
+	return func(e harness.Event) {
+		name := modelName(e.Model)
+		switch e.Kind {
+		case harness.KindModelDone:
+			r.Add("model_calls_total", map[string]string{"model": name}, 1)
+			r.Observe("model_latency_ms", map[string]string{"model": name}, ms(e.Duration))
+			tokens(name, e.Reply.Usage)
+		case harness.KindModelFailed:
+			r.Add("model_calls_total", map[string]string{"model": name}, 1)
+			r.Add("model_errors_total", map[string]string{"model": name, "class": string(e.Failure.Class)}, 1)
+			r.Observe("model_latency_ms", map[string]string{"model": name}, ms(e.Duration))
+			tokens(name, e.Failure.Usage)
+		case harness.KindModelLost:
+			r.Add("model_lost_total", map[string]string{"agent": e.Agent}, 1)
+		case harness.KindToolGated:
+			if e.Decision != nil && e.Decision.Action == harness.ActionDeny {
+				r.Add("tool_calls_total", map[string]string{"tool": e.Tool, "outcome": "denied"}, 1)
+			}
+		case harness.KindToolDone:
+			r.Add("tool_calls_total", map[string]string{"tool": e.Tool, "outcome": e.Outcome}, 1)
+			r.Observe("tool_latency_ms", map[string]string{"tool": e.Tool}, ms(e.Duration))
+		case harness.KindToolLost:
+			r.Add("tool_calls_total", map[string]string{"tool": e.Tool, "outcome": "lost"}, 1)
+		case harness.KindRunEnded:
+			agent := map[string]string{"agent": e.Agent}
+			r.Add("agent_runs_total", map[string]string{"agent": e.Agent, "stop": e.Outcome}, 1)
+			r.Observe("agent_run_duration_ms", agent, ms(e.Duration))
+			r.Observe("agent_turns", agent, float64(e.Turn))
+		}
 	}
-	h.R.Add("tool_calls_total", map[string]string{"tool": out.Call.Name, "outcome": outcome}, 1)
-	if !out.Denied {
-		h.R.Observe("tool_latency_ms", map[string]string{"tool": out.Call.Name}, ms(out.Duration))
-	}
-	return nil
-}
-
-// AfterRun counts runs by stop reason.
-func (h *Hook) AfterRun(_ context.Context, r *harness.Run, res *harness.Result) {
-	agent := map[string]string{"agent": r.Agent.Name}
-	h.R.Add("agent_runs_total", map[string]string{"agent": r.Agent.Name, "stop": string(res.Stop)}, 1)
-	h.R.Observe("agent_run_duration_ms", agent, ms(res.Duration))
-	h.R.Observe("agent_turns", agent, float64(res.Turns))
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }

@@ -8,6 +8,10 @@
 // or, with HaltOnTool, stop the run. Output violations ask the model to
 // revise, or block the answer with BlockOutput. Redact rules rewrite the
 // accepted output instead of rejecting it.
+//
+// Guard.Redact changes only the final answer, so the value stays in the history and
+// the journal. To keep a value out of the model, the tools, the hooks and the journal,
+// attach a Redactor.
 package guard
 
 import (
@@ -79,8 +83,28 @@ type Guard struct {
 // Name implements harness.Hook.
 func (g *Guard) Name() string { return "guard" }
 
+// Redactor replaces every match with "[redacted:<name>]" in everything the run sees
+// and records. A match inside provider state, such as a signature that happens to hold
+// a long number, invalidates it, and the provider adapter recovers.
+type Redactor []Rule
+
+// Name implements harness.Hook.
+func (Redactor) Name() string { return "guard.redactor" }
+
+// Redact implements harness.Redactor.
+func (rules Redactor) Redact(_ context.Context, _ harness.Kind, text string) (string, error) {
+	return redact(rules, text), nil
+}
+
+func redact(rules []Rule, s string) string {
+	for _, r := range rules {
+		s = r.Pattern.ReplaceAllLiteralString(s, "[redacted:"+r.Name+"]")
+	}
+	return s
+}
+
 // BeforeRun checks the input.
-func (g *Guard) BeforeRun(_ context.Context, r *harness.Run) error {
+func (g *Guard) BeforeRun(_ context.Context, r harness.Run) error {
 	if rule, ok := match(g.InputDeny, model.LastUser(r.Messages)); ok {
 		return harness.Stop(harness.StopGuardrail, "input matches rule "+rule)
 	}
@@ -88,8 +112,8 @@ func (g *Guard) BeforeRun(_ context.Context, r *harness.Run) error {
 }
 
 // BeforeTool checks one tool call.
-func (g *Guard) BeforeTool(_ context.Context, _ *harness.Run, call model.ToolCall) harness.Decision {
-	reason := g.toolViolation(call)
+func (g *Guard) BeforeTool(_ context.Context, _ harness.Run, c harness.Call) harness.Decision {
+	reason := g.toolViolation(c.ToolCall)
 	switch {
 	case reason == "":
 		return harness.Allow()
@@ -119,7 +143,7 @@ func (g *Guard) toolViolation(call model.ToolCall) string {
 }
 
 // CheckOutput checks and redacts the candidate answer.
-func (g *Guard) CheckOutput(_ context.Context, run *harness.Run, output string) harness.Verdict {
+func (g *Guard) CheckOutput(ctx context.Context, _ harness.Run, output string) harness.Verdict {
 	if rule, ok := match(g.OutputDeny, output); ok {
 		msg := "the answer contains content matching rule " + rule
 		if g.BlockOutput {
@@ -127,12 +151,8 @@ func (g *Guard) CheckOutput(_ context.Context, run *harness.Run, output string) 
 		}
 		return harness.Revise(msg + "; remove it")
 	}
-	redacted := output
-	for _, r := range g.Redact {
-		redacted = r.Pattern.ReplaceAllString(redacted, "[redacted:"+r.Name+"]")
-	}
-	if redacted != output {
-		run.Note(g.Name(), "redacted %s", strings.Join(redactedNames(g.Redact, output), ", "))
+	if redacted := redact(g.Redact, output); redacted != output {
+		harness.Note(ctx, "redacted %s", strings.Join(redactedNames(g.Redact, output), ", "))
 		return harness.Verdict{Rewrite: redacted}
 	}
 	return harness.Accept()
