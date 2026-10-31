@@ -1,6 +1,7 @@
 // Command webchat is a small web chat for trying agent-harness, with a
 // diagnostic view that shows every state transition and hook invocation of
-// each turn as it happens.
+// each turn as it happens. An approval is a durable wait: the run suspends until the
+// browser answers.
 //
 //	go run ./examples/webchat            # scripted demo model, no keys
 //	HARNESS_PROVIDER=openai OPENAI_API_KEY=… go run ./examples/webchat
@@ -16,7 +17,7 @@
 //	OPENAI_BASE_URL    default https://api.openai.com/v1 (e.g. Ollama: http://localhost:11434/v1)
 //	OPENAI_MODEL       default gpt-4.1-mini
 //	ANTHROPIC_API_KEY  key for the Anthropic Messages API
-//	ANTHROPIC_MODEL    default claude-sonnet-4-5
+//	ANTHROPIC_MODEL    default claude-opus-5-5
 package main
 
 import (
@@ -101,7 +102,7 @@ func providerFromEnv(getenv func(string) string) (model.Provider, string, string
 		}
 		m := getenv("ANTHROPIC_MODEL")
 		if m == "" {
-			m = "claude-sonnet-4-5"
+			m = "claude-opus-5-5"
 		}
 		return p, m, "anthropic · " + m, nil
 	}

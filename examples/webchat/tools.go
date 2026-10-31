@@ -18,10 +18,10 @@ import (
 // a hook visible: clock and calculator are harmless reads, search_docs
 // returns a large result (offload), send_email is dangerous and scoped
 // (approval), delete_records is denied by the guardrail.
-func demoTools(store *offload.Store) *tool.Registry {
+func demoTools(store offload.Store) *tool.Registry {
 	return tool.NewRegistry(
 		tool.Func(tool.Spec{
-			Name: "clock", Description: "Current date and time in Zurich.",
+			Name: "clock", Description: "Current date and time in Zurich.", Effect: tool.EffectRead,
 			Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
 		}, func(context.Context, json.RawMessage) (string, error) {
 			loc, err := time.LoadLocation("Europe/Zurich")
@@ -31,11 +31,11 @@ func demoTools(store *offload.Store) *tool.Registry {
 			return time.Now().In(loc).Format("Monday, 2 January 2006, 15:04 MST"), nil
 		}),
 		tool.Func(tool.Spec{
-			Name: "calculator", Description: "Evaluate an arithmetic expression such as (17+4)*3.",
+			Name: "calculator", Description: "Evaluate an arithmetic expression such as (17+4)*3.", Effect: tool.EffectRead,
 			Parameters: json.RawMessage(`{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}`),
 		}, calculate),
 		tool.Func(tool.Spec{
-			Name: "search_docs", Description: "Search the agent-harness documentation.",
+			Name: "search_docs", Description: "Search the agent-harness documentation.", Effect: tool.EffectRead,
 			Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
 		}, searchDocs),
 		offload.Reader(store),
@@ -83,16 +83,16 @@ func calculate(_ context.Context, raw json.RawMessage) (string, error) {
 // docs is a tiny corpus. search_docs deliberately returns a lot of text so
 // the offload hook has something to move out of the context window.
 var docs = []string{
-	"The outer loop is one task or episode: start, prepare, then the inner loop, then verify, then done.",
-	"The inner loop is one model/tool turn: compose, model, route, tools, observe, back to compose.",
-	"BeforeModel hooks run in compose. Compaction (summarisation) and model profiles live there.",
-	"WrapModel middleware wraps the provider call: retries, fallback providers, model spans, latency metrics.",
-	"BeforeTool decides whether a tool call may run: guardrail veto, scopes, human approval.",
-	"WrapTool middleware wraps one tool execution: tool spans, result offloading.",
-	"CheckOutput runs in verify: output guardrails, redaction and verifiers; a revise verdict loops back to compose.",
+	"A run is an append-only journal of events. Fold computes the run from them, and a pure next picks the step.",
+	"One turn: compose, model, gate, tools, back to compose. Verify judges the answer, closing runs AfterRun.",
+	"Context hooks change the history for good, as a recorded edit. Compaction lives there.",
+	"BeforeModel hooks change one request: retrieval and model profiles. WrapModel wraps the stream.",
+	"BeforeTool decides whether a tool call may run: guardrail veto, scopes, human approval as a durable wait.",
+	"WrapTool middleware wraps one tool execution: result offloading, a ledger lookup on the idempotency key.",
+	"CheckOutput runs in verify: output guardrails and verifiers; a revise verdict loops back to compose.",
 	"The budget hook caps tokens, cost, model calls, tool calls and time, and detects repeated identical tool calls.",
-	"Budgets are hierarchical: Child carves a sub-budget from the parent's remaining allowance.",
-	"The trace hook records OpenTelemetry GenAI-style spans; sub-agents nest under the tool span that started them.",
+	"A Redactor is the innermost ring: the model, the tools, the hooks and the journal only see what it left.",
+	"Tracing, metrics and logging are event sinks, attached once on the context. Each event arrives once.",
 	"Multi-agent patterns: sequential, parallel, best-of-n, router, subagent, background, planner-worker, evaluator-optimizer, handoff, team, debate.",
 }
 

@@ -1,7 +1,7 @@
 // agent-harness web chat. Plain JS, no build step. Talks to:
 //   GET  /api/meta     -> states, transitions, hook points, hooks, patterns
 //   POST /api/chat     -> text/event-stream of harness events for one turn
-//   POST /api/approve  -> answer a pending approval (the "SPA" hook)
+//   POST /api/approve  -> answer a wait; the turn goes on in a new event stream
 //   POST /api/reset    -> forget this browser's session
 'use strict';
 
@@ -46,7 +46,7 @@ const SUGGEST = [
   'What time is it?', 'Compute (17+4)*3', 'Search the docs for budget', 'Send an email to Jan',
   'Delete all records', 'My password is hunter2', 'Show my AHV number', 'flaky: what time is it?', 'loop', 'Tell me something long',
 ];
-const SHORT = { BeforeRun: 'BeforeRun', BeforeModel: 'BeforeModel', WrapModel: 'WrapModel', OnDelta: 'OnDelta', AfterModel: 'AfterModel', BeforeTool: 'BeforeTool', WrapTool: 'WrapTool', AfterTool: 'AfterTool', AfterTurn: 'AfterTurn', CheckOutput: 'CheckOutput', AfterRun: 'AfterRun', OnTransition: 'OnTransition' };
+const SHORT = {};
 
 // ---------- boot ----------
 async function boot() {
@@ -75,7 +75,7 @@ function setView(v) {
 }
 
 function greet() {
-  addBot('Hi — this chat runs on agent-harness. Every message is one outer-loop episode; the panels on the right show each state transition and every hook invocation as it happens. Pick a pattern above or try a suggestion below.', null, 'harness');
+  addBot('Hi — this chat runs on agent-harness. Every message is one durable run; the panels on the right show each state transition and every hook invocation as it happens. Pick a pattern above or try a suggestion below.', null, 'harness');
 }
 
 // ---------- patterns ----------
@@ -96,8 +96,8 @@ function renderPatterns() {
 
 // ---------- state machine diagram ----------
 const POS = {
-  start: [44, 62], prepare: [146, 62], compose: [262, 62], model: [378, 62], route: [494, 62], verify: [622, 62], done: [756, 62],
-  observe: [262, 160], tools: [494, 160], stopped: [622, 222], failed: [756, 222],
+  start: [44, 62], compose: [170, 62], model: [300, 62], gate: [430, 62], tools: [430, 160], verify: [570, 62], closing: [680, 62], done: [790, 62],
+  body: [170, 160], suspended: [300, 160], stopped: [680, 222], failed: [790, 222],
 };
 const NW = 86, NH = 30;
 function renderMachine() {
@@ -110,18 +110,18 @@ function renderMachine() {
     defs.append(m);
   }
   svg.append(defs);
-  const inner = new Set(['compose>model', 'model>route', 'route>tools', 'tools>observe', 'observe>compose']);
+  const inner = new Set(['compose>model', 'model>gate', 'gate>tools', 'tools>compose']);
   for (const { from, to } of state.meta.transitions) {
-    if (to === 'stopped' || to === 'failed') continue;
+    if (to === 'stopped' || to === 'failed' || !POS[from] || !POS[to]) continue;
     const d = edgePath(from, to);
     const isInner = inner.has(from + '>' + to);
     svg.append(svgEl('path', { d, class: 'edge' + (isInner ? ' inner' : ''), id: `e-${from}-${to}`, 'marker-end': `url(#${isInner ? 'arr-inner' : 'arr'})` }));
   }
   const lbl = (x, y, t, cls = '') => { const n = svgEl('text', { x, y, class: 'lbl ' + cls }); n.textContent = t; svg.append(n); };
-  lbl(318, 116, 'INNER LOOP · one model/tool turn', 'loop');
+  lbl(318, 116, 'ONE TURN · model, gate, tools', 'loop');
   lbl(330, 14, 'verify → compose: repair (revise verdict)');
-  lbl(232, 226, 'any state → stopped (on purpose) | failed (error) →');
-  lbl(8, 18, 'OUTER LOOP · one task / episode', 'outer');
+  lbl(232, 226, 'closing → stopped (on purpose) | failed (error) →');
+  lbl(8, 18, 'ONE RUN · every step is a journal event', 'outer');
   for (const s of state.meta.states) {
     const [x, y] = POS[s] || [0, 0];
     const g = svgEl('g', { class: 'node' + (['done', 'stopped', 'failed'].includes(s) ? ' terminal' : '') + (s === 'failed' || s === 'stopped' ? ' bad' : ''), id: 'n-' + s });
@@ -139,6 +139,7 @@ function edgePath(a, b) {
   return `M${x1},${y1} L${x2},${y2}`;
 }
 function showTransition(ev) {
+  if (!POS[ev.to]) return;
   if (state.focus !== ev.run_id) { state.focus = ev.run_id; state.visited.clear(); }
   state.visited.add(ev.from); state.visited.add(ev.to);
   for (const s of state.meta.states) {
@@ -158,8 +159,8 @@ function trackRun(ev) {
   let r = state.runs.get(ev.run_id);
   if (!r) { r = { id: ev.run_id, agent: ev.agent, depth: ev.depth, turn: 0, state: ev.kind === 'pattern' ? 'pattern:' + ev.hook : 'start', stop: '' }; state.runs.set(ev.run_id, r); }
   if (ev.turn) r.turn = ev.turn;
-  if (ev.kind === 'transition') r.state = ev.to;
-  if (ev.kind === 'run.end') r.stop = ev.outcome;
+  if (ev.to) r.state = ev.to;
+  if (ev.kind === 'run.ended') r.stop = ev.outcome;
   if (ev.kind === 'pattern' && (ev.outcome === 'done' || ev.outcome === 'end')) r.stop = ev.text ? clip(ev.text, 24) : 'done';
   renderRuns();
 }
@@ -205,7 +206,7 @@ function countHook(ev) {
   const n = (state.counts.get(k) || 0) + 1;
   state.counts.set(k, n);
   td.textContent = String(n);
-  const trivial = ev.point === 'OnTransition' || (ev.point === 'WrapTool' && !String(ev.text || '').includes(': '));
+  const trivial = false;
   if (BAD.has(ev.outcome)) td.className = 'deny';
   else if (ev.text && !trivial && td.className !== 'deny') td.className = 'act';
   else if (!td.className) td.className = 'on';
@@ -233,18 +234,17 @@ function renderBudget(spent, limits) {
   ];
   $('#budget').replaceChildren(...rows.flatMap(([k, v]) => [el('dt', { text: k }), el('dd', { text: v })]));
 }
-// The budget hook notes "+N tokens → used/limit" at AfterModel; use it to
-// move the meter live, before the turn's final numbers arrive.
+// Each recorded reply moves the meter, before the turn's final numbers arrive.
 function liveBudget(ev) {
-  if (ev.hook !== 'budget' || ev.point !== 'AfterModel' || !ev.text) return;
-  const m = /→ (\d+)\/(\d+)/.exec(ev.text);
-  if (!m) return;
-  const used = +m[1], lim = +m[2];
-  const pct = Math.min(100, 100 * used / lim);
+  const u = ev.reply && ev.reply.usage;
+  const lim = state.meta.limits.Tokens;
+  if (!u || !lim) return;
+  state.liveTokens = (state.liveTokens || 0) + (u.input || 0) + (u.output || 0);
+  const pct = Math.min(100, 100 * state.liveTokens / lim);
   $('#budget-fill').style.width = pct.toFixed(1) + '%';
   $('#budget-fill').classList.toggle('hot', pct > 80);
   const dd = $('#budget dd');
-  if (dd) dd.textContent = `${used.toLocaleString()} / ${lim.toLocaleString()}`;
+  if (dd) dd.textContent = `${state.liveTokens.toLocaleString()} / ${lim.toLocaleString()}`;
 }
 function renderMetrics(m) {
   if (!m) return;
@@ -282,22 +282,24 @@ function renderSpans() {
 // ---------- event stream ----------
 function streamLine(ev) {
   const list = $('#stream');
-  const kind = ev.kind.startsWith('run.') ? 'run' : ev.kind;
+  const kind = ev.kind.split('.')[0] === 'model' || ev.kind.split('.')[0] === 'tool' || ['hook', 'pattern', 'delta'].includes(ev.kind) ? ev.kind.split('.')[0] : 'run';
   const t = '+' + Math.max(0, Date.parse(ev.time) - state.turnStart) + 'ms';
   const ind = '  '.repeat(ev.depth || 0);
   const body = el('span', {}, ind, el('span', { class: 'agent', text: ev.agent || '' }), ' ');
   const add = (txt, cls) => body.append(cls ? el('span', { class: cls, text: txt }) : txt);
   switch (ev.kind) {
-    case 'transition': add(`${ev.from} → ${ev.to}`); if (ev.turn) add(`  (turn ${ev.turn})`, 'note'); break;
     case 'hook': add(`${ev.point} · ${ev.hook} → `); add(ev.outcome, BAD.has(ev.outcome) ? 'bad' : ''); if (ev.text) add(`  ${clip(ev.text, 200)}`, 'note'); add(`  ${fmtMs(ev.duration_ns)}`, 'note'); break;
     case 'delta': add(JSON.stringify(ev.text), 'note'); break;
-    case 'model': { const d = ev.data || {}; const u = d.usage || {}; add(`reply ${d.tool_calls ? d.tool_calls + ' tool call(s)' : clip(ev.text, 90)}  ${u.input || 0}→${u.output || 0} tok  ${fmtMs(ev.duration_ns)}`); break; }
-    case 'tool': { const d = ev.data || {}; add(`${ev.hook}(${clip(d.args, 80)}) → `); add(ev.outcome, ev.outcome === 'ok' ? '' : 'bad'); add(`  ${clip(ev.text || d.result, 140)}`, 'note'); break; }
+    case 'model.done': { const r = ev.reply || {}; const u = r.usage || {}; const n = (r.tool_calls || []).length; add(`reply ${n ? n + ' tool call(s)' : clip(r.text, 90)}  ${u.input || 0}→${u.output || 0} tok  ${fmtMs(ev.duration_ns)}`); break; }
+    case 'model.failed': add(`${ev.failure.class}  `, 'bad'); add(clip(ev.text, 140), 'note'); break;
+    case 'tool.done': add(`${ev.tool} → `); add(ev.outcome, ev.outcome === 'ok' ? '' : 'bad'); add(`  ${clip(ev.text, 140)}`, 'note'); break;
+    case 'tool.gated': add(`${ev.tool} → ${ev.outcome}`, ev.outcome === 'allow' ? '' : 'bad'); break;
     case 'pattern': add(`${ev.hook} · ${ev.outcome}`); if (ev.text) add(`  ${clip(ev.text, 200)}`, 'note'); break;
-    case 'run.start': add('run.start  '); add(clip(ev.text, 120), 'note'); break;
-    case 'run.end': add('run.end → '); add(ev.outcome, ev.outcome === 'completed' ? '' : 'bad'); { const d = ev.data || {}; if (d.detail) add('  ' + d.detail, 'note'); } break;
-    case 'approval': add(`approval needed for ${ev.text}`, 'bad'); break;
-    default: add(clip(ev.text, 160));
+    case 'run.started': add('started'); break;
+    case 'run.ended': add('ended → '); add(ev.outcome, ev.outcome === 'completed' ? '' : 'bad'); if (ev.text) add('  ' + clip(ev.text, 160), 'note'); break;
+    case 'history.edited': add(`${ev.hook} edited the history`); break;
+    case 'wait.resolved': add(`${ev.signal.kind} answered: ${ev.signal.value || 'expired'}`); break;
+    default: if (ev.from && ev.to) add(`${ev.from} → ${ev.to}`); if (ev.text) add(`  ${clip(ev.text, 160)}`, 'note');
   }
   const li = el('li', { 'data-kind': kind }, el('span', { class: 't', text: t }), el('span', { class: 'k ' + kind, text: ev.kind }), body);
   if (!filterSet().has(kind)) li.classList.add('hidden');
@@ -328,7 +330,7 @@ async function send() {
   const bubble = el('li', { class: 'msg bot' }, el('span', { class: 'who', text: state.pattern === 'single' ? 'assistant' : state.pattern }), el('span', { class: 'body typing', text: '' }), el('span', { class: 'live' }));
   $('#messages').append(bubble); scrollChat();
   state.bubble = bubble;
-  state.turnStart = Date.now(); state.runs.clear(); state.spans = []; state.focus = null; state.visited.clear();
+  state.turnStart = Date.now(); state.liveTokens = 0; state.runs.clear(); state.spans = []; state.focus = null; state.visited.clear();
   resetMatrix(); renderRuns(); $('#stream').replaceChildren(); $('#spans').replaceChildren();
   try {
     const res = await fetch('api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -371,25 +373,35 @@ function onSSE(event, data) {
   const ev = data;
   streamLine(ev);
   trackRun(ev);
+  if (ev.from && ev.to) showTransition(ev);
   switch (ev.kind) {
-    case 'transition': showTransition(ev); break;
-    case 'hook': countHook(ev); liveBudget(ev); break;
+    case 'hook': countHook(ev); break;
+    case 'model.done': liveBudget(ev); break;
     case 'delta': { const live = $('.live', state.bubble); if (live.dataset.run !== ev.run_id) { live.dataset.run = ev.run_id; live.textContent = (ev.agent ? ev.agent + ': ' : ''); } live.textContent += ev.text; scrollChat(); break; }
-    case 'approval': askApproval(ev); break;
   }
 }
 
-function askApproval(ev) {
-  const d = ev.data || {};
+// A wait is durable: the turn's stream has ended, and the run is parked in the journal.
+// The answer is a signal, and the turn goes on in a new stream.
+function askApproval(wait) {
   const card = el('li', { class: 'approval' },
-    el('p', { class: 'ix', text: `SPA · APPROVAL REQUIRED · ${d.risk || ''} tool` }),
-    el('strong', { text: `${ev.agent} wants to call ${d.tool}` }),
-    el('pre', { text: JSON.stringify(d.arguments, null, 2) }));
+    el('p', { class: 'ix', text: 'APPROVAL REQUIRED · the run is suspended' }),
+    el('strong', { text: wait.detail || wait.kind }));
   const decide = async ok => {
     card.classList.add('decided');
     for (const b of card.querySelectorAll('button')) b.disabled = true;
-    await fetch('api/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: d.id, approve: ok }) });
     card.append(el('p', { class: 'ix', text: ok ? 'approved' : 'denied' }));
+    state.busy = true; $('#send').disabled = true;
+    try {
+      const res = await fetch('api/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: sessionId, pattern: state.pattern, wait: wait.id, approve: ok }) });
+      if (!res.ok) throw new Error(await res.text());
+      await readSSE(res.body, onSSE);
+    } catch (err) {
+      $('.body', state.bubble).textContent = 'Request failed: ' + err.message;
+      state.bubble.classList.add('failed');
+    } finally {
+      state.busy = false; $('#send').disabled = false;
+    }
   };
   card.append(el('div', { class: 'row' },
     el('button', { class: 'btn pri sm', type: 'button', text: 'Approve', onclick: () => decide(true) }),
@@ -403,6 +415,12 @@ function askApproval(ev) {
 function finish(data) {
   const b = state.bubble;
   const body = $('.body', b);
+  if (data.waits && data.waits.length) {
+    data.waits.forEach(askApproval);
+    renderBudget(data.spent || {}, data.limits || state.meta.limits);
+    renderSpans();
+    return;
+  }
   body.classList.remove('typing');
   $('.live', b).remove();
   const r = data.result;

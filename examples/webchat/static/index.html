@@ -38,7 +38,7 @@
         <h2 class="h3">Chat</h2>
       </div>
       <div class="head-actions">
-        <label class="toggle" title="Auto-approve dangerous tool calls (SPA: approval hook)">
+        <label class="toggle" title="Auto-approve dangerous tool calls (approval hook)">
           <input type="checkbox" id="auto-approve"><span>auto-approve</span>
         </label>
         <button class="btn ghost sm" id="reset" type="button">reset</button>
@@ -62,7 +62,7 @@
   <section class="diag" id="diag" aria-label="Hook diagnostics">
     <div class="card">
       <div class="card-head">
-        <div><p class="ix">02 · state machine</p><h2 class="h3">Inner &amp; outer loop</h2></div>
+        <div><p class="ix">02 · state machine</p><h2 class="h3">The run, step by step</h2></div>
         <span class="pill mono" id="current-state">idle</span>
       </div>
       <svg id="machine" viewBox="0 0 820 250" role="img" aria-label="State machine diagram"></svg>
@@ -102,7 +102,6 @@
       <div class="card-head">
         <div><p class="ix">07 · event stream</p><h2 class="h3">Live events</h2></div>
         <div class="filters mono" id="filters">
-          <label><input type="checkbox" value="transition" checked>transitions</label>
           <label><input type="checkbox" value="hook" checked>hooks</label>
           <label><input type="checkbox" value="model" checked>model</label>
           <label><input type="checkbox" value="tool" checked>tools</label>

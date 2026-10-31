@@ -1,104 +1,91 @@
 # The state machine
 
-`Agent.Run` executes one **episode**, the outer loop, as a walk over an explicit state graph. Inside it, the **inner loop** repeats one model/tool turn until the model answers without asking for tools, or something stops the run.
+A run is an append-only journal of events. `Fold` computes the `Run` from them, a pure `next` picks the step, and a thin shell does the step and records what happened. So the state is never stored: it is what the events add up to, on any process.
+
+This is why `Run` can be one call. Starting, resuming, signalling and cancelling all load the journal, fold it and carry on from there.
 
 ```mermaid
 stateDiagram-v2
   [*] --> start
-  start --> prepare
-  prepare --> compose
+  start --> compose
+  start --> body: a composite run
   compose --> model
-  model --> route
-  route --> tools: tool calls
-  tools --> observe
-  observe --> compose
-  route --> verify: final answer
-  verify --> compose: revise (repair)
-  verify --> done: accepted
+  model --> gate: tool calls
+  model --> verify: plain answer
+  model --> compose: failed, retry
+  gate --> tools
+  tools --> compose: results joined
+  gate --> suspended: a person must answer
+  tools --> suspended: a tool parked
+  model --> suspended: long backoff
+  body --> suspended: a child waits
+  suspended --> gate: decide again
+  suspended --> compose
+  suspended --> body
+  body --> verify
+  verify --> compose: revise
+  verify --> closing: accepted
+  closing --> done
+  closing --> stopped: on purpose
+  closing --> failed: an error
   done --> [*]
   stopped --> [*]
   failed --> [*]
 ```
 
-Every non-terminal state may also move to `stopped` (on purpose) or `failed` (an error).
+| State | What happens | Plugin points |
+|---|---|---|
+| `start` | nothing yet: `run.started` records identity, the pin and the input | `Redact` on everything from here on |
+| `compose` | the turn limit, then the history, then the request, then the intent to call | `Context`, `BeforeModel` |
+| `model` | the paid call: the intent is recorded first, the reply after | `WrapModel`, `AfterModel`, `Recover` |
+| `gate` | each call is decided, and the decisions are recorded together | `BeforeTool` |
+| `tools` | intents recorded as a group, the tools run, results recorded as they arrive | `WrapTool`, `AfterTool` |
+| `body` | a composite run's children advance | a composite's own `Body` |
+| `verify` | the candidate answer is judged | `CheckOutput` |
+| `suspended` | nothing runs: the run waits for a signal, or a timer | none |
+| `closing` | the outcome is decided, and children of a cancelled run are ended | `AfterRun` |
+| `done`, `stopped`, `failed` | terminal | none |
 
-## Transitions are data
+`BeforeRun` runs each time a worker takes the run, at the start and on every resume.
 
-```go
-harness.Transitions() // map[State][]State: the only legal edges
-harness.CanTransition(from, to)
-s.Loop()              // "outer", "inner" or "terminal"
-s.Terminal()
-```
+## Every step is recorded before anything acts on it
 
-The machine checks every edge before taking it. A step function that returns an edge not in the table fails the run with `ErrIllegalTransition`. Bugs show up immediately and can't turn into silent loops. `Result.Path` holds the visited states in order, which makes test assertions trivial:
+`record` is the one way anything happens. In this order, always: redact, check the edge, append, adopt, emit. An event whose edge is not in the table below fails the run, so an illegal step can't pass silently.
 
-```go
-// tool call, then answer
-[start prepare compose model route tools observe compose model route verify done]
-```
+A crash can land between any two events, and each case has one answer, because the journal says how far the run got:
 
-`state_test.go` checks the table itself. `run_test.go` drives 15 scenarios through table tests and asserts their paths: plain answer, tool turn, tool denied, tool halt, input guardrail, budget, revise, capped repairs, output block, rewrite, max turns, AfterTurn loop stop, handoff, tool error and provider failure. Cancellation is tested separately.
+| Last event | What it means | What the next worker does |
+|---|---|---|
+| `model.started` | the call may have been billed, and its reply is gone | records `model.lost`, counts it in `LostCalls` and calls again |
+| `tool.started` on `EffectRead` or `EffectIdempotent` | the effect is safe to repeat | records `tool.lost` and runs the call again, with the same idempotency key |
+| `tool.started` on `EffectOnce` | nobody can know whether it happened | records `tool.lost` and opens a `WaitUnknownOutcome` wait, so a person answers |
+| `tool.done` | the effect happened and the result is safe | carries on |
 
-## States
+Spend is a bound, not exact: `ModelCalls <= billed <= ModelCalls + LostCalls`.
 
-| State | Loop | Does | Leaves to |
-|---|---|---|---|
-| `start` | outer | creates the `Run`, emits `run.start` | `prepare` |
-| `prepare` | outer | `BeforeRun` hooks: admission (guardrails, budget, root span) | `compose`, `stopped`, `failed` |
-| `compose` | inner | checks `MaxTurns` (→ `stopped`/`max_turns`), increments `Turn`, builds the `model.Request`, `BeforeModel` hooks | `model` |
-| `model` | inner | calls the provider through the `WrapModel` chain; `OnDelta` per streamed event; `AfterModel` hooks; records usage and the assistant message | `route` |
-| `route` | inner | tool calls → `tools`, else → `verify` | `tools`, `verify` |
-| `tools` | inner | for each call: `BeforeTool` (allow / deny / halt), the `WrapTool` chain, the registry, `AfterTool`. A `*tool.Handoff` result stops the run with `handoff` | `observe`, `stopped` |
-| `observe` | inner | `AfterTurn` hooks at the turn boundary | `compose` |
-| `verify` | outer | `CheckOutput` hooks: accept, rewrite, revise (append feedback and go back to `compose`, capped by `MaxRepairs`) or block | `done`, `compose`, `stopped` |
-| `done`, `stopped`, `failed` | terminal | `AfterRun` hooks, `run.end` event | — |
+Two workers can't both advance a run. A unique index on `(run_id, seq)` is the fence: `run.claimed` takes the next position, so the old worker's next append fails with `ErrFenced`. See [the design](design/durable-core.md) for the whole argument and its limits.
 
-### Request building
+## Transitions
 
-The agent's `Instructions` are added as the system message **at request time** and are never stored in `Run.Messages`. History stays model-agnostic, and a profile or a compactor can't accidentally duplicate the system prompt. `BeforeModel` hooks receive a mutable `*model.Request` and may rewrite it, for example by dropping tools, appending instructions or replacing history.
+Generated from `harness.Transitions()`. `TestTheDocsMatchTheTable` fails if this drifts. To refresh it, run `UPDATE_DOCS=1 go test -run TestTheDocsMatchTheTable .`
 
-### Stopping on purpose vs failing
+<!-- transitions -->
+| From | Event | To |
+|---|---|---|
+| `start` | `run.started` | `compose`, `body` |
+| `compose` | `history.edited` | `compose` |
+| `compose` | `model.started` | `model` |
+| `model` | `model.done` | `gate`, `verify`, `compose`, `closing` |
+| `model` | `model.failed` | `compose`, `suspended`, `closing` |
+| `model` | `model.lost` | `compose` |
+| `gate` | `tool.gated` | `gate`, `tools`, `suspended`, `compose`, `closing` |
+| `tools` | `tool.started` | `tools` |
+| `tools` | `tool.done` | `tools`, `compose`, `suspended`, `closing` |
+| `tools` | `tool.lost` | `tools`, `gate`, `compose`, `suspended` |
+| `body` | `body.done` | `verify`, `suspended`, `closing` |
+| `suspended` | `wait.resolved` | `suspended`, `gate`, `compose`, `body` |
+| `verify` | `output.checked` | `compose`, `closing` |
+| `closing` | `run.ended` | `done`, `stopped`, `failed` |
+<!-- /transitions -->
 
-A hook returns `harness.Stop(reason, detail)` to end the run deliberately. The run then ends in `stopped` with `Result.Stop = reason`, and `Run` returns `err == nil`. Any other error ends in `failed` with `StopFailed`, and `Run` returns that error. Callers branch on `res.Stop` and only treat `err != nil` as a bug or outage.
-
-| Reason | Typical source |
-|---|---|
-| `completed` | `verify` accepted |
-| `max_turns` | `compose`, `Agent.MaxTurns` (default 8) |
-| `max_repairs` | `verify`, `Agent.MaxRepairs` (default 2) |
-| `budget_exhausted` | `hooks/budget` |
-| `guardrail` | `hooks/guard`, `Verdict` block |
-| `policy` | `hooks/approval` with `HaltOnDeny`, `Decision` halt |
-| `loop_detected` | `hooks/budget` repeat detection, `multi.Handoff` hop cap |
-| `handoff` | a tool returned `*tool.Handoff` |
-| `cancelled` | context cancelled |
-| `failed` | provider or tool infrastructure error, illegal transition |
-
-## Events
-
-Each step emits `harness.Event`s to the sinks registered with `harness.WithEvents(ctx, sink)`:
-
-| Kind | When |
-|---|---|
-| `run.start` / `run.end` | episode boundaries (`run.end` carries stop, usage, turns) |
-| `transition` | every edge (`From`, `To`, `Data.loop`) |
-| `hook` | every hook invocation (`Hook`, `Point`, `Outcome`, `Duration`, `Text` = the hook's note) |
-| `delta` | streamed text |
-| `model` | a complete reply (usage, finish, tool-call count) |
-| `tool` | a completed tool call (args, outcome, clipped result) |
-| `pattern` | a multi-agent pattern step (start, fan-out, verdict, plan, claim, …, end) |
-
-Sub-agents inherit the sinks. Their events carry `Depth > 0` and `ParentRun`, so one sink sees a whole tree of runs. That's how the web chat renders nested patterns live.
-
-## Why these states (and not others)
-
-The states are the moments the video says a harness needs to own:
-
-- before the agent runs → `prepare`
-- before each model call, where summarisation and context assembly happen → `compose`
-- around the model call → `model`
-- around each tool call, where offloading and approval happen → `tools`
-- after the agent → the terminal states
-
-`route`, `observe` and `verify` come from ecociel/agents (`production-agent-components.md`, *Explicit state machine*), from tessmir's `agentloop` (turn boundary, verification before acceptance), and from corporate-admin's `agent.Next` steps, which map one-to-one; see [corporate-admin.md](corporate-admin.md). `verify` turns "the model stopped calling tools" into "the answer passed its checks". The repair edge back to `compose` is the single-agent form of the evaluator–optimizer pattern.
+Every live state also takes `run.claimed`, because any worker may take the run, and `run.stopping`, because a cancel or a hook can end it from anywhere.

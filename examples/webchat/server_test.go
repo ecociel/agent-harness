@@ -9,16 +9,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ecociel/agent-harness/provider/fake"
 )
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := NewServer(fake.NewFunc(brain), "demo-scripted", "test", nil)
-	srv.ApprovalTimeout = 5 * time.Second
-	ts := httptest.NewServer(srv)
+	ts := httptest.NewServer(NewServer(&flaky{next: fake.NewFunc(brain)}, "demo-scripted", "test", nil))
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -154,13 +151,13 @@ func TestChatStreamsEveryHookPoint(t *testing.T) {
 			spans++
 		}
 	}
-	for _, p := range []string{"BeforeRun", "BeforeModel", "WrapModel", "OnDelta", "AfterModel", "BeforeTool",
-		"WrapTool", "AfterTool", "AfterTurn", "CheckOutput", "AfterRun", "OnTransition"} {
+	for _, p := range []string{"BeforeRun", "Context", "BeforeModel", "AfterModel", "BeforeTool", "AfterTool", "CheckOutput", "AfterRun"} {
 		if !points[p] {
 			t.Errorf("hook point %s never fired", p)
 		}
 	}
-	for _, k := range []string{"run.start", "transition", "hook", "delta", "model", "tool", "run.end"} {
+	for _, k := range []string{"run.started", "model.started", "model.done", "tool.gated", "tool.started", "tool.done",
+		"output.checked", "run.ended", "hook", "delta"} {
 		if !kinds[k] {
 			t.Errorf("no %s event", k)
 		}
@@ -186,30 +183,105 @@ func TestChatGuardrailsAndRedaction(t *testing.T) {
 	}
 }
 
-func TestChatInteractiveApproval(t *testing.T) {
-	ts := newTestServer(t)
-	for _, approve := range []bool{true, false} {
-		asked := false
-		evs := chat(t, ts, map[string]any{"session": "a", "message": "send an email to Jan"}, func(e sseEvent) {
-			if e.Name != "harness" || e.Data["kind"] != "approval" {
-				return
+// post sends a JSON body to path and parses the SSE response.
+func stream(t *testing.T, ts *httptest.Server, path string, body map[string]any) []sseEvent {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	resp, err := http.Post(ts.URL+path, "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, msg)
+	}
+	var evs []sseEvent
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	var cur sseEvent
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			cur.Name = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &cur.Data); err != nil {
+				t.Fatalf("bad data %q: %v", line, err)
 			}
-			asked = true
-			id := e.Data["data"].(map[string]any)["id"].(string)
-			b, _ := json.Marshal(map[string]any{"id": id, "approve": approve})
-			resp, err := http.Post(ts.URL+"/api/approve", "application/json", bytes.NewReader(b))
-			if err != nil || resp.StatusCode != 200 {
-				t.Errorf("approve: %v %v", err, resp.Status)
-			}
-			_ = resp.Body.Close()
-		})
-		out := final(t, evs)["output"].(string)
-		if !asked {
-			t.Fatal("no approval request streamed")
+		case line == "":
+			evs = append(evs, cur)
+			cur = sseEvent{}
 		}
+	}
+	return evs
+}
+
+// The stream ends at a wait, nothing is held open, and the answer resumes the run.
+func TestChatApprovalIsADurableWait(t *testing.T) {
+	ts := newTestServer(t)
+	for session, approve := range map[string]bool{"yes": true, "no": false} {
+		evs := chat(t, ts, map[string]any{"session": session, "message": "send an email to Jan"}, nil)
+		last := evs[len(evs)-1].Data
+		if res := last["result"].(map[string]any); res["state"] != "suspended" {
+			t.Fatalf("result %v", res)
+		}
+		waits, _ := last["waits"].([]any)
+		if len(waits) != 1 {
+			t.Fatalf("waits %v", last["waits"])
+		}
+		id := waits[0].(map[string]any)["id"]
+		out := final(t, stream(t, ts, "/api/approve", map[string]any{"session": session, "wait": id, "approve": approve}))["output"].(string)
 		if approve != strings.Contains(out, "sent") {
 			t.Errorf("approve=%v: %q", approve, out)
 		}
+	}
+}
+
+func TestChatAutoApproveAnswersEveryWait(t *testing.T) {
+	ts := newTestServer(t)
+	evs := chat(t, ts, map[string]any{"session": "auto", "message": "send an email to Jan", "auto_approve": true}, nil)
+	if out := final(t, evs)["output"].(string); !strings.Contains(out, "sent") {
+		t.Fatalf("%q", out)
+	}
+}
+
+func TestChatApproveWithNoConversationIsRefused(t *testing.T) {
+	ts := newTestServer(t)
+	resp, err := http.Post(ts.URL+"/api/approve", "application/json", strings.NewReader(`{"session":"none","wait":"w"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+func TestChatRetriesAFlakyModel(t *testing.T) {
+	ts := newTestServer(t)
+	evs := chat(t, ts, map[string]any{"session": "f", "message": "this one is flaky"}, nil)
+	failed := 0
+	for _, e := range evs {
+		if e.Name == "harness" && e.Data["kind"] == "model.failed" {
+			failed++
+		}
+	}
+	if res := final(t, evs); res["stop"] != "completed" || failed != 1 {
+		t.Fatalf("%v, %d failures", res, failed)
+	}
+}
+
+// The budget spans a session's runs, so it comes from a projection and not one Run.
+func TestChatSpendAddsUpAcrossTurns(t *testing.T) {
+	ts := newTestServer(t)
+	used := func(evs []sseEvent) float64 {
+		return evs[len(evs)-1].Data["spent"].(map[string]any)["model_calls"].(float64)
+	}
+	first := used(chat(t, ts, map[string]any{"session": "b", "message": "hello"}, nil))
+	second := used(chat(t, ts, map[string]any{"session": "b", "message": "hello again"}, nil))
+	if first != 1 || second != 2 {
+		t.Fatalf("%v then %v", first, second)
 	}
 }
 
@@ -268,7 +340,7 @@ func TestProviderFromEnv(t *testing.T) {
 	if _, _, _, err := providerFromEnv(env(map[string]string{"HARNESS_PROVIDER": "openai"})); err == nil {
 		t.Error("openai without key should fail")
 	}
-	if _, m, _, err := providerFromEnv(env(map[string]string{"HARNESS_PROVIDER": "anthropic", "ANTHROPIC_API_KEY": "k"})); err != nil || m != "claude-sonnet-4-5" {
+	if _, m, _, err := providerFromEnv(env(map[string]string{"HARNESS_PROVIDER": "anthropic", "ANTHROPIC_API_KEY": "k"})); err != nil || m != "claude-opus-5-5" {
 		t.Errorf("anthropic: %v %v", m, err)
 	}
 	if _, _, _, err := providerFromEnv(env(map[string]string{"HARNESS_PROVIDER": "bogus"})); err == nil {
@@ -278,25 +350,24 @@ func TestProviderFromEnv(t *testing.T) {
 
 func TestChatCompactionAndOffload(t *testing.T) {
 	ts := newTestServer(t)
-	noted := func(evs []sseEvent, hook string) string {
+	saw := func(evs []sseEvent, kind, text string) bool {
 		for _, e := range evs {
-			if e.Name == "harness" && e.Data["kind"] == "hook" && e.Data["hook"] == hook {
-				if s, _ := e.Data["text"].(string); strings.Contains(s, "→") || strings.Contains(s, "offloaded") {
-					return s
+			if e.Name == "harness" && e.Data["kind"] == kind {
+				if s, _ := e.Data["text"].(string); strings.Contains(s, text) {
+					return true
 				}
 			}
 		}
-		return ""
+		return false
 	}
-	evs := chat(t, ts, map[string]any{"session": "c", "message": "search the docs for budget"}, nil)
-	if n := noted(evs, "offload"); !strings.Contains(n, "offloaded") {
-		t.Errorf("offload note = %q", n)
+	if evs := chat(t, ts, map[string]any{"session": "c", "message": "search the docs for budget"}, nil); !saw(evs, "tool.done", `"offloaded"`) {
+		t.Error("the large result was not offloaded")
 	}
-	var note string
-	for i := 0; i < 6 && note == ""; i++ {
-		note = noted(chat(t, ts, map[string]any{"session": "c", "message": "tell me something long"}, nil), "compact")
+	compacted := false
+	for i := 0; i < 6 && !compacted; i++ {
+		compacted = saw(chat(t, ts, map[string]any{"session": "c", "message": "tell me something long"}, nil), "hook", "messages summarised")
 	}
-	if !strings.Contains(note, "compacted") {
-		t.Errorf("compaction never happened (note %q)", note)
+	if !compacted {
+		t.Error("compaction never happened")
 	}
 }

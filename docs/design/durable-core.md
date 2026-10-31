@@ -275,10 +275,6 @@ Grafted into the base: the redaction ring (candidates 1 and 3), `AfterModel` and
 1. **A pattern needs a durable row.** The base claimed a pattern could stay stateless and resume by rerunning. That failed with `no such run: root/1`, because an unstarted branch has no recorded input. Signals also could not reach the right branch. The sketch made a pattern a lead agent with a scripted model, which wrote `model.*` events for calls nobody paid for and made consumers skip them. Unit 3 replaced that with `Composite`, one state and one event. The skips are gone.
 2. **`ErrFenced` no longer means someone else owns the run.** In a tree, each run has its own fence, so two live workers can stop each other. This is safe, but it means a sweep is required for trees. Unit 3 does not change this. A cancel fences runs one at a time and adds no owner for the tree, and `TestTwoLiveWorkersCanFenceEachOtherAndTheNextRunConverges` still forces the stall.
 
-## Agreed decisions not yet built
-
-- **A test check guards the `Run` copy.** `view()` clones the `Messages` slice but not each message's `ToolCalls`, so a hook can change shared state despite having no setters. A deep copy per hook costs O(history). Test helpers fail if a hook changed its `Run`, and production stays unchecked, so a careless hook that slips past tests can still corrupt a live run.
-
 ## Known limits
 
 Each of these was left on purpose.
@@ -297,6 +293,7 @@ Each of these was left on purpose.
 - **`Team` no longer pulls work.** A member does not take the next free task, so a slow member's task holds its round. A member also sees the list as it stood when the round began, not its peers' live results.
 - **A round holds at a wait.** In `Debate`, `PlannerWorker` and `Team` a child that waits stops the next round, once the rest of its round has run as far as it can.
 - **A cancel walks every position a pattern could have used.** Each is one `Load`, and an unused position costs a read and writes nothing. `PlannerWorker` has the most: 43 positions at the defaults, before sub-planners.
+- **Only tests guard the `Run` copy.** A hook gets a `Run` by value, but `view()` clones the `Messages` slice and not each message's `ToolCalls`, because a deep copy per hook costs O(history). `hooktest.Frozen` fails a test if a hook writes through one. Production stays unchecked, so a careless hook that slips past tests can still corrupt a live run.
 - **Sticky ownership can be compacted away.** If the owner's last reply is summarised, the next turn starts at `Start`. By reading the code.
 - **A summariser pays outside the run.** `compact.ModelSummarizer` makes its own model call, so its spend is not in `Run.Usage`, and a crash before the edit is recorded pays it again. A failed summary keeps the history and carries on.
 - **`offload` needs a durable `Store` for a durable run.** `NewMemStore` results die with the process, and a resumed run then holds handles nothing can read. The model gets an error from the reader, not a failed run.

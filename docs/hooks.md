@@ -1,74 +1,69 @@
 # Hooks
 
-A hook is any value with a `Name() string` method that also implements one or more point interfaces. `Agent.Hooks` is an ordered slice. The machine indexes it once per run by type assertion (`harness.HookPoints(h)` reports which points a hook implements).
+A hook is a plain value that implements one or more of the interfaces below. Put it in `Agent.Hooks`. Hooks run in list order, and the first middleware is the outermost layer.
+
+One rule makes hooks safe across a crash: **a hook only ever returns a value.** It gets a `Run` by value and can't change it. The machine records what the hook returned, and `Fold` reads the record, so a decision is never made differently on replay. A hook can run more than once if a crash lands before its result is recorded, so its own side effects must tolerate repeats. Test a hook with `hooktest.Frozen`, which fails if it writes through the `Run` it was given.
+
+| Point | Runs | Returns | Typical use |
+|---|---|---|---|
+| `Redact` | on all text, innermost | text | keep a value out of the model, the tools, every hook and the journal |
+| `BeforeRun` | each time a worker takes the run | error (`Stop` ends the run) | admission, input guardrails, revocation |
+| `Context` | before every model call | an `Edit`, recorded | compaction, memory |
+| `BeforeModel` | before every model call | changes one request, not recorded | retrieval, model profiles |
+| `WrapModel` | around the provider stream | a provider | streaming guardrails, response caches |
+| `AfterModel` | on the reply, before it is recorded | a reply (not its usage) | reply guardrails |
+| `Recover` | after a failed model call | a `Recovery`, recorded | retries, a fallback model |
+| `BeforeTool` | for each call | `Allow`, `Deny`, `Halt` or `Await`, recorded | policy, approval |
+| `WrapTool` | around one execution | a tool function | offloading, a ledger lookup on `c.Key` |
+| `AfterTool` | on a result, before it is recorded | text | result guardrails |
+| `CheckOutput` | on the candidate answer | `Accept`, `Revise` or `Block`, recorded | output guardrails, verifiers |
+| `AfterRun` | when the outcome is decided, at least once | nothing | saving memory, keyed on `r.ID` |
+
+`Redact` is special. It is a ring, not a step: it wraps the provider and the tools directly, inside `WrapModel` and `WrapTool`, and every durable event passes through it again. A redactor that fails ends the run with the text discarded. Children inherit it. While one is attached, a reply reaches sinks only when complete, unless the redactor also implements `ModelMiddleware` to filter the stream.
+
+Retries belong in `Recover`, not `WrapModel`: an attempt inside middleware isn't journaled, so a crash forgets it.
+
+## Sinks
+
+Tracing, metrics and logging are not hooks. They are event sinks, attached once on the context, and every run in the tree reports to them:
 
 ```go
-type Hook interface{ Name() string }
+ctx = harness.WithEvents(ctx, trace.Sink(exporter))
+ctx = harness.WithEvents(ctx, metrics.Sink(registry))
+ctx = harness.WithEvents(ctx, logging.Sink(logger, slog.LevelDebug))
 ```
 
-## Point interfaces
+A sink gets each durable event once, after it is journaled, and only what has passed the redactors. It can miss the last event before a crash, so the journal is the source to reconcile a total from.
 
-```go
-BeforeRunHook    BeforeRun(ctx, *Run) error
-BeforeModelHook  BeforeModel(ctx, *Run, *model.Request) error
-ModelMiddleware  WrapModel(*Run, next ModelCall) ModelCall
-DeltaHook        OnDelta(ctx, *Run, model.Event)
-AfterModelHook   AfterModel(ctx, *Run, *model.Response) error
-BeforeToolHook   BeforeTool(ctx, *Run, model.ToolCall) Decision      // Allow, Deny(reason), Halt(reason)
-ToolMiddleware   WrapTool(*Run, next ToolCallFunc) ToolCallFunc
-AfterToolHook    AfterTool(ctx, *Run, ToolOutcome) error
-AfterTurnHook    AfterTurn(ctx, *Run) error
-OutputHook       CheckOutput(ctx, *Run, output string) Verdict       // Accept, Revise(fb), Block(msg), {Rewrite: s}
-AfterRunHook     AfterRun(ctx, *Run, *Result)
-TransitionHook   OnTransition(ctx, *Run, from, to State)
-```
+## Built in
 
-## Rules
-
-- **Order.** Hooks run in slice order at every point. For middleware the first hook is the **outermost** layer: `[retry, trace]` means each retry attempt gets its own model span.
-- **Errors.** A hook error at a point that returns `error` ends the run. `harness.Stop(reason, detail)` ends it on purpose (`stopped`, `err == nil` from `Run`); any other error fails it (`failed`).
-- **Decisions and verdicts.** `BeforeTool` returns a `Decision`. The first non-allow decision wins. A denial is fed back to the model as a tool result (`{"denied":true,…}`) so it can adapt; a halt stops the run. `CheckOutput` returns a `Verdict`: `Revise` appends the feedback as a user message and loops back to `compose` (capped by `MaxRepairs`), `Block` stops, and `Rewrite` replaces the answer (redaction).
-- **State.** Hooks run on the run's goroutine one at a time, so they may read and write the exported `Run` fields (for example `Messages` for compaction) without locking. `Run.Set` and `Run.Value` are scratch space shared between a hook's points and are safe from any goroutine.
-- **Notes.** `run.Note(hookName, format, args…)` attaches a remark to the current invocation's `hook` event, such as "compacted 14 → 7 messages" or "offloaded 5321 bytes as off-1". The built-in hooks use notes, and the web chat shows them as tooltips in the hook matrix.
-- **Shared hooks.** A hook value may be shared by many agents (all agents in a pattern, say). Keep per-run state in `Run.Set`, not in the hook. The built-in hooks are safe for concurrent use.
-
-## Writing a hook
-
-```go
-type piiStream struct{}
-
-func (piiStream) Name() string { return "pii-stream" }
-
-// Streaming guardrail: stop the model mid-reply.
-func (piiStream) OnDelta(ctx context.Context, r *harness.Run, ev model.Event) {
-    if d, ok := ev.(model.TextDelta); ok && strings.Contains(d.Text, "756.") {
-        r.Set("pii-stream.hit", true)
-    }
-}
-
-func (piiStream) CheckOutput(_ context.Context, r *harness.Run, out string) harness.Verdict {
-    if hit, _ := r.Value("pii-stream.hit").(bool); hit {
-        return harness.Revise("do not include AHV numbers")
-    }
-    return harness.Accept()
-}
-```
-
-## Built-in hooks and the video's middleware list
-
-The video lists the middleware points a harness needs. Here is where each one lives in this library:
-
-| Video | Point | Built-in |
+| Package | Points | Concern |
 |---|---|---|
-| before the agent | `BeforeRun` | guard (input), budget (admission), trace (root span), trajectory |
-| before each model call: summarisation, context assembly | `BeforeModel` | compact, profile, budget (pre-flight estimate) |
-| wrap the model call | `WrapModel` | retry/fallback, trace, metrics |
-| wrap each tool call: context offloading, approvals | `BeforeTool`, `WrapTool` | guard (veto), approval (SPA), profile (hidden tools); offload, trace |
-| after the agent | `AfterRun` | trace, metrics, trajectory, logging |
-| model profiles (per-model prompts and tool variants) | `BeforeModel`, `BeforeTool` | profile |
-| traces, trajectories, tokens, latency | all | trace, trajectory, metrics, budget |
-| evals (instruction, environment, verifier; LLM as judge) | — | package `eval`, `OutputHook` verifiers |
+| `hooks/guard` | `BeforeRun`, `BeforeTool`, `CheckOutput` | deny inputs, veto tools, revise or block outputs. `guard.Redactor` is the rule-based `Redact` ring. `Guard.Redact` only rewrites the final answer |
+| `hooks/budget` | `BeforeRun`, `BeforeModel` | tokens, cost, model and tool calls, wall time, loop detection, read from the `Run`. `WithPool` applies limits to a tree or tenant, from the consumer's own projection |
+| `hooks/approval` | `BeforeTool` | scopes, a risk threshold, an `Approver` or a durable wait (`Ask`), audit records |
+| `hooks/compact` | `Context`, `Recover` | summarise old turns as a recorded edit, and answer a full context |
+| `hooks/offload` | `WrapTool` | move large results to a `Store`, with a `read_offloaded` tool. A durable run needs a durable `Store` |
+| `hooks/retry` | `Recover` | backoff and retries as recorded decisions, then one try on `FallbackModel`. `retry.Fallback` routes that name to another provider |
+| `hooks/profile` | `BeforeModel` | per-model instructions, hidden tools, output caps |
+| `hooks/trajectory` | `AfterRun` | full runs for evals. `trajectory.From` reads one from any `Run` |
+| `hooks/trace` | sink | OpenTelemetry-shaped spans with stable IDs |
+| `hooks/metrics` | sink | counters and latency histograms behind a `Recorder` |
+| `hooks/logging` | sink | `log/slog` lines |
 
-## Tracing without dependencies
+## Writing one
 
-`hooks/trace` produces OpenTelemetry-shaped spans: trace and span ids, parent ids, attributes and events. Names and attributes follow the GenAI semantic conventions (`invoke_agent <name>`, `chat <model>`, `execute_tool <name>`, `gen_ai.usage.input_tokens`, …). An `Exporter` receives finished `SpanData`. Exporters ship for memory (tests) and JSONL (files). To get real OTel, write a ~30-line exporter in your application that maps `SpanData` onto `go.opentelemetry.io/otel/trace`; that keeps the library dependency-free. The tracer comes from the hook (`trace.New(tracer)`) or, when that is nil, from the context (`trace.WithTracer`), so a server can trace each request separately. A tool span is placed on the context, so sub-agent spans nest under the tool call that started them.
+```go
+type noFridays struct{}
+
+func (noFridays) Name() string { return "no-fridays" }
+
+func (noFridays) BeforeTool(_ context.Context, _ harness.Run, c harness.Call) harness.Decision {
+	if c.Spec.Risk >= tool.RiskDangerous && time.Now().Weekday() == time.Friday {
+		return harness.Deny("no dangerous changes on a Friday")
+	}
+	return harness.Allow()
+}
+```
+
+Keep state in the journal. What a hook needs to know is in the `Run` it is given, so `hooks/budget` holds limits and no spend, and a budget survives a crash with nothing to restore. `harness.Note(ctx, ...)` attaches a remark to the hook's event.

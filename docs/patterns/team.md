@@ -1,11 +1,10 @@
 # Shared-state team
 
 ```
-member A ─┐  claim / post / add  ┌─ member B
-          └──────▶  Board  ◀─────┘
+tasks ──round──▶ member A, member B, member A ──NEW TASK──▶ tasks ──round──▶ …
 ```
 
-A **shared-state team**: long-lived peers pull tasks from a `Board`, claim them with **optimistic concurrency**, post results and add follow-up tasks. Nobody is in charge. The run ends when the work list is empty and nobody is busy.
+A **shared-state team**: peers work through a task list, post results and add follow-up tasks. Nobody is in charge. The run ends when the list is empty.
 
 ```go
 tm := &multi.Team{Members: []harness.Runner{a, b}, MaxTasks: 12}
@@ -13,14 +12,11 @@ tm := &multi.Team{Members: []harness.Runner{a, b}, MaxTasks: 12}
 tm.Seed = func(in harness.Input) []string { return []string{"audit hooks", "audit patterns"} }
 ```
 
-- **Board.** Each task has a version. `Claim(id, version, owner)` fails with `ErrConflict` if someone else changed it first, and the loser simply moves on. That is the optimistic-concurrency fix Cursor found after lock-based coordination through a shared file stalled. `Snapshot()` gives a consistent view and `Finish` posts a result. The board is safe for concurrent use and can be passed in (`Team.Board`) to inspect afterwards.
+- **The list is a pure function.** It comes from the seed and the journals: each round runs every task nobody has run, and the follow-ups it reports, in task order, form the next round. So a resume rebuilds the same list.
+- **Tasks go to members by number.** The first version raced members to claim tasks on a shared board. A race can't be replayed after a crash, so assignment is by position now. A slow member's task holds its round.
 - **Follow-ups.** A member adds tasks by writing `NEW TASK: …` lines, capped by `MaxTasks` in total.
-- **Waiting.** Idle members block until a task appears or everyone is done (`context.AfterFunc` wakes them on cancellation).
-- **Result.** The output is all task results in order. Failed tasks give `StopFailed` with a count.
-- **Events.** `claim`, `conflict`, `add`, `post`, `end`.
+- **What a member sees.** The list as it stood when its round began, not its peers' live results.
+- **Result.** The output is all task results in order. Failed tasks give `StopFailed` with a count, and don't stop the others.
+- **Events.** `fan-out` and `round`.
 
-Cursor also found that flat self-coordination makes agents risk-averse at scale, which is why [PlannerWorker](planner-worker.md) exists. A Team is still the right shape for a small pool of peers working through a queue.
-
-**Sources:** Dani Zhu's *shared-state teams*; Cursor [*Scaling agents*](https://cursor.com/blog/scaling-agents) (locks → optimistic concurrency); ecociel/agents `blackboard` and `contractnet`.
-
-**Example:** `ExampleTeam`.
+Cursor found that flat self-coordination makes agents risk-averse at scale, which is why [PlannerWorker](planner-worker.md) exists. Team is still the right shape for a small pool of peers working through a queue.

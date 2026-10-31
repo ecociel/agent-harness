@@ -4,13 +4,14 @@ Every pattern in package `multi` is a `harness.Runner`. A pattern takes Runners 
 
 ```go
 type Runner interface {
-    Run(ctx context.Context, in harness.Input) (*harness.Result, error)
+    Run(ctx context.Context, in harness.Input) (*harness.Run, error)
 }
 ```
 
 What all patterns share:
 
-- **Results.** A pattern returns a `Result` like an agent: `Output`, `Stop`, `Detail` and the summed `Usage`, `Turns`, `ModelCalls` and `ToolCalls` of its children. A child that stops (budget, guardrail, …) stops the pattern with the same reason unless the pattern says otherwise.
+- **Results.** A pattern returns a `Run` like an agent: `Output`, `Stop` and `Detail`. `Spent()` adds what its children reported, because a pattern spends nothing itself.
+- **Durability.** A pattern is a composite run with its own journal. A child's ID comes from its position, and each decision comes from what a child recorded, so a resume walks the same tree and finished children answer from their journals. A function you give a pattern, like `Score`, `Seed`, `Next` or `Join`, must be pure, because it runs again after a crash. Set `Journal` on the outermost pattern, and everything below inherits it.
 - **Observability.** Each pattern emits `pattern` events (`start`, the steps of the pattern, `end`) and opens a `pattern <kind>` span. Children run with the pattern as their parent, so their events carry `Depth`/`ParentRun` and their spans nest.
 - **Hooks.** Patterns have no hooks of their own. Every agent inside keeps its own `Hooks`, so guardrails, approvals and budgets apply to every model and tool call in the tree. A shared `*budget.Budget` caps the whole tree; `budget.Child` gives a sub-tree its own slice.
 - **Text contracts.** Where a model's answer steers the pattern (`WINNER: n`, `TASK:`, `APPROVED`/`REVISE:`, a route label), the parsing is deliberately lenient and the fallback is safe: an unknown label goes to the fallback route, an unparsable verdict counts as not approved.

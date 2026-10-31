@@ -19,20 +19,20 @@ case agent.Wait:         // awaiting approval without a decision → finish as f
 // a Refusal error finishes the turn with EvFail and the refusal reason
 ```
 
-Because the next step is derived from the log, a turn survives process restarts at every step. agent-harness runs its machine in memory. The step vocabulary matches, but durability is the main gap (see below).
+Because the next step is derived from the log, a turn survives process restarts at every step. agent-harness works the same way: `Fold` computes the run from a journal, and a pure `next` picks the step.
 
 ## Mapping
 
 | corporate-admin | agent-harness |
 |---|---|
-| `agent.Next(limits, turn)` (pure function of the turn log) | the transition table plus the machine's step functions; `Result.Path` records the walk; the event stream (`WithEvents`) is the natural log to persist |
-| `CallModel` (+ compaction) | `compose` (`BeforeModel`: `hooks/compact`, profiles, budget pre-flight) → `model` (`WrapModel`, `OnDelta`, `AfterModel`) |
+| `agent.Next(limits, turn)` (pure function of the turn log) | `next` over `Fold(events)`; `harness.Transitions()` is the table, and `Run.Path` records the walk |
+| `CallModel` (+ compaction) | `compose` (`Context`: `hooks/compact`; `BeforeModel`: profiles, budget pre-flight) → `model` (`WrapModel`, `AfterModel`) |
 | `StartTool` | `tools`, per call |
-| `AskApproval` | `BeforeTool` → `hooks/approval` (`Approver` decides; `Record` audits) |
+| `AskApproval` | `BeforeTool` → `hooks/approval` (`Ask` opens a durable wait, `Approver` decides on the spot, `Record` audits) |
 | `RunTool` | the `WrapTool` chain around `tool.Registry.Call` |
-| `RecordResult` | the tool message appended in `tools`; `AfterTool`; `observe` (`AfterTurn`) |
-| `Finish` | `route` → `verify` (`CheckOutput`) → `done` |
-| `AskApproval` → `errAwaiting`, `Wait` | **gap**: approval blocks in-process (with a timeout). Parking a run needs a `suspended` state plus checkpoint/resume |
+| `RecordResult` | `tool.done` in the journal, after `AfterTool` |
+| `Finish` | `verify` (`CheckOutput`) → `closing` → `done` |
+| `AskApproval` → `errAwaiting`, `Wait` | `suspended`: the run parks with `Run.Waits`, and any process resumes it with a `Signal` |
 | `Refusal` | `harness.Stop(StopGuardrail \| StopPolicy, detail)` → `stopped` |
 | limits | `hooks/budget.Limits` (+ `Agent.MaxTurns`) |
 
@@ -49,5 +49,5 @@ Because the next step is derived from the log, a turn survives process restarts 
 
 1. Write an adapter `llm.Provider` → `model.Provider`, a thin type mapping because both stream `iter.Seq2`.
 2. Write an adapter for the tool registry: each corporate-admin `Spec` becomes a `tool.Tool`, with `Risk` mapped onto `tool.Risk`.
-3. Replace `run.loop` with `harness.Agent.Run` plus corporate-admin's own hooks: approval via the existing approval service as an `approval.Approver`, persistence through `AfterTurn`/`AfterRun`, tracing through a `trace.Exporter` that bridges to its telemetry.
-4. Add durability. Either persist the event stream and rebuild a `Run` from it (closest to today's design), or add a `suspended` terminal state with a resumable checkpoint (tessmir's `suspend` exit is the model for it). Today's `errAwaiting` approval flow needs one of the two.
+3. Replace `run.loop` with `harness.Agent.Run` plus corporate-admin's own hooks: approval through the existing approval service, tracing and metrics as sinks.
+4. Implement `harness.Journal` over the turn log, and run `journaltest.Run` against it before it holds a real turn. `journal/postgres` is a worked example. Project `Event.Wake` to find crashed turns.
