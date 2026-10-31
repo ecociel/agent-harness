@@ -751,9 +751,10 @@ func (m *machine) modelFailed(ctx context.Context, name string, err error, attem
 // crash anywhere leaves the state where it was for the next worker to run it again.
 func (m *machine) body(ctx context.Context) error {
 	r := &m.run
-	output, below, err := m.a.composite.Body(m.nest(ctx, *r),
+	var source string
+	output, below, err := m.a.composite.Body(context.WithValue(m.nest(ctx, *r), keySource, &source),
 		Input{RunID: r.ID, Messages: slices.Clone(r.Messages), Signals: slices.Clone(r.heard)})
-	ev := Event{Kind: KindBodyDone, Reply: &model.Response{Text: output}, Below: &below}
+	ev := Event{Kind: KindBodyDone, Reply: &model.Response{Text: output, Source: source}, Below: &below}
 	var parked *suspension
 	switch {
 	case err == nil:

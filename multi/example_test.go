@@ -2,6 +2,7 @@ package multi_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -11,25 +12,25 @@ import (
 	"github.com/ecociel/agent-harness/provider/fake"
 )
 
-// bot is a text-only agent whose fake model answers with reply(prompt).
-func bot(name string, reply func(prompt string) string) *harness.Agent {
+// answers is a text-only agent whose fake model answers with reply(prompt).
+func answers(name string, reply func(prompt string) string) *harness.Agent {
 	return &harness.Agent{Name: name, Provider: fake.NewFunc(func(req model.Request) (model.Response, error) {
 		return fake.Text(reply(model.LastUser(req.Messages))), nil
 	})}
 }
 
-func say(text string) func(string) string { return func(string) string { return text } }
+func always(text string) func(string) string { return func(string) string { return text } }
 
 func ExampleSequential() {
 	pipeline := &multi.Sequential{Name: "pipeline", Steps: []harness.Runner{
-		bot("planner", say("plan: add a greeting")),
-		bot("implementer", func(p string) string {
+		answers("planner", always("plan: add a greeting")),
+		answers("implementer", func(p string) string {
 			if strings.Contains(p, "plan: add a greeting") {
 				return "func hello() string { return \"hi\" }"
 			}
 			return "no plan"
 		}),
-		bot("verifier", func(p string) string {
+		answers("verifier", func(p string) string {
 			if strings.Contains(p, "func hello") {
 				return "verified: hello() returns hi"
 			}
@@ -43,9 +44,9 @@ func ExampleSequential() {
 
 func ExampleParallel() {
 	review := &multi.Parallel{Name: "review", Branches: []harness.Runner{
-		bot("security", say("no secrets found")),
-		bot("style", say("naming is consistent")),
-		bot("tests", say("coverage 82%")),
+		answers("security", always("no secrets found")),
+		answers("style", always("naming is consistent")),
+		answers("tests", always("coverage 82%")),
 	}}
 	res, _ := review.Run(context.Background(), harness.Prompt("review this diff"))
 	fmt.Println(res.Output)
@@ -62,8 +63,8 @@ func ExampleParallel() {
 
 func ExampleBestOfN() {
 	best := &multi.BestOfN{Name: "best-of-3",
-		Candidates: []harness.Runner{bot("a", say("2+2=5")), bot("b", say("2+2=4")), bot("c", say("four-ish"))},
-		Judge:      bot("judge", say("WINNER: 2 — the only exact answer")),
+		Candidates: []harness.Runner{answers("a", always("2+2=5")), answers("b", always("2+2=4")), answers("c", always("four-ish"))},
+		Judge:      answers("judge", always("WINNER: 2 — the only exact answer")),
 	}
 	res, _ := best.Run(context.Background(), harness.Prompt("what is 2+2?"))
 	fmt.Println(res.Output)
@@ -72,17 +73,17 @@ func ExampleBestOfN() {
 
 func ExampleRouter() {
 	router := &multi.Router{Name: "support",
-		Classifier: bot("classifier", func(p string) string {
+		Classifier: answers("classifier", func(p string) string {
 			if strings.Contains(p, "invoice") {
 				return "billing"
 			}
 			return "unsure"
 		}),
 		Routes: map[string]harness.Runner{
-			"billing":   bot("billing", say("Your invoice is attached.")),
-			"technical": bot("technical", say("Try restarting.")),
+			"billing":   answers("billing", always("Your invoice is attached.")),
+			"technical": answers("technical", always("Try restarting.")),
 		},
-		Fallback: bot("general", say("A human will get back to you.")),
+		Fallback: answers("general", always("A human will get back to you.")),
 	}
 	a, _ := router.Run(context.Background(), harness.Prompt("where is my invoice?"))
 	b, _ := router.Run(context.Background(), harness.Prompt("tell me a joke"))
@@ -94,7 +95,7 @@ func ExampleRouter() {
 }
 
 func ExampleSubagent() {
-	researcher := bot("researcher", say("Zurich has 4 public holidays in December."))
+	researcher := answers("researcher", always("Zurich has 4 public holidays in December."))
 	// The lead's model: first delegate, then answer from the tool result.
 	lead := &harness.Agent{Name: "lead"}
 	lead.Provider = fake.NewFunc(func(req model.Request) (model.Response, error) {
@@ -112,7 +113,7 @@ func ExampleSubagent() {
 
 func ExampleBackground() {
 	pool := multi.NewBackground(multi.Subagent{Name: "crawler", Description: "Crawl a site.",
-		Agent: bot("crawler", say("12 pages crawled"))})
+		Agent: answers("crawler", always("12 pages crawled"))})
 	step := 0
 	lead := &harness.Agent{Name: "lead", Tools: nil, Provider: fake.NewFunc(func(req model.Request) (model.Response, error) {
 		step++
@@ -120,7 +121,11 @@ func ExampleBackground() {
 		case 1:
 			return fake.Call("start_crawler", map[string]string{"task": "crawl ecociel.ch"}), nil
 		case 2:
-			return fake.Call("collect", map[string]any{"id": "job-1", "wait": true}), nil
+			var started struct {
+				Job string `json:"job"`
+			}
+			_ = json.Unmarshal([]byte(req.Messages[len(req.Messages)-1].Content), &started)
+			return fake.Call("collect", map[string]any{"id": started.Job, "wait": true}), nil
 		}
 		return fake.Text("crawler says: " + req.Messages[len(req.Messages)-1].Content), nil
 	})}
@@ -134,14 +139,14 @@ func ExampleBackground() {
 
 func ExamplePlannerWorker() {
 	round := 0
-	planner := bot("planner", func(p string) string {
+	planner := answers("planner", func(p string) string {
 		round++
 		if round == 1 {
 			return "TASK: write the parser\nTASK: write the tests"
 		}
 		return "DONE"
 	})
-	worker := bot("worker", func(p string) string {
+	worker := answers("worker", func(p string) string {
 		switch {
 		case strings.Contains(p, "write the parser"):
 			return "parser written; handles CSV"
@@ -150,7 +155,7 @@ func ExamplePlannerWorker() {
 		}
 		return "?"
 	})
-	judge := bot("judge", say("CONTINUE: check once more"))
+	judge := answers("judge", always("CONTINUE: check once more"))
 	pw := &multi.PlannerWorker{Name: "build", Planner: planner, Worker: worker, Judge: judge, MaxRounds: 3}
 	res, _ := pw.Run(context.Background(), harness.Prompt("build a CSV importer"))
 	fmt.Println(res.Output)
@@ -163,13 +168,13 @@ func ExamplePlannerWorker() {
 }
 
 func ExampleEvaluatorOptimizer() {
-	gen := bot("writer", func(p string) string {
+	gen := answers("writer", func(p string) string {
 		if strings.Contains(p, "Reviewer feedback") {
 			return "Grüezi! Welcome to écociel."
 		}
 		return "Hello."
 	})
-	critic := bot("critic", func(p string) string {
+	critic := answers("critic", func(p string) string {
 		if strings.Contains(p, "écociel") {
 			return "APPROVED"
 		}
@@ -188,12 +193,12 @@ func ExampleHandoff() {
 		Provider: fake.Script(fake.Text("Invoice 2026-114 was paid on 3 October."))}
 	h := &multi.Handoff{Name: "desk", Agents: []*harness.Agent{triage, billing}}
 	res, _ := h.Run(context.Background(), harness.Prompt("was my invoice paid?"))
-	fmt.Println(res.Agent+":", res.Output)
+	fmt.Println(h.Owner(res.Messages)+":", res.Output)
 	// Output: billing: Invoice 2026-114 was paid on 3 October.
 }
 
 func ExampleTeam() {
-	member := bot("member", func(p string) string {
+	member := answers("member", func(p string) string {
 		if strings.Contains(p, "Your task (#1)") {
 			return "inventory done\nNEW TASK: reorder low stock"
 		}
@@ -214,15 +219,15 @@ func ExampleTeam() {
 func ExampleDebate() {
 	d := &multi.Debate{Name: "debate",
 		Debaters: []harness.Runner{
-			bot("optimist", func(p string) string {
+			answers("optimist", func(p string) string {
 				if strings.Contains(p, "Other agents answered") {
 					return "17 — I was wrong, 9+8 is 17"
 				}
 				return "18"
 			}),
-			bot("skeptic", say("17")),
+			answers("skeptic", always("17")),
 		},
-		Judge: bot("judge", say("WINNER: 1 — corrected and explained")),
+		Judge: answers("judge", always("WINNER: 1 — corrected and explained")),
 	}
 	res, _ := d.Run(context.Background(), harness.Prompt("what is 9+8?"))
 	fmt.Println(res.Output)

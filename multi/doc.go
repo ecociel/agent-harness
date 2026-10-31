@@ -23,13 +23,17 @@
 //	EvaluatorOptimizer  ecociel/agents critic and verified; tessmir critic
 //	Router              ecociel/agents routing; tessmir routing
 //	Handoff             ecociel/agents handoff (control moves, cycle cap)
-//	Team (Blackboard)   Cursor's first coordination attempt (shared file,
-//	                    claims, optimistic concurrency); Dani Zhu "shared-state
-//	                    teams"; ecociel/agents blackboard
+//	Team (Blackboard)   Cursor's first coordination attempt (a shared list);
+//	                    Dani Zhu "shared-state teams"; ecociel/agents blackboard
 //	Debate              multi-agent debate: peers see each other's answers for
 //	                    a few rounds, then a judge decides
 //
-// Patterns report their own steps as harness.KindPattern events and open a
-// trace span when a tracer is on the context, so the diagnostic view shows
-// fan-outs, verdicts and handoffs alongside the inner state machines.
+// Every pattern is a composite run with its own journal. Its body keeps no state: a
+// child's ID comes from its position, and each decision comes from what a child
+// recorded, so a resume walks the same tree and finished children answer from their
+// journals. Functions a pattern takes, like Score or Seed, must be pure for the same
+// reason.
+//
+// Patterns report their own steps as harness.KindPattern events, so the diagnostic
+// view shows fan-outs, verdicts and handoffs alongside the inner state machines.
 package multi

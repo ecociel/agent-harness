@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,7 +66,7 @@ func (p *Parallel) Run(ctx context.Context, in harness.Input) (*harness.Run, err
 
 func (p *Parallel) body(s *scope) (string, harness.Spend, error) {
 	in := s.in
-	results, errs := fanOut(s, p.Branches, func(int) harness.Input { return in }, p.MaxConcurrent)
+	results, errs := fanOut(s, numbers("", len(p.Branches)), p.Branches, func(int) harness.Input { return in }, p.MaxConcurrent)
 	var failed []string
 	var waits []harness.Wait
 	for i, r := range results {
@@ -128,7 +127,7 @@ func (p *Parallel) body(s *scope) (string, harness.Spend, error) {
 // fanOut runs runners concurrently with per-index inputs, keeping results in
 // input order and isolating failures per branch. A slot holds a nil Run only if that
 // branch's worker stopped, and then the error is a stop.
-func fanOut(s *scope, runners []harness.Runner, input func(i int) harness.Input, limit int) ([]*harness.Run, []error) {
+func fanOut(s *scope, ids []string, runners []harness.Runner, input func(i int) harness.Input, limit int) ([]*harness.Run, []error) {
 	results := make([]*harness.Run, len(runners))
 	errs := make([]error, len(runners))
 	if limit <= 0 {
@@ -138,7 +137,7 @@ func fanOut(s *scope, runners []harness.Runner, input func(i int) harness.Input,
 	var wg sync.WaitGroup
 	for i, r := range runners {
 		in := input(i)
-		in.RunID = s.fork(strconv.Itoa(i))
+		in.RunID = s.fork(ids[i])
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

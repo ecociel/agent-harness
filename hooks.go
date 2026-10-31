@@ -170,6 +170,15 @@ func Note(ctx context.Context, format string, args ...any) {
 	}
 }
 
+// Attribute sets the provenance of a composite's answer, from inside its Body. The
+// answer joins the history with this as its Message.Source, so it survives into the
+// next run of a session.
+func Attribute(ctx context.Context, source string) {
+	if s, ok := ctx.Value(keySource).(*string); ok {
+		*s = source
+	}
+}
+
 // Edit replaces Messages[From:To] with With, stamping Source on each new message.
 // The zero Edit changes nothing. Inserting is From == To. The result must keep
 // every tool call paired with its result, or the run fails. Messages after the edit

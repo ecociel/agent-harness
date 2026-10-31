@@ -104,6 +104,7 @@ const (
 	keySignals
 	keyDrain
 	keyNote
+	keySource
 )
 
 // WithEvents returns a context whose runs report to sink, in addition to any

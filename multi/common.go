@@ -29,7 +29,8 @@ type pattern struct {
 	journal    harness.Journal
 	hooks      []harness.Hook
 	lease      time.Duration
-	parts      []part // pinned: a resume must find them unchanged
+	parts      []part // every child a run can have, which a cancel walks
+	roles      []part // what the shape pins, if not parts: a grid's rows repeat the same runners
 }
 
 // run advances the pattern.
@@ -55,8 +56,12 @@ func (p pattern) run(ctx context.Context, in harness.Input, body func(*scope) (s
 
 // shape names the parts by position, so that moving an agent changes it.
 func (p pattern) shape() string {
-	names := make([]string, len(p.parts))
-	for i, c := range p.parts {
+	roles := p.roles
+	if roles == nil {
+		roles = p.parts
+	}
+	names := make([]string, len(roles))
+	for i, c := range roles {
 		names[i] = c.id + ":" + harness.NameOf(c.runner)
 	}
 	return p.kind + ": " + strings.Join(names, ", ")
@@ -69,12 +74,19 @@ type scope struct {
 	in             harness.Input   // the pattern's input, from the journal
 	signals        []harness.Signal
 
-	mu    sync.Mutex // children may finish concurrently
-	below harness.Spend
+	mu      sync.Mutex // children may finish concurrently
+	below   harness.Spend
+	partial string // what a stopped child had written
 }
 
 // fork names a child by its position in the pattern.
 func (s *scope) fork(part string) string { return s.id + "/" + part }
+
+// at gives an input the run ID of the child at part.
+func (s *scope) at(part string, in harness.Input) harness.Input {
+	in.RunID = s.fork(part)
+	return in
+}
 
 // emit reports one step of the pattern. No redactor runs here, so text is a label.
 func (s *scope) emit(step, text string) {
@@ -100,6 +112,24 @@ func (s *scope) advance(r harness.Runner, in harness.Input) (*harness.Run, error
 	defer s.mu.Unlock()
 	s.below = s.below.Add(res.Spent())
 	return res, err
+}
+
+// need advances a child the pattern cannot go on without. A nil Run comes with the
+// error that must end the body: pass it to exit.
+func (s *scope) need(who string, r harness.Runner, in harness.Input) (*harness.Run, error) {
+	res, err := s.advance(r, in)
+	switch {
+	case res == nil:
+		return nil, err
+	case res.State == harness.StateSuspended:
+		return nil, harness.Suspend(res.Waits...)
+	case err != nil:
+		return nil, harness.Stop(harness.StopFailed, fmt.Sprintf("%s: %v", who, err))
+	case !res.OK():
+		s.partial = res.Output
+		return nil, harness.Stop(res.Stop, fmt.Sprintf("%s stopped: %s %s", who, res.Stop, res.Detail))
+	}
+	return res, nil
 }
 
 // deliver hands signals to a child. A child refuses a whole delivery if one signal is
@@ -144,6 +174,9 @@ func stopped(err error) error {
 // ok ends the body with an answer.
 func (s *scope) ok(output string) (string, harness.Spend, error) { return output, s.below, nil }
 
+// exit ends the body with what need returned.
+func (s *scope) exit(err error) (string, harness.Spend, error) { return s.partial, s.below, err }
+
 // halt stops the worker, not the pattern.
 func (s *scope) halt(err error) (string, harness.Spend, error) { return "", s.below, err }
 
@@ -183,6 +216,22 @@ func numbered(title string, outputs []string) string {
 		fmt.Fprintf(&b, "### %s %d\n%s\n\n", title, i+1, strings.TrimSpace(o))
 	}
 	return b.String()
+}
+
+func def(v, d int) int {
+	if v <= 0 {
+		return d
+	}
+	return v
+}
+
+// numbers returns prefix0, prefix1, and so on.
+func numbers(prefix string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = prefix + strconv.Itoa(i)
+	}
+	return out
 }
 
 // positional gives runners the IDs of their positions.

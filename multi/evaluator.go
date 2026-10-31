@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/ecociel/agent-harness"
 	"github.com/ecociel/agent-harness/model"
@@ -30,54 +31,64 @@ type EvaluatorOptimizer struct {
 	// MaxRounds caps evaluations (default 3).
 	MaxRounds int
 	// Approve parses the evaluator's answer; nil looks for "APPROVED" and
-	// otherwise uses the text after "REVISE:" as feedback.
+	// otherwise uses the text after "REVISE:" as feedback. It must be a pure function:
+	// it runs again after a crash.
 	Approve func(verdict string) (ok bool, feedback string)
+	// Journal makes the pattern durable. Nil inherits, like Agent.Journal.
+	Journal harness.Journal
+	// Hooks attach to the pattern's own run. A Redactor here covers every part.
+	Hooks []harness.Hook
+	// Lease is the same as Parallel.Lease.
+	Lease time.Duration
 }
 
 // RunnerName implements harness.Named.
 func (e *EvaluatorOptimizer) RunnerName() string { return e.Name }
 
 // Run implements harness.Runner.
-func (e *EvaluatorOptimizer) Run(ctx context.Context, in harness.Input) (*harness.Result, error) {
-	s := open(ctx, "evaluator_optimizer", e.Name)
+func (e *EvaluatorOptimizer) Run(ctx context.Context, in harness.Input) (*harness.Run, error) {
+	rounds := def(e.MaxRounds, 3)
+	var parts []part
+	for round := range rounds {
+		parts = append(parts, part{fmt.Sprintf("generate/%d", round), e.Generator}, part{fmt.Sprintf("evaluate/%d", round), e.Evaluator})
+	}
+	spec := pattern{kind: "evaluator_optimizer", name: e.Name, journal: e.Journal, hooks: e.Hooks, lease: e.Lease, parts: parts,
+		roles: []part{{"generate", e.Generator}, {"evaluate", e.Evaluator}}}
+	return spec.run(ctx, in, func(s *scope) (string, harness.Spend, error) { return e.body(s, rounds) })
+}
+
+func (e *EvaluatorOptimizer) body(s *scope, rounds int) (string, harness.Spend, error) {
+	in := s.in
 	approve := e.Approve
 	if approve == nil {
 		approve = defaultApprove
 	}
-	gen, err := s.run(e.Generator, in)
+	gen, err := s.need("generator", e.Generator, s.at("generate/0", in))
 	if err != nil {
-		return s.fail(in, err)
-	}
-	if !gen.OK() {
-		return s.stopped(in, "generator", gen)
+		return s.exit(err)
 	}
 	draft, msgs := gen.Output, gen.Messages
-	rounds := def(e.MaxRounds, 3)
 	for round := 1; ; round++ {
-		v, err := s.run(e.Evaluator, harness.Prompt(fmt.Sprintf("Request:\n%s\n\nDraft:\n%s\n\n"+
-			"Reply 'APPROVED' if the draft fully satisfies the request; otherwise 'REVISE: <specific feedback>'.", in.Text(), draft)))
+		v, err := s.need("evaluator", e.Evaluator, s.at(fmt.Sprintf("evaluate/%d", round-1), harness.Prompt(fmt.Sprintf("Request:\n%s\n\nDraft:\n%s\n\n"+
+			"Reply 'APPROVED' if the draft fully satisfies the request; otherwise 'REVISE: <specific feedback>'.", in.Text(), draft))))
 		if err != nil {
-			return s.fail(in, fmt.Errorf("evaluator: %w", err))
+			return s.exit(err)
 		}
 		ok, feedback := approve(v.Output)
-		s.emit("verdict", v.Output, map[string]any{"round": round, "approved": ok})
+		s.emit("verdict", fmt.Sprintf("round %d approved=%v", round, ok))
 		if ok {
-			return s.ok(in, draft)
+			return s.ok(draft)
 		}
 		if round >= rounds {
-			return s.done(in, draft, harness.StopMaxRepairs, "not approved after "+fmt.Sprint(rounds)+" rounds", nil)
+			return draft, s.below, harness.Stop(harness.StopMaxRepairs, fmt.Sprintf("not approved after %d rounds", rounds))
 		}
 		next := harness.Input{Messages: append(append([]model.Message(nil), msgs...),
 			model.User("Reviewer feedback: "+feedback+"\nRevise your answer."))}
-		gen, err = s.run(e.Generator, next)
-		if err != nil {
-			return s.fail(in, err)
-		}
-		if !gen.OK() {
-			return s.stopped(in, "generator", gen)
+		if gen, err = s.need("generator", e.Generator, s.at(fmt.Sprintf("generate/%d", round), next)); err != nil {
+			return s.exit(err)
 		}
 		if strings.TrimSpace(gen.Output) == strings.TrimSpace(draft) {
-			return s.done(in, draft, harness.StopLoop, "generator made no progress", nil)
+			return draft, s.below, harness.Stop(harness.StopLoop, "generator made no progress")
 		}
 		draft, msgs = gen.Output, gen.Messages
 	}

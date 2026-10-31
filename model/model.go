@@ -222,11 +222,13 @@ type Response struct {
 	Finish    FinishReason    `json:"finish"`
 	Usage     Usage           `json:"usage"`
 	Opaque    json.RawMessage `json:"opaque,omitempty"`
+	// Source is the reply's provenance when a pattern wrote it (see Message.Source).
+	Source string `json:"source,omitempty"`
 }
 
 // Message returns the assistant message that records r in the history.
 func (r Response) Message() Message {
-	return Message{Role: RoleAssistant, Content: r.Text, ToolCalls: r.ToolCalls, Opaque: r.Opaque}
+	return Message{Role: RoleAssistant, Content: r.Text, ToolCalls: r.ToolCalls, Opaque: r.Opaque, Source: r.Source}
 }
 
 // Collect drains a stream into a Response. onEvent, if non-nil, sees every
