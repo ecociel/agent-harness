@@ -91,11 +91,31 @@ func TestOutputMatchesGolden(t *testing.T) {
 	}
 }
 
-func TestEveryPointHasAnExample(t *testing.T) {
-	have := examples(t)
+func TestEveryHookHasAnExample(t *testing.T) {
+	var want []string
 	for _, p := range harness.Points() {
-		if dir := "points/" + strings.ToLower(string(p)); !slices.Contains(have, dir) {
+		want = append(want, "points/"+strings.ToLower(string(p)))
+	}
+	packages, err := os.ReadDir("../../hooks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range packages {
+		if p.IsDir() {
+			want = append(want, "builtin/"+p.Name())
+		}
+	}
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := examples(t)
+	for _, dir := range append(want, "tour") {
+		if !slices.Contains(have, dir) {
 			t.Errorf("no example at examples/hooks/%s", dir)
+		}
+		if !strings.Contains(string(readme), "("+dir+"/main.go)") {
+			t.Errorf("README.md does not link %s/main.go", dir)
 		}
 	}
 }

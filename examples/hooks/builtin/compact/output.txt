@@ -1,0 +1,21 @@
+Watch the history edit before the only model call: five messages become one summary.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> When does order 4711 ship?
+  run-1 started, agent support
+  hook compact Context: ok (5 of 7 messages summarised)
+  history edited by compact: messages [0:5] replaced with 1 new, source "compact"
+  model call: turn 1, no tools
+  model replied: Order 4711 ships on Tuesday.
+  output accepted
+  run ended: completed
+< Order 4711 ships on Tuesday.
+stop: completed
+path: start compose model verify closing done
+history went from 7 messages to 4
+| [Summary of the earlier conversation]
+| - user: Hi, I have a question about my order.
+| - assistant: Of course. What is the order number?
+| - user: It is order 4711, the blue kettle.
+| - assistant: Thanks, I found it. It left our warehouse this morning.
+| - user: Can it still go to my office instead?

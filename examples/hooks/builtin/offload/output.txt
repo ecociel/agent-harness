@@ -1,0 +1,21 @@
+Watch a result of 817 bytes come back as a handle, and the model read its tail.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Why did the last build fail?
+  run-1 started, agent ci
+  model call: turn 1, tools fetch_log read_offloaded
+  model asked for: fetch_log {}
+  tool fetch_log gate: allow
+  tool fetch_log returned: {"bytes":817,"hint":"call read_offloaded with this id and an offset to read more","offloaded":"e59c9...
+  model call: turn 2, tools fetch_log read_offloaded
+  model asked for: read_offloaded {"id":"e59c9801abf84ddfae4065f3","offset":784}
+  tool read_offloaded gate: allow
+  tool read_offloaded returned: step ok step ok error: disk full
+  model call: turn 3, tools fetch_log read_offloaded
+  model replied: The build failed because the disk is full.
+  output accepted
+  run ended: completed
+< The build failed because the disk is full.
+stop: completed
+path: start compose model gate tools compose model gate tools compose model verify closing done
+the history keeps 152 bytes of the result: {"bytes":817,"hint":"call read_offloaded with this id and an offset to read more","offloaded":"e59c9801abf84ddfae4065f3","preview":"step ok\nstep ok\n"}

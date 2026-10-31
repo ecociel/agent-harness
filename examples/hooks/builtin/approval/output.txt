@@ -1,0 +1,53 @@
+Watch an approver say yes and no, then a run suspend until a person answers.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Refund 50.
+  run-1 started, agent refunds
+  model call: turn 1, tools refund
+  model asked for: refund {"amount":50}
+[audit] allow refund, rule approved, reason ""
+  tool refund gate: allow
+  tool refund returned: refunded
+  model call: turn 2, tools refund
+  model replied: I refunded 50.
+  output accepted
+  run ended: completed
+< I refunded 50.
+stop: completed
+path: start compose model gate tools compose model verify closing done
+
+> Refund 5000.
+  run-2 started, agent refunds
+  model call: turn 1, tools refund
+  model asked for: refund {"amount":5000}
+[audit] deny refund, rule approval, reason "refunds over 100 need a person"
+  tool refund gate: deny by approval (refunds over 100 need a person)
+  model call: turn 2, tools refund
+  model replied: I could not refund 5000, that needs a person.
+  output accepted
+  run ended: completed
+< I could not refund 5000, that needs a person.
+stop: completed
+path: start compose model gate compose model verify closing done
+
+> Refund 5000.
+  run-3 started, agent refunds
+  model call: turn 1, tools refund
+  model asked for: refund {"amount":5000}
+  tool refund gate: await by approval, wait opened on approval (dangerous tool "refund" needs approval)
+stop: suspended
+path: start compose model gate suspended
+
+> resume run-3: "yes" from jan
+  worker claimed the run
+  wait resolved: approval, "yes" from jan
+[audit] allow refund, rule approved, reason "by jan"
+  tool refund gate: allow
+  tool refund returned: refunded
+  model call: turn 2, tools refund
+  model replied: I refunded 5000.
+  output accepted
+  run ended: completed
+< I refunded 5000.
+stop: completed
+path: start compose model gate suspended gate tools compose model verify closing done

@@ -1,0 +1,18 @@
+Watch one log line per event, and a WARN for the denied tool. There is no demo timeline here.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Delete user 42.
+level=INFO msg=run.started run=run-1 agent=ops turn=0 from=start to=compose
+level=INFO msg=hook run=run-1 agent=ops turn=0 hook=guard point=BeforeRun outcome=ok
+level=INFO msg=model.started run=run-1 agent=ops turn=0 from=compose to=model model=mock attempt=1
+level=INFO msg=model.done run=run-1 agent=ops turn=1 from=model to=gate model=mock attempt=1 finish=tool_calls tool_calls=1 input_tokens=24 output_tokens=10
+level=INFO msg=hook run=run-1 agent=ops turn=1 hook=guard point=BeforeTool outcome=deny
+level=WARN msg=tool.gated run=run-1 agent=ops turn=1 from=gate to=compose tool=delete_user hook=guard outcome=deny
+level=INFO msg=model.started run=run-1 agent=ops turn=1 from=compose to=model model=mock attempt=1
+level=INFO msg=model.done run=run-1 agent=ops turn=2 from=model to=verify model=mock attempt=1 finish=stop tool_calls=0 input_tokens=59 output_tokens=8
+level=INFO msg=hook run=run-1 agent=ops turn=2 hook=guard point=CheckOutput
+level=INFO msg=output.checked run=run-1 agent=ops turn=2 from=verify to=closing
+level=INFO msg=run.ended run=run-1 agent=ops turn=2 from=closing to=done outcome=completed
+< I am not allowed to delete users.
+stop: completed
+path: start compose model gate compose model verify closing done

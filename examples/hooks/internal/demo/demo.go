@@ -36,7 +36,7 @@ func Provider(mock model.Provider) (model.Provider, string) {
 
 // Context returns a context whose runs print the timeline.
 func Context() context.Context {
-	return harness.WithEvents(context.Background(), Timeline)
+	return harness.WithEvents(context.Background(), timeline)
 }
 
 var runs atomic.Int64
@@ -80,9 +80,9 @@ func FailFirst(p model.Provider, n int, class model.ErrorClass) model.Provider {
 	})
 }
 
-// Timeline is the sink behind Context: one line per event. It leaves out times,
-// durations and backoffs, so a mock run prints the same text every time.
-func Timeline(e harness.Event) {
+// timeline is the sink behind Context. It leaves out times, durations and backoffs, so
+// a mock run prints the same text every time.
+func timeline(e harness.Event) {
 	if line := describe(e); line != "" {
 		fmt.Println("  " + line)
 	}
@@ -159,9 +159,9 @@ func failure(e harness.Event) string {
 	case e.Recovery == nil || !e.Recovery.Retry:
 		return line + ", no retry"
 	case e.Recovery.Model != "":
-		return line + ", retry on " + e.Recovery.Model
+		return line + ", retry on " + e.Recovery.Model + waits(e)
 	}
-	return line + ", retry"
+	return line + ", retry" + waits(e)
 }
 
 func gate(e harness.Event) string {
@@ -169,11 +169,15 @@ func gate(e harness.Event) string {
 	if e.Hook != "" {
 		what += " by " + e.Hook
 	}
-	line := fmt.Sprintf("tool %s gate: %s", e.Tool, joined(what, e.Text))
+	return fmt.Sprintf("tool %s gate: %s", e.Tool, joined(what, e.Text)) + waits(e)
+}
+
+func waits(e harness.Event) string {
+	var out string
 	for _, w := range e.Waits {
-		line += ", waiting on " + joined(w.Kind, w.Detail)
+		out += ", wait opened on " + joined(w.Kind, w.Detail)
 	}
-	return line
+	return out
 }
 
 func verdict(e harness.Event) string {
@@ -186,12 +190,11 @@ func verdict(e harness.Event) string {
 	return "output accepted"
 }
 
-// hook keeps the invocations that add something. One that returned "ok" with no note
-// did nothing to see, and a plain gate or verdict repeats the recorded line that follows
-// it, which also names the hook.
+// hook keeps the invocations that add something. A gate or a verdict is left out because
+// the recorded line after it says the same and names the hook, and one that returned "ok"
+// with no note did nothing to see.
 func hook(e harness.Event) string {
-	decided := e.Point == harness.PointBeforeTool || e.Point == harness.PointCheckOutput
-	if e.Text == "" && (e.Outcome == "ok" || decided) {
+	if e.Point == harness.PointBeforeTool || e.Point == harness.PointCheckOutput || e.Outcome == "ok" && e.Text == "" {
 		return ""
 	}
 	return fmt.Sprintf("hook %s %s: %s", e.Hook, e.Point, joined(e.Outcome, e.Text))

@@ -1,0 +1,20 @@
+Watch the offered tools: the profile hid one, and added to the system message.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> In config.yaml, change the port from 8000 to 8080.
+  run-1 started, agent editor
+  hook profile BeforeModel: ok (profile "mock" for model "mock")
+[show] system message "You edit files.\n\nEdit files with str_replace.", max tokens 500
+  model call: turn 1, tools str_replace
+  model asked for: str_replace {"new":"8080","old":"8000"}
+  tool str_replace gate: allow
+  tool str_replace returned: edited
+  hook profile BeforeModel: ok (profile "mock" for model "mock")
+[show] system message "You edit files.\n\nEdit files with str_replace.", max tokens 500
+  model call: turn 2, tools str_replace
+  model replied: The port in config.yaml is now 8080.
+  output accepted
+  run ended: completed
+< The port in config.yaml is now 8080.
+stop: completed
+path: start compose model gate tools compose model verify closing done

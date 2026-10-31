@@ -1,0 +1,25 @@
+Watch the run, then the counters: the failed attempt is counted too.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> What is the weather in Zurich?
+  run-1 started, agent weather
+  model call: turn 1, tools weather
+  model failed: transient, attempt 1, retry
+  model call: turn 1, attempt 2, tools weather
+  model asked for: weather {"city":"Zurich"}
+  tool weather gate: allow
+  tool weather returned: {"temp_c":11}
+  model call: turn 2, tools weather
+  model replied: It is 11 °C in Zurich.
+  output accepted
+  run ended: completed
+< It is 11 °C in Zurich.
+stop: completed
+path: start compose model compose model gate tools compose model verify closing done
+
+agent_runs_total{agent=weather,stop=completed} 1
+model_calls_total{model=mock} 3
+model_errors_total{class=transient,model=mock} 1
+model_tokens_total{kind=input,model=mock} 85
+model_tokens_total{kind=output,model=mock} 16
+tool_calls_total{outcome=ok,tool=weather} 1

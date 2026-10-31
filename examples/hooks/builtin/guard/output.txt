@@ -1,0 +1,35 @@
+Watch three runs: the input is refused, a tool is denied, an answer is revised.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Log me in, my password: hunter2
+  run-1 started, agent ops
+  hook guard BeforeRun: stop (guardrail: input matches rule password)
+  run ended: guardrail (input matches rule password)
+stop: guardrail
+path: start compose closing stopped
+
+> Delete user 42.
+  run-2 started, agent ops
+  model call: turn 1, tools delete_user
+  model asked for: delete_user {"id":42}
+  tool delete_user gate: deny by guard (tool "delete_user" is denied by policy)
+  model call: turn 2, tools delete_user
+  model replied: I am not allowed to delete users.
+  output accepted
+  run ended: completed
+< I am not allowed to delete users.
+stop: completed
+path: start compose model gate compose model verify closing done
+
+> Where is the staging server?
+  run-3 started, agent ops
+  model call: turn 1, tools delete_user
+  model replied: The staging server is at 10.0.0.7.
+  output revise by guard: the answer contains content matching rule ip-address; remove it
+  model call: turn 2, tools delete_user
+  model replied: The staging server is on the internal network.
+  output accepted
+  run ended: completed
+< The staging server is on the internal network.
+stop: completed
+path: start compose model verify compose model verify closing done

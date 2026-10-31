@@ -1,0 +1,21 @@
+Watch the run, then its spans: one per run, model call and tool call.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> What is the weather in Zurich?
+  run-1 started, agent weather
+  model call: turn 1, tools weather
+  model asked for: weather {"city":"Zurich"}
+  tool weather gate: allow
+  tool weather returned: {"temp_c":11}
+  model call: turn 2, tools weather
+  model replied: It is 11 °C in Zurich.
+  output accepted
+  run ended: completed
+< It is 11 °C in Zurich.
+stop: completed
+path: start compose model gate tools compose model verify closing done
+
+span d62a647b425ab3fc "chat" status ok, parent: invoke_agent weather, operation chat
+span 1556d413db1c3004 "execute_tool weather" status ok, parent: invoke_agent weather, operation execute_tool
+span 044657eced3e8fae "chat" status ok, parent: invoke_agent weather, operation chat
+span 801c726fa1448fb5 "invoke_agent weather" status ok, parent: none, it is the root, operation invoke_agent

@@ -1,0 +1,18 @@
+Watch the run stop before a third model call.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Wait for the service to recover.
+  run-1 started, agent monitor
+  model call: turn 1, tools service_status
+  model asked for: service_status {}
+  tool service_status gate: allow
+  tool service_status returned: degraded
+  model call: turn 2, tools service_status
+  model asked for: service_status {}
+  tool service_status gate: allow
+  tool service_status returned: degraded
+  hook budget BeforeModel: stop (budget_exhausted: model call limit 2 reached)
+  run ended: budget_exhausted (model call limit 2 reached)
+stop: budget_exhausted
+path: start compose model gate tools compose model gate tools compose closing stopped
+spent: 2 model calls, 2 tool calls

@@ -23,6 +23,8 @@ One rule makes hooks safe across a crash: **a hook only ever returns a value.** 
 
 Retries belong in `Recover`, not `WrapModel`: an attempt inside middleware isn't journaled, so a crash forgets it.
 
+[examples/hooks](../examples/hooks/README.md) has a small runnable program for every point and every package below.
+
 ## Sinks
 
 Tracing, metrics and logging are not hooks. They are event sinks, attached once on the context, and every run in the tree reports to them:

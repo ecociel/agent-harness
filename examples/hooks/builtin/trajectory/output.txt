@@ -1,0 +1,24 @@
+Watch the run, then the same run read back as a trajectory.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Compare the weather in Zurich and Bern.
+  run-1 started, agent weather
+  model call: turn 1, tools weather
+  model asked for: weather {"city":"Zurich"}
+  tool weather gate: allow
+  tool weather returned: {"temp_c":11}
+  model call: turn 2, tools weather
+  model asked for: weather {"city":"Bern"}
+  tool weather gate: allow
+  tool weather returned: {"temp_c":11}
+  model call: turn 3, tools weather
+  model replied: Both are at 11 °C.
+  output accepted
+  run ended: completed
+< Both are at 11 °C.
+stop: completed
+path: start compose model gate tools compose model gate tools compose model verify closing done
+
+trajectory of run-1: 3 turns, 6 messages, stop completed
+turn 1: weather {"city":"Zurich"} -> {"temp_c":11} (ok)
+turn 2: weather {"city":"Bern"} -> {"temp_c":11} (ok)

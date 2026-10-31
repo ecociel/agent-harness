@@ -14,6 +14,7 @@ go get github.com/ecociel/agent-harness
 - [Hook points](#hook-points)
 - [Multi-agent patterns](#multi-agent-patterns)
 - [Try it: the web chat](#try-it-the-web-chat)
+- [Learn the hooks: one example each](#learn-the-hooks-one-example-each)
 - [Using it](#using-it)
 - [What has not been verified](#what-has-not-been-verified)
 - [Fit with corporate-admin](#fit-with-corporate-admin)
@@ -48,7 +49,8 @@ github.com/ecociel/agent-harness
 ├── provider/fake       deterministic scripted provider for tests and demos
 ├── provider/openai     OpenAI-compatible Chat Completions (streaming)
 ├── provider/anthropic  Anthropic Messages API (streaming, thinking replay)
-└── examples/webchat    web chat + live diagnostics (go run ./examples/webchat)
+├── examples/webchat    web chat + live diagnostics (go run ./examples/webchat)
+└── examples/hooks      one small program per hook (go run ./examples/hooks/tour)
 ```
 
 Dependencies only point inwards: `hooks/*`, `multi` and `provider/*` depend on the core, and the core depends on nothing but `model` and `tool`.
@@ -154,6 +156,16 @@ HARNESS_PROVIDER=anthropic ANTHROPIC_API_KEY=…  [ANTHROPIC_MODEL=claude-opus-5
 ```
 
 The journal is in memory, so a restart forgets the runs. Flags: `-addr localhost:8080`, `-v`.
+
+## Learn the hooks: one example each
+
+[examples/hooks](examples/hooks/README.md) holds one small program for each of the 12 plugin points and each package under `hooks/`. Each prints a timeline of its run. They use a mock model and need no API key, and the same environment variables as the web chat switch any of them to a real model.
+
+```sh
+go run ./examples/hooks/tour                    # one run through all 12 points
+go run ./examples/hooks/points/beforetool       # one point, in a hand-written hook
+go run ./examples/hooks/builtin/approval        # one package from hooks/
+```
 
 ## Using it
 
