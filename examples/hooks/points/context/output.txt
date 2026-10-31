@@ -1,0 +1,20 @@
+Watch the first turn edit the history and the second leave it alone.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> What is the weather where I live?
+  run-1 started, agent weather
+[memory] not in the history yet, insert it at the top
+  history edited by memory: messages [0:0] replaced with 1 new, source "memory"
+  model call: turn 1, tools weather
+  model asked for: weather {"city":"Zurich"}
+  tool weather gate: allow
+  tool weather returned: {"temp_c":11}
+[memory] already in the history, nothing to do
+  model call: turn 2, tools weather
+  model replied: It is 11 °C in Zurich.
+  output accepted
+  run ended: completed
+< It is 11 °C in Zurich.
+stop: completed
+path: start compose model gate tools compose model verify closing done
+the history starts with "From memory: I live in Zurich.", source "memory"

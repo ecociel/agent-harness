@@ -1,0 +1,19 @@
+Watch the ledger run around the tool, with the key the tool sees too.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Send acme their monthly invoice.
+  run-1 started, agent billing
+  model call: turn 1, tools send_invoice
+  model asked for: send_invoice {"customer":"acme"}
+  tool send_invoice gate: allow
+[ledger] before send_invoice, key e59c9801abf84ddfae4065f3
+[send_invoice] running with key e59c9801abf84ddfae4065f3
+[ledger] after send_invoice, the result is 4 bytes
+  tool send_invoice returned: sent
+  model call: turn 2, tools send_invoice
+  model replied: The invoice went to acme.
+  output accepted
+  run ended: completed
+< The invoice went to acme.
+stop: completed
+path: start compose model gate tools compose model verify closing done

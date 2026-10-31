@@ -1,0 +1,30 @@
+Watch the gate lines: one call runs, one is denied and the model adapts, one halts the run.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Read notes.txt, tell me what it says, then delete it.
+  run-1 started, agent files
+  model call: turn 1, tools read_file delete_file wipe_disk
+  model asked for: read_file {"path":"notes.txt"}
+  tool read_file gate: allow
+  tool read_file returned: buy milk
+  model call: turn 2, tools read_file delete_file wipe_disk
+  model asked for: delete_file {"path":"notes.txt"}
+[policy] deleting is not allowed, so tell the model
+  tool delete_file gate: deny by policy (this workspace is read-only)
+  model call: turn 3, tools read_file delete_file wipe_disk
+  model replied: notes.txt says to buy milk. I could not delete it, the workspace is read-only.
+  output accepted
+  run ended: completed
+< notes.txt says to buy milk. I could not delete it, the workspace is read-only.
+stop: completed
+path: start compose model gate tools compose model gate compose model verify closing done
+
+> Wipe the disk.
+  run-2 started, agent files
+  model call: turn 1, tools read_file delete_file wipe_disk
+  model asked for: wipe_disk {}
+[policy] wipe_disk is never acceptable, so end the run
+  tool wipe_disk gate: halt by policy (attempted to wipe the disk)
+  run ended: guardrail (attempted to wipe the disk)
+stop: guardrail
+path: start compose model gate closing stopped

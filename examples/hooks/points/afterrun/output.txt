@@ -1,0 +1,14 @@
+Watch the summary get saved just before the run ends.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> What is the capital of Switzerland?
+  run-1 started, agent geo
+  model call: turn 1, no tools
+  model replied: Bern.
+  output accepted
+[summaries] saved under run-1
+  run ended: completed
+< Bern.
+stop: completed
+path: start compose model verify closing done
+saved[run-1] = completed, model calls 1, answer "Bern."

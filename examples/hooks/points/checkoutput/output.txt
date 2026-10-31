@@ -1,0 +1,18 @@
+Watch the first answer come back for revision and the second get accepted.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> How much is the Basic plan?
+  run-1 started, agent sales
+  model call: turn 1, no tools
+  model replied: The plan costs 30.
+[currency] no currency in the answer, ask again
+  output revise by currency: State the price in CHF.
+  model call: turn 2, no tools
+  model replied: The plan costs 30 CHF.
+[currency] the answer names the currency
+  output accepted
+  run ended: completed
+< The plan costs 30 CHF.
+stop: completed
+path: start compose model verify compose model verify closing done
+repairs: 1

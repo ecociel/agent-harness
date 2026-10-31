@@ -1,0 +1,21 @@
+Watch the second run: it stops before its first model call.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> What is the capital of Switzerland?
+  acme/1 started, agent geo
+[admission] acme has quota 10, let the run in
+  model call: turn 1, no tools
+  model replied: Bern.
+  output accepted
+  run ended: completed
+< Bern.
+stop: completed
+path: start compose model verify closing done
+
+> What is the capital of Switzerland?
+  globex/1 started, agent geo
+[admission] globex has no quota left, so stop before spending anything
+  hook admission BeforeRun: stop (policy: globex is over quota)
+  run ended: policy (globex is over quota)
+stop: policy
+path: start compose closing stopped

@@ -1,0 +1,31 @@
+Watch the chunks: the first reply passes, the second is cut mid-sentence.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> When does the office open?
+  run-1 started, agent reception
+  model call: turn 1, no tools
+[watchword] chunk "The "
+[watchword] chunk "office "
+[watchword] chunk "opens "
+[watchword] chunk "at "
+[watchword] chunk "8."
+  model replied: The office opens at 8.
+  output accepted
+  run ended: completed
+< The office opens at 8.
+stop: completed
+path: start compose model verify closing done
+
+> What is the staff wifi password?
+  run-2 started, agent reception
+  model call: turn 1, no tools
+[watchword] chunk "The "
+[watchword] chunk "staff "
+[watchword] chunk "wifi "
+[watchword] chunk "password "
+[watchword] chunk "is "
+[watchword] this chunk holds the watchword, cut the stream here
+  model call stopped: guardrail (the reply leaks the password)
+  run ended: guardrail (the reply leaks the password)
+stop: guardrail
+path: start compose model closing stopped

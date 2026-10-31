@@ -1,0 +1,46 @@
+Follow the [Point] lines: one failed call, one tool call, one answer.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> What is the weather in Zurich?
+[Redact] first text of kind run.started
+  run-1 started, agent tour
+[BeforeRun] a worker took the run, admit it or Stop it
+[Redact] first text of kind hook
+[Context] the history has 1, a recorded Edit could change it
+[BeforeModel] may change this request, 2 messages with the system one
+[Redact] first text of kind model.started
+  model call: turn 1, tools weather
+[WrapModel] the stream passes through here
+[Redact] first text of kind model.failed
+[Recover] transient failure, retry it
+  model failed: transient, attempt 1, retry
+[Context] the history has 1, a recorded Edit could change it
+[BeforeModel] may change this request, 2 messages with the system one
+  model call: turn 1, attempt 2, tools weather
+[WrapModel] the stream passes through here
+[Redact] first text of kind model.done
+[AfterModel] may revise the reply before it is recorded
+  model asked for: weather {"city":"Zurich"}
+[BeforeTool] allow weather
+[Redact] first text of kind tool.gated
+  tool weather gate: allow
+[Redact] first text of kind tool.started
+[WrapTool] around weather
+[Redact] first text of kind tool.done
+[AfterTool] may revise the result of weather
+  tool weather returned: {"temp_c":11}
+[Context] the history has 3, a recorded Edit could change it
+[BeforeModel] may change this request, 4 messages with the system one
+  model call: turn 2, tools weather
+[WrapModel] the stream passes through here
+[AfterModel] may revise the reply before it is recorded
+  model replied: It is 11 °C in Zurich.
+[CheckOutput] accept the answer
+[Redact] first text of kind output.checked
+  output accepted
+[AfterRun] the outcome is completed
+[Redact] first text of kind run.ended
+  run ended: completed
+< It is 11 °C in Zurich.
+stop: completed
+path: start compose model compose model gate tools compose model verify closing done

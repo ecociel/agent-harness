@@ -1,0 +1,18 @@
+Watch the tool's real result, then the masked one that gets recorded.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Who is customer 42 and how do they pay?
+  run-1 started, agent crm
+  model call: turn 1, tools get_customer
+  model asked for: get_customer {"id":42}
+  tool get_customer gate: allow
+[mask-card] get_customer really returned: {"name":"Jan","card":"4111 1111 1111 1111"}
+  tool get_customer returned: {"name":"Jan","card":"**** **** **** 1111"}
+  model call: turn 2, tools get_customer
+  model replied: Customer 42 is Jan, paying with the card ending in 1111.
+  output accepted
+  run ended: completed
+< Customer 42 is Jan, paying with the card ending in 1111.
+stop: completed
+path: start compose model gate tools compose model verify closing done
+the history holds: {"name":"Jan","card":"**** **** **** 1111"}

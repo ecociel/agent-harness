@@ -1,0 +1,27 @@
+Watch [AHV] replace the number everywhere, then the count of raw copies in the journal.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> Find the customer with AHV number 756.1234.5678.97.
+[redact-ahv] first text of kind run.started
+  run-1 started, agent records
+[redact-ahv] first text of kind model.started
+  model call: turn 1, tools find_customer
+[redact-ahv] first text of kind model.done
+  model asked for: find_customer {"ahv":"[AHV]"}
+[redact-ahv] first text of kind tool.gated
+  tool find_customer gate: allow
+[redact-ahv] first text of kind tool.started
+[find_customer] got {"ahv":"[AHV]"}
+[redact-ahv] first text of kind tool.done
+  tool find_customer returned: {"name":"Jan","ahv":"[AHV]"}
+  model call: turn 2, tools find_customer
+  model replied: I found Jan, and the record matches [AHV].
+[redact-ahv] first text of kind output.checked
+  output accepted
+[redact-ahv] first text of kind run.ended
+  run ended: completed
+< I found Jan, and the record matches [AHV].
+stop: completed
+path: start compose model gate tools compose model verify closing done
+the model was sent: Find the customer with AHV number [AHV].
+journal: 10 events, 0 hold the raw number

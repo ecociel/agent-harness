@@ -1,0 +1,14 @@
+Watch the reply change before it is recorded.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> When does the next product ship?
+  run-1 started, agent press
+  model call: turn 1, no tools
+[codename] the model said: Project Bluebird ships in May.
+  model replied: our next product ships in May.
+  output accepted
+  run ended: completed
+< our next product ships in May.
+stop: completed
+path: start compose model verify closing done
+the history holds: our next product ships in May.

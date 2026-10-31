@@ -1,0 +1,14 @@
+Watch the passage reach the model and stay out of the run's history.
+model: mock (set HARNESS_PROVIDER for a real one)
+
+> How long do I have to ask for a refund?
+  run-1 started, agent support
+[retrieval] add to this request only: Policy excerpt: refunds are possible within 30 days.
+  model call: turn 1, no tools
+  model replied: Within 30 days.
+  output accepted
+  run ended: completed
+< Within 30 days.
+stop: completed
+path: start compose model verify closing done
+history has 2 messages, passage recorded: false
