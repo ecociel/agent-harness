@@ -1,19 +1,25 @@
 // Package openai is a model.Provider for any OpenAI-compatible
 // /chat/completions endpoint, with streaming and tool calls.
+//
+// The endpoint is stateless and returns nothing that must go back on the next call, so
+// this adapter never fills Opaque and ignores what another provider left there.
 package openai
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ecociel/agent-harness/model"
+	"github.com/ecociel/agent-harness/provider/internal/httperr"
 	"github.com/ecociel/agent-harness/provider/internal/sse"
 )
 
@@ -96,9 +102,58 @@ type wireChunk struct {
 			ReasoningTokens int `json:"reasoning_tokens"`
 		} `json:"completion_tokens_details"`
 	} `json:"usage"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
+	Error json.RawMessage `json:"error"`
+}
+
+// apiError is what compatible servers agree on. Code is a string on OpenAI and a number
+// on some others, and a few send error as a bare string, which decodes to nothing here
+// and leaves the status to decide.
+type apiError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    any    `json:"code"`
+}
+
+func (e apiError) kind() string {
+	if s, ok := e.Code.(string); ok && s != "" {
+		return s
+	}
+	return e.Type
+}
+
+// classify reads the error code. A 429 for an empty account is not a rate limit:
+// waiting cannot help, and a person has to fix it.
+func classify(status int, e apiError) model.ErrorClass {
+	switch e.kind() {
+	case "context_length_exceeded", "string_above_max_length":
+		return model.ClassContextLength
+	case "insufficient_quota", "billing_hard_limit_reached", "invalid_api_key":
+		return model.ClassAuth
+	case "rate_limit_exceeded":
+		return model.ClassRateLimit
+	case "server_error":
+		return model.ClassTransient
+	}
+	if strings.Contains(strings.ToLower(e.Message), "maximum context length") {
+		return model.ClassContextLength
+	}
+	if status == 0 && e.Type == "invalid_request_error" {
+		return model.ClassInvalid
+	}
+	return httperr.Class(status)
+}
+
+// finishReason keeps the reasons the harness knows. Compatible servers send others, and
+// an empty reason lets Collect work it out from the reply.
+func finishReason(s string) model.FinishReason {
+	switch r := model.FinishReason(s); r {
+	case model.FinishStop, model.FinishLength, model.FinishToolCalls, model.FinishContentFilter, model.FinishRefusal:
+		return r
+	}
+	if s == "function_call" {
+		return model.FinishToolCalls
+	}
+	return ""
 }
 
 func encode(req model.Request, def string) wireRequest {
@@ -128,44 +183,58 @@ func encode(req model.Request, def string) wireRequest {
 	return w
 }
 
+// send makes one call and returns a 2xx response, or a classified error.
+func (p *Provider) send(ctx context.Context, req model.Request) (*http.Response, error) {
+	body, err := json.Marshal(encode(req, p.Model))
+	if err != nil {
+		return nil, &model.Error{Class: model.ClassInvalid, Err: err}
+	}
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(p.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, &model.Error{Class: model.ClassInvalid, Err: err}
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Accept", "text/event-stream")
+	if p.APIKey != "" {
+		hreq.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	for k, v := range p.Headers {
+		hreq.Header.Set(k, v)
+	}
+	client := p.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(hreq)
+	if err != nil {
+		return nil, &model.Error{Class: model.ClassTransient, Err: err}
+	}
+	if resp.StatusCode/100 == 2 {
+		return resp, nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	var e struct {
+		Error apiError `json:"error"`
+	}
+	_ = json.Unmarshal(msg, &e) // a body that is not JSON leaves the status to decide
+	return nil, &model.Error{Class: classify(resp.StatusCode, e.Error),
+		RetryAfter: httperr.RetryAfter(resp.Header, time.Now()),
+		Err:        &StatusError{Code: resp.StatusCode, Body: string(msg)}}
+}
+
 // Complete implements model.Provider.
 func (p *Provider) Complete(ctx context.Context, req model.Request) iter.Seq2[model.Event, error] {
 	return func(yield func(model.Event, error) bool) {
-		body, err := json.Marshal(encode(req, p.Model))
-		if err != nil {
-			yield(nil, err)
-			return
-		}
-		hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(p.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
-		if err != nil {
-			yield(nil, err)
-			return
-		}
-		hreq.Header.Set("Content-Type", "application/json")
-		hreq.Header.Set("Accept", "text/event-stream")
-		if p.APIKey != "" {
-			hreq.Header.Set("Authorization", "Bearer "+p.APIKey)
-		}
-		for k, v := range p.Headers {
-			hreq.Header.Set(k, v)
-		}
-		client := p.Client
-		if client == nil {
-			client = http.DefaultClient
-		}
-		resp, err := client.Do(hreq)
+		resp, err := p.send(ctx, req)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode/100 != 2 {
-			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			yield(nil, &StatusError{Code: resp.StatusCode, Body: string(msg)})
-			return
-		}
 		var (
 			finish  model.Finish
+			ended   bool
 			stopped bool
 			ierr    error
 		)
@@ -175,11 +244,13 @@ func (p *Provider) Complete(ctx context.Context, req model.Request) iter.Seq2[mo
 			}
 			var ch wireChunk
 			if err := json.Unmarshal([]byte(ev.Data), &ch); err != nil {
-				ierr = fmt.Errorf("openai: bad chunk: %w", err)
+				ierr = &model.Error{Class: model.ClassTransient, Err: fmt.Errorf("openai: bad chunk: %w", err)}
 				return false
 			}
-			if ch.Error != nil {
-				ierr = fmt.Errorf("openai: %s", ch.Error.Message)
+			if len(ch.Error) > 0 && string(ch.Error) != "null" {
+				e := apiError{Message: string(ch.Error)}
+				_ = json.Unmarshal(ch.Error, &e)
+				ierr = &model.Error{Class: classify(0, e), Err: fmt.Errorf("openai: %s", e.Message)}
 				return false
 			}
 			if ch.Usage != nil {
@@ -202,7 +273,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request) iter.Seq2[mo
 					}
 				}
 				if c.FinishReason != "" {
-					finish.Reason = model.FinishReason(c.FinishReason)
+					finish.Reason, ended = finishReason(c.FinishReason), true
 				}
 			}
 			return true
@@ -210,11 +281,19 @@ func (p *Provider) Complete(ctx context.Context, req model.Request) iter.Seq2[mo
 		if stopped {
 			return
 		}
-		if err == nil {
+		switch {
+		case err != nil:
+			err = &model.Error{Class: model.ClassTransient, Err: err}
+		case ierr != nil:
 			err = ierr
+		case !ended:
+			err = &model.Error{Class: model.ClassTransient, Err: errors.New("openai: stream ended before the reply did")}
 		}
 		if err != nil {
-			yield(nil, err)
+			var e *model.Error
+			errors.As(err, &e)
+			e.Usage = finish.Usage // billed, whatever became of the reply
+			yield(nil, e)
 			return
 		}
 		yield(finish, nil)

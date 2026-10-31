@@ -109,6 +109,8 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 10. **A composite run spends nothing.** It writes no `model.*` or `tool.*` event, and `Fold` gives it no spend, so a sum over a tree's runs needs no exceptions. What its children spent reaches its caller through `Run.Spent`, as a report on `body.done`.
 11. **Cancel has two paths, because a worker and its absence need different things.** A running branch reads its ancestors after recording each intent, so it needs no child ID. A parked or crashed branch has no worker to read anything, so its parent ends it through the child's own `Runner`, the way a signal travels.
 12. **The ancestor check has an optional fast path.** Loading a parent's journal on every step makes each child step cost the parent's whole history. A `Journal` may also implement `LineageReader`, one projected row per run. It stays optional so that `Journal` stays two methods, and a store without it is slower, not wrong. A cache was rejected, because it would let a child pay after a cancel it could have seen.
+13. **An assistant message goes back in the order it was produced, built from the history.** Current Anthropic models think by default, and a signature covers everything before its block. `Opaque` keeps the thinking blocks and the shape of the reply, not its text. So a replay can't undo a hook or a redactor, and a message that no longer fits its shape goes back without thinking. Thinking text in `Opaque` is redacted like any text, as decided: a redactor that changes it invalidates the signature, and the recovery below handles that.
+14. **A refused signature costs one more request, not the run.** A history edit such as compaction invalidates later signatures, and the same body fails forever. The Anthropic adapter sends that call again with all thinking stripped, which needs no beta header and works on every platform. It's a recovery, not a steady state: the model loses that reasoning, and each later turn pays one refused request.
 
 ### State machine
 
@@ -240,6 +242,7 @@ Review found two defects that no test or mutant had caught. A cancel that fenced
 Measured on real PostgreSQL 17.6 through `journal/postgres`, at the end of unit 3:
 
 - `go test -race -count=3 ./...` exits 0. With `-v`, all 8 tests and all 14 conformance checks ran, and none skipped. The checks include crash sweeps through one agent and through `Parallel`, two workers racing one run, concurrent writers racing every position, and a cancel reaching a running child and a parked branch. These sweeps are a smaller set than the 764 cases above.
+- Both adapters ran through the machine against a scripted server: rate limits, `Retry-After`, long waits that park, cut streams, auth failures, full contexts, drains and redaction. The Anthropic adapter's history was a byte-identical prefix from request to request across a crash, the check the API docs give. Of 37 mutants in unit 4, 36 were caught and one changes no behaviour.
 - `journaltest` refuses all 11 deliberately broken journals, each at the check named for its bug, and all 6 wrong `Lineage` projections.
 - One ancestor read, averaged over 50, on a run of 2 KB events: `Load` takes 0.9 ms at 100 events, 6.2 ms at 1,000 and 54.7 ms at 10,000. `Lineage` takes 0.24 to 0.29 ms at all three.
 
@@ -250,7 +253,7 @@ Reported by the spike in `.audit/durable-core/spike-report.md`, and not rerun:
 - Nine defects were found, six of them on the untouched base. The worst left a child suspended forever. All nine are fixed and have tests.
 - `go test -race -count=10` failed 6 times in 10 on its first run, which is how the mutual fence below was found. A single pass would have missed it.
 
-**Not verified.** No real process kill, and no real provider through the ring. The crash sweeps kill the journal, not the process, and the cancel tests run their workers in one process. A cancel recorded after a worker's check and before its provider call starts is not tested as an interleaving: by reading the code, it is the same as a call already in flight, which counts as lost. Seven of eleven patterns and eight of eleven hooks are not ported, and `Handoff` and `Team` are expected to be the hard ones (a guess).
+**Not verified.** No real process kill, and no call to a real provider. The adapters run through the ring against a scripted HTTP server that follows the published API. The crash sweeps kill the journal, not the process, and the cancel tests run their workers in one process. A cancel recorded after a worker's check and before its provider call starts is not tested as an interleaving: by reading the code, it is the same as a call already in flight, which counts as lost. Seven of eleven patterns and eight of eleven hooks are not ported, and `Handoff` and `Team` are expected to be the hard ones (a guess).
 
 ## Synthesis decision
 
@@ -286,6 +289,10 @@ Each of these was left on purpose.
 - **`Run.Spent` is a report.** A composite's is what its body last said, and a run ended from outside reports nothing further. An agent's leaves out children its tools started. For a tree, sum the runs.
 - **A sweep can land between two steps of a `Sequential`.** Nothing is working in that instant, so a root past its `Lease` is due and the tree is taken over. By reading the code, that is the zombie case, and it repeats nothing.
 - **Ancestors are read through the parent's journal.** A child with its own `Journal` still sees its parent. A grandparent in a third journal is out of its sight. By reading the code.
+- **No adapter has met a real API.** The wire shapes come from the published docs, and `TestLiveToolLoop` is there to check them. The strings `prompt is too long` and `exceed context limit` come from memory, not the docs. If they're wrong, a full context reads as `invalid`, so the run fails instead of compacting. A `413` is classified without them.
+- **Compaction needs a plan in unit 5.** Keep-tail compaction leaves retained turns with stale signatures, so every later Anthropic call pays one refused request until those turns are gone. The docs recommend summarising everything, or stripping the retained turns' thinking. A per-turn reminder that a `Context` hook adds and later removes breaks the same check.
+- **A retry after a cut stream repeats text to sinks.** Deltas already streamed stay streamed, so a live UI shows the partial reply and then the whole one. By reading the code.
+- **The Anthropic adapter stays on API version `2023-06-01`, with a default `max_tokens` of 4096.** Thinking counts against that limit, so set `MaxTokens` on current models. Version `2026-10-21` refuses `temperature` on every model, so moving to it is a separate change.
 - **A wrapper can hide the fast path.** A journal wrapped for tracing or fault injection has no `Lineage` unless the wrapper forwards it. Runs then fall back to `Load`, which is correct and slower. Nothing reports the fallback.
 
 ## Tradeoffs accepted
@@ -297,6 +304,7 @@ Each of these was left on purpose.
 - We accept no lease in the core. A sweep that fires early costs a needless unknown-outcome wait, never a repeated effect.
 - We accept that a nested run reads each ancestor once per model call and tool start, in exchange for a cancel that needs no child ID. Measured on a two-branch `Parallel` with one tool each and a plain `Journal`: 24 appends, 9 loads, 6 of them for this check. With `LineageReader` those 6 become one-row reads. Depth still multiplies them, and a root reads nothing extra.
 - We accept that a root's `Wake` is a floor and not a sign of life. A tree is due at the latest of its root's `Wake` and the `Wake` of whatever below it is working. A pattern only waits, so its `Lease` says how soon to look and need not outlast its slowest branch. A nested pattern has no `Wake`, so its lease can't hide a crash below it.
+- We accept that thinking text is stored in the journal, redacted, in exchange for replaying it after a crash. With the default `display: "omitted"` that text is empty and only the signature is kept.
 - We accept a flat `Event` struct, in exchange for one vocabulary and no decode registry.
 
 ## Settled questions
@@ -314,7 +322,7 @@ Each unit lands on its own and ends in a check. Unit 2 ran first, because the su
 | 1 | Done. Journal conformance suite, plus a real Postgres journal in a separate module | Crash sweeps pass against a real database, and the sweep query runs as SQL |
 | 2 | Done. Land root, `model`, `tool` from the sketch | The sketch's crash sweeps and tests pass here |
 | 3 | Done. First-class composite runs, a `Lease` on patterns, tree cancel | No pattern writes a `model.*` event, and a cancelled branch pays for no further call |
-| 4 | Provider adapters: error classes, `Opaque` | Real providers pass the redaction and retry tests |
+| 4 | Done. Provider adapters: error classes, `Opaque`, cut streams | Both adapters pass the redaction and retry tests through the machine, against a scripted server. `TestLiveToolLoop` checks a real API and has not been run |
 | 5 | Port 8 hooks | Each uses only exported API, proven from an external test package |
 | 6 | Port 7 patterns, `Handoff` and `Team` last | A crash sweep through each pattern |
 | 7 | Web chat, README, docs | `docs/state-machine.md` is generated from the table or checked against it |

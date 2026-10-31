@@ -407,6 +407,9 @@ func (m *machine) scrub(ctx context.Context, ev *Event) error {
 				failed = errors.New("harness: redaction left invalid tool arguments")
 			}
 		}
+		if len(ev.Reply.Opaque) > 0 && !json.Valid(ev.Reply.Opaque) {
+			failed = errors.New("harness: redaction left invalid provider state")
+		}
 	}
 	if failed != nil {
 		m.sealed.Store(true)
