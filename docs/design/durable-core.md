@@ -247,6 +247,7 @@ Measured on real PostgreSQL 17.6 through `journal/postgres`, at the end of unit 
 - `go test -race -count=3 ./...` exits 0. With `-v`, all 8 tests and all 14 conformance checks ran, and none skipped. The checks include crash sweeps through one agent and through `Parallel`, two workers racing one run, concurrent writers racing every position, and a cancel reaching a running child and a parked branch. These sweeps are a smaller set than the 764 cases above.
 - Both adapters ran through the machine against a scripted server: rate limits, `Retry-After`, long waits that park, cut streams, auth failures, full contexts, drains and redaction. The Anthropic adapter's history was a byte-identical prefix from request to request across a crash, the check the API docs give. Of 37 mutants in unit 4, 36 were caught and one changes no behaviour.
 - `journaltest` refuses all 11 deliberately broken journals, each at the check named for its bug, and all 6 wrong `Lineage` projections.
+- `TestKillTheWorkerAtRandomPoints` SIGKILLs a real worker process at random points, restarts it from the run ID alone and audits a five-run tree against the outside world, in the same database. Over 800 rounds: 1,068 kills, 922 of them mid-run, 128 runs reached an unknown outcome, 333 model calls were lost. No once-only tool repeated, the billing bound held, and every output matched the uncrashed run. It fails if a once-only tool is repeated or a lost call goes uncounted. CI runs 40 rounds.
 - One ancestor read, averaged over 50, on a run of 2 KB events: `Load` takes 0.9 ms at 100 events, 6.2 ms at 1,000 and 54.7 ms at 10,000. `Lineage` takes 0.24 to 0.29 ms at all three.
 
 Measured on real PostgreSQL at unit 1, and not rerun: all 7 mutants of the Postgres journal itself are caught.
@@ -256,7 +257,7 @@ Reported by the spike in `.audit/durable-core/spike-report.md`, and not rerun:
 - Nine defects were found, six of them on the untouched base. The worst left a child suspended forever. All nine are fixed and have tests.
 - `go test -race -count=10` failed 6 times in 10 on its first run, which is how the mutual fence below was found. A single pass would have missed it.
 
-**Not verified.** No real process kill, and no call to a real provider. The adapters run through the ring against a scripted HTTP server that follows the published API. The crash sweeps kill the journal, not the process, and the cancel tests run their workers in one process. A cancel recorded after a worker's check and before its provider call starts is not tested as an interleaving: by reading the code, it is the same as a call already in flight, which counts as lost. Seven of eleven patterns and eight of eleven hooks are not ported, and `Handoff` and `Team` are expected to be the hard ones (a guess).
+**Not verified.** No call to a real provider: the adapters run through the ring against a scripted HTTP server that follows the published API, and `TestLiveToolLoop` has not been run. Two live workers are covered by racing writers in the conformance suite, not by killing processes: the kill test runs one worker at a time. A cancel recorded after a worker's check and before its provider call starts is not tested as an interleaving: by reading the code, it is the same as a call already in flight, which counts as lost.
 
 ## Synthesis decision
 
@@ -333,4 +334,4 @@ Each unit lands on its own and ends in a check. Unit 2 ran first, because the su
 | 5 | Done. Port 8 hooks: `metrics` and `logging` as sinks, a fallback as a provider | Each uses only exported API, proven from an external test package |
 | 6 | Done. Port 7 patterns, `Handoff` and `Team` last | A crash sweep through each pattern: 1,168 cases over the seven |
 | 7 | Web chat, README, docs | `docs/state-machine.md` is generated from the table or checked against it |
-| 8 | Real process kill test | `SIGKILL` at random points on the real journal, no once-only tool repeats |
+| 8 | Done. Real process kill test | `SIGKILL` at random points on the real journal, no once-only tool repeats |
