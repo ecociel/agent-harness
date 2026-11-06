@@ -71,6 +71,7 @@ type Event struct {
 
 	Pin      *Pin              `json:"pin,omitempty"`      // run.started
 	Messages []model.Message   `json:"messages,omitempty"` // run.started
+	Pinned   []model.Message   `json:"pinned,omitempty"`   // run.started
 	Meta     map[string]string `json:"meta,omitempty"`     // run.started
 	Drift    *Drift            `json:"drift,omitempty"`    // run.claimed
 	Edit     *Edit             `json:"edit,omitempty"`     // history.edited
@@ -222,6 +223,7 @@ func (e Event) IsCancel() bool { return e.Kind == KindRunStopping && e.Stop == S
 func (e *Event) redact(visit func(*string)) {
 	visit(&e.Text)
 	e.Messages = redactMessages(e.Messages, visit)
+	e.Pinned = redactMessages(e.Pinned, visit)
 	if e.Meta != nil {
 		meta := make(map[string]string, len(e.Meta))
 		for k, v := range e.Meta {

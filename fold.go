@@ -139,6 +139,9 @@ type Run struct {
 	// closes. So every tool call here has a result at each model call and at the
 	// end of the run, and a finished run's Messages can start the next run.
 	Messages []model.Message `json:"messages"`
+	// Pinned is Input.Pinned as recorded at start. It is in every request and never
+	// in Messages.
+	Pinned []model.Message `json:"pinned,omitempty"`
 	// Meta is Input.Meta as recorded at start.
 	Meta    map[string]string `json:"meta,omitempty"`
 	Usage   model.Usage       `json:"usage"`
@@ -226,6 +229,7 @@ func (r *Run) apply(ev Event) error {
 		r.ID, r.RootRun, r.ParentRun, r.Agent, r.Depth = ev.RunID, ev.RootRun, ev.ParentRun, ev.Agent, ev.Depth
 		r.Pin, r.Started = *ev.Pin, ev.Time
 		r.Messages = slices.Clone(ev.Messages)
+		r.Pinned = slices.Clone(ev.Pinned)
 		r.Meta = maps.Clone(ev.Meta)
 		r.State = StateCompose
 		if r.composite() {

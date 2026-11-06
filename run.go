@@ -115,7 +115,7 @@ func (m *machine) start(ctx context.Context, id string, in Input) error {
 		return fmt.Errorf("harness: Meta of %s has %d keys, at most %d", id, len(meta), MaxMeta)
 	}
 	return m.record(ctx, Event{Kind: KindRunStarted, RunID: id, RootRun: root, ParentRun: ParentRun(ctx),
-		Agent: m.a.Name, Depth: Depth(ctx), Pin: m.a.pin(), Messages: in.Messages, Meta: meta})
+		Agent: m.a.Name, Depth: Depth(ctx), Pin: m.a.pin(), Messages: in.Messages, Pinned: in.Pinned, Meta: meta})
 }
 
 func (a *Agent) pin() *Pin {
@@ -547,6 +547,7 @@ func (m *machine) ringTool() ToolFunc {
 func (m *machine) view() Run {
 	v := m.run
 	v.Messages = slices.Clone(v.Messages)
+	v.Pinned = slices.Clone(v.Pinned)
 	v.Meta = maps.Clone(v.Meta)
 	v.Waits = slices.Clone(v.Waits)
 	v.batch = slices.Clone(v.batch)
@@ -639,10 +640,11 @@ func balanced(msgs []model.Message) bool {
 // request is pure over the fold and the live tool specs.
 func (m *machine) request() model.Request {
 	r := &m.run
-	msgs := make([]model.Message, 0, len(r.Messages)+1)
+	msgs := make([]model.Message, 0, len(r.Messages)+len(r.Pinned)+1)
 	if r.Pin.Instructions != "" {
 		msgs = append(msgs, model.System(r.Pin.Instructions))
 	}
+	msgs = append(msgs, r.Pinned...)
 	msgs = append(msgs, r.Messages...)
 	var specs []model.ToolSpec
 	for _, s := range m.a.Tools.Specs() {

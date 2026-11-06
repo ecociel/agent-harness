@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
+	"sync"
 	"testing"
 
 	"github.com/ecociel/agent-harness"
+	"github.com/ecociel/agent-harness/model"
 	"github.com/ecociel/agent-harness/tool"
 )
 
@@ -106,5 +109,80 @@ func TestMetaOverThirtyTwoKeysStartsNothing(t *testing.T) {
 	}
 	if evs := mustLoad(t, j, "big"); len(evs) != 0 {
 		t.Fatalf("a refused start wrote %d events", len(evs))
+	}
+}
+
+// requests records what the model was sent, as role:content lines per call.
+type requests struct {
+	mu    sync.Mutex
+	calls [][]string
+}
+
+func (rq *requests) wrap(p model.Provider) model.Provider {
+	return model.ProviderFunc(func(ctx context.Context, req model.Request) iter.Seq2[model.Event, error] {
+		var lines []string
+		for _, m := range req.Messages {
+			if m.Content != "" {
+				lines = append(lines, string(m.Role)+":"+m.Content)
+			}
+		}
+		rq.mu.Lock()
+		rq.calls = append(rq.calls, lines)
+		rq.mu.Unlock()
+		return p.Complete(ctx, req)
+	})
+}
+
+func TestPinnedContextIsInEveryRequestAndAResumeCannotChangeIt(t *testing.T) {
+	ctx := context.Background()
+	j := newJSONJournal()
+	w := newWorld()
+	rq := &requests{}
+	a := approvalAgent(w, j, 0)
+	a.Instructions = "be brief"
+	a.Provider = rq.wrap(a.Provider)
+	in := harness.Prompt("send it")
+	in.RunID = "pinned"
+	in.Pinned = []model.Message{model.User("memory: prefers email")}
+	res, err := a.Run(ctx, in)
+	if err != nil || res.State != harness.StateSuspended {
+		t.Fatalf("%v %+v", err, res)
+	}
+	resume := harness.Resume("pinned", harness.Signal{Wait: res.Waits[0].ID, Value: "yes"})
+	resume.Pinned = []model.Message{model.User("memory: something else")}
+	if res, err = a.Run(ctx, resume); err != nil || !res.OK() {
+		t.Fatalf("%v %+v", err, res)
+	}
+	want := "[system:be brief user:memory: prefers email user:send it]"
+	if len(rq.calls) != 2 {
+		t.Fatalf("%d model calls", len(rq.calls))
+	}
+	for i, c := range rq.calls {
+		if got := fmt.Sprint(c[:3]); got != want {
+			t.Fatalf("request %d starts %s, want %s", i, got, want)
+		}
+	}
+	if len(res.Pinned) != 1 || res.Pinned[0].Content != "memory: prefers email" {
+		t.Fatalf("Run.Pinned = %+v", res.Pinned)
+	}
+	if res.Messages[0].Content != "send it" {
+		t.Fatalf("Pinned leaked into Messages: %+v", res.Messages)
+	}
+}
+
+func TestAChildDoesNotInheritPinnedContext(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld()
+	rq := &requests{}
+	child := &harness.Agent{Name: "child", Provider: rq.wrap(w.provider())}
+	lead := &harness.Agent{Name: "lead", Journal: harness.NewMemJournal(), Provider: w.provider("delegate"),
+		Tools: tool.NewRegistry(subagentTool(child, "delegate"))}
+	in := harness.Prompt("go")
+	in.Pinned = []model.Message{model.User("lead only")}
+	if res, err := lead.Run(ctx, in); err != nil || !res.OK() {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if got := fmt.Sprint(rq.calls); got != "[[user:sub task]]" {
+		t.Fatalf("the child was sent %s", got)
 	}
 }

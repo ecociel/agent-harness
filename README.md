@@ -195,6 +195,7 @@ res, err := a.Run(ctx, harness.Prompt("Weather in Zurich?"))
 
 - Chat: `harness.NewSession(runner).Send(ctx, text)` keeps history across runs, and is safe to repeat after a crash.
 - Identity: `Input.Meta` (tenant, principal, labels) is recorded at start and read back from `Run.Meta`, so a resume by any process acts for the run's owner. A child started from a tool inherits it.
+- Per-run context: `Input.Pinned` (a snapshot, retrieved memory) is recorded at start and sent on every request of that run, after the history and before the run's own messages. No other run inherits it, and a `Context` hook cannot edit it.
 - Graceful shutdown: `ctx, drain := harness.WithDrain(ctx)`. Runs finish their step, record it and return `ErrDrained`.
 - Patterns: see the `Example…` functions in `multi/example_test.go`.
 - Evals: `eval.Run(ctx, runner, tasks, parallel)` with `eval.Contains`, `eval.StoppedWith` or `eval.Judge`.

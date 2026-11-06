@@ -46,6 +46,12 @@ type Input struct {
 	RunID string
 	// Messages starts the run. They are ignored once the run exists.
 	Messages []model.Message
+	// Pinned is context the model sees on every request of this run, after the
+	// history and before this run's own messages, and that no other run inherits: a
+	// snapshot, retrieved memory, a reminder. It is recorded at start, so a resume
+	// sends the same request, and it is redacted like any text. A Context hook cannot
+	// edit it. Like Messages, it is ignored once the run exists.
+	Pinned []model.Message
 	// Meta is data about the run for hooks and tools: tenant, principal, labels. At
 	// most MaxMeta keys. It is recorded at start, redacted like any text, returned in
 	// Run.Meta and never sent to the model. A process that resumes a run reads
