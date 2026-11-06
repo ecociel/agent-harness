@@ -304,8 +304,23 @@ func redactMessages(ms []model.Message, visit func(*string)) []model.Message {
 	out := append([]model.Message(nil), ms...)
 	for i := range out {
 		visit(&out[i].Content)
+		out[i].Parts = redactParts(out[i].Parts, visit)
 		out[i].ToolCalls = redactCalls(out[i].ToolCalls, visit)
 		out[i].Opaque = redactRaw(out[i].Opaque, visit)
+	}
+	return out
+}
+
+// redactParts drops the bytes along with the text, since no event carries them.
+func redactParts(ps []model.Part, visit func(*string)) []model.Part {
+	if ps == nil {
+		return nil
+	}
+	out := append([]model.Part(nil), ps...)
+	for i := range out {
+		visit(&out[i].Name)
+		visit(&out[i].Text)
+		out[i].Bytes = nil
 	}
 	return out
 }

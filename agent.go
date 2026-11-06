@@ -107,6 +107,11 @@ type Agent struct {
 	Provider model.Provider
 	// Model is passed through to the provider. Pinned when a run starts.
 	Model string
+	// Resolve supplies the bytes of each message part by its Ref, as the innermost
+	// layer around the provider, on the copy of the request the provider gets. No
+	// hook, redactor, event or journal sees them, and a resume sends the same parts.
+	// Required when a run has parts.
+	Resolve model.Resolver
 	// Tools the model may call. May be nil.
 	Tools *tool.Registry
 	// Hooks attached to every run, in order.

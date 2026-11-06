@@ -565,11 +565,12 @@ func (m *machine) stopEvent(err error) Event {
 	return Event{Kind: KindRunStopping, Stop: StopFailed, Text: f.Detail, Failure: f}
 }
 
-// scrub runs the redactors over one event. It fails closed: once a redactor has
-// failed the worker is sealed, and the only text it still records is the fixed
-// reason that ends the run.
+// scrub runs the redactors over one event and drops its part bytes. It fails
+// closed: once a redactor has failed the worker is sealed, and the only text it
+// still records is the fixed reason that ends the run.
 func (m *machine) scrub(ctx context.Context, ev *Event) error {
 	if len(m.hooks.redact) == 0 {
+		ev.redact(func(*string) {})
 		return nil
 	}
 	if m.sealed.Load() {
@@ -672,9 +673,9 @@ func (m *machine) scrubError(ctx context.Context, kind Kind, err error) error {
 // and keeps its usage, because the provider billed it.
 func (m *machine) ringModel(v Run) model.Provider {
 	if len(m.hooks.redact) == 0 {
-		return m.a.Provider
+		return resolving(m.a.Provider, m.a.Resolve)
 	}
-	p, blind := m.a.Provider, false
+	p, blind := resolving(m.a.Provider, m.a.Resolve), false
 	for i := len(m.hooks.redact) - 1; i >= 0; i-- {
 		if mw, ok := m.hooks.redact[i].(ModelMiddleware); ok {
 			p = mw.WrapModel(v, p)

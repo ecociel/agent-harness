@@ -3,7 +3,9 @@
 //
 // Mapping: system messages become the top-level system prompt; tool results
 // become user messages with tool_result blocks (consecutive ones merged);
-// assistant tool calls become tool_use blocks.
+// assistant tool calls become tool_use blocks. Parts go before the text of a user
+// message: a JPEG, PNG, GIF or WebP image as an image block, a PDF or plain text as a
+// document block, and any other part as its text alternative.
 //
 // Thinking is on by default on current models, and a signature covers everything
 // before its block. So a reply with thinking keeps its block order in Opaque, and an
@@ -22,6 +24,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,6 +74,15 @@ type block struct {
 	Thinking  *string `json:"thinking,omitempty"`
 	Signature string  `json:"signature,omitempty"`
 	Data      string  `json:"data,omitempty"`
+	Source    *source `json:"source,omitempty"`
+	Title     string  `json:"title,omitempty"`
+}
+
+// source is the content of an image or document block.
+type source struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
 func (b block) isThinking() bool { return b.Type == "thinking" || b.Type == "redacted_thinking" }
@@ -165,7 +177,9 @@ type wireRequest struct {
 	Stream      bool       `json:"stream"`
 }
 
-func encode(req model.Request, defModel string, defMax int, stripThinking bool) wireRequest {
+// encode also counts the parts it sends natively, which is what a refusal can be about.
+func encode(req model.Request, defModel string, defMax int, stripThinking bool) (wireRequest, int, error) {
+	binary := 0
 	w := wireRequest{Model: req.Model, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Stream: true}
 	if w.Model == "" {
 		w.Model = defModel
@@ -185,11 +199,26 @@ func encode(req model.Request, defModel string, defMax int, stripThinking bool) 
 		w.Messages = append(w.Messages, message{Role: role, Content: []block{b}})
 	}
 	for _, m := range req.Messages {
+		if len(m.Parts) > 0 && m.Role != model.RoleUser {
+			return w, 0, &model.Error{Class: model.ClassInvalid, Err: fmt.Errorf("anthropic: parts on a %s message", m.Role)}
+		}
 		switch m.Role {
 		case model.RoleSystem:
 			sys = append(sys, m.Content)
 		case model.RoleUser:
-			add("user", block{Type: "text", Text: m.Content})
+			for _, p := range m.Parts {
+				b, err := encodePart(p)
+				if err != nil {
+					return w, 0, err
+				}
+				if b.Source != nil {
+					binary++
+				}
+				add("user", b)
+			}
+			if m.Content != "" || len(m.Parts) == 0 {
+				add("user", block{Type: "text", Text: m.Content})
+			}
 		case model.RoleTool:
 			add("user", block{Type: "tool_result", ToolUseID: m.ToolCallID, Content: m.Content})
 		case model.RoleAssistant:
@@ -217,7 +246,28 @@ func encode(req model.Request, defModel string, defMax int, stripThinking bool) 
 		}
 		w.Tools = append(w.Tools, wireTool{Name: t.Name, Description: t.Description, InputSchema: schema})
 	}
-	return w
+	return w, binary, nil
+}
+
+var images = map[string]bool{"image/jpeg": true, "image/png": true, "image/gif": true, "image/webp": true}
+
+// encodePart sends p natively where the API takes it, and otherwise as its text.
+func encodePart(p model.Part) (block, error) {
+	if p.Bytes != nil {
+		data := base64.StdEncoding.EncodeToString(p.Bytes)
+		switch {
+		case p.Kind == model.PartImage && images[p.MediaType]:
+			return block{Type: "image", Source: &source{Type: "base64", MediaType: p.MediaType, Data: data}}, nil
+		case p.Kind == model.PartDocument && p.MediaType == "application/pdf":
+			return block{Type: "document", Source: &source{Type: "base64", MediaType: p.MediaType, Data: data}, Title: p.Name}, nil
+		case p.Kind == model.PartDocument && p.MediaType == "text/plain":
+			return block{Type: "document", Source: &source{Type: "text", MediaType: p.MediaType, Data: string(p.Bytes)}, Title: p.Name}, nil
+		}
+	}
+	if p.Text == "" {
+		return block{}, &model.Error{Class: model.ClassContent, Err: fmt.Errorf("anthropic: cannot send %s part %s (%s) and it has no text", p.Kind, p.Ref, p.MediaType)}
+	}
+	return block{Type: "text", Text: p.Text}, nil
 }
 
 type streamEvent struct {
@@ -250,7 +300,7 @@ type streamEvent struct {
 }
 
 // send makes one call and returns a 2xx response, or a classified error.
-func (p *Provider) send(ctx context.Context, w wireRequest) (*http.Response, error) {
+func (p *Provider) send(ctx context.Context, w wireRequest, binary bool) (*http.Response, error) {
 	body, err := json.Marshal(w)
 	if err != nil {
 		return nil, &model.Error{Class: model.ClassInvalid, Err: err}
@@ -286,7 +336,7 @@ func (p *Provider) send(ctx context.Context, w wireRequest) (*http.Response, err
 		} `json:"error"`
 	}
 	_ = json.Unmarshal(msg, &e) // a body that is not JSON leaves the status to decide
-	return nil, &model.Error{Class: classify(resp.StatusCode, e.Error.Type, e.Error.Message),
+	return nil, &model.Error{Class: classify(resp.StatusCode, e.Error.Type, e.Error.Message, binary),
 		RetryAfter: httperr.RetryAfter(resp.Header, time.Now()),
 		Err:        &StatusError{Code: resp.StatusCode, Body: string(msg)}}
 }
@@ -301,9 +351,15 @@ func signatureRefused(err error) bool {
 // Complete implements model.Provider.
 func (p *Provider) Complete(ctx context.Context, req model.Request) iter.Seq2[model.Event, error] {
 	return func(yield func(model.Event, error) bool) {
-		resp, err := p.send(ctx, encode(req, p.Model, p.MaxTokens, false))
+		w, binary, err := encode(req, p.Model, p.MaxTokens, false)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		resp, err := p.send(ctx, w, binary > 0)
 		if signatureRefused(err) {
-			resp, err = p.send(ctx, encode(req, p.Model, p.MaxTokens, true))
+			w, _, _ = encode(req, p.Model, p.MaxTokens, true)
+			resp, err = p.send(ctx, w, binary > 0)
 		}
 		if err != nil {
 			yield(nil, err)
@@ -381,7 +437,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request) iter.Seq2[mo
 			case "error":
 				class, msg := httperr.Class(0), "unknown error"
 				if se.Error != nil {
-					class, msg = classify(0, se.Error.Type, se.Error.Message), se.Error.Type+": "+se.Error.Message
+					class, msg = classify(0, se.Error.Type, se.Error.Message, false), se.Error.Type+": "+se.Error.Message
 				}
 				ierr = &model.Error{Class: class, Err: fmt.Errorf("anthropic: %s", msg)}
 				return false
@@ -426,8 +482,10 @@ func mapStop(s string) model.FinishReason {
 }
 
 // classify reads Anthropic's error type, which says more than the status. Billing is
-// an auth failure because a person has to fix it, so retrying cannot help.
-func classify(status int, kind, msg string) model.ErrorClass {
+// an auth failure because a person has to fix it, so retrying cannot help. A request
+// that carried a binary part and is refused for anything but a full context is
+// taken as the part's refusal.
+func classify(status int, kind, msg string, binary bool) model.ErrorClass {
 	switch kind {
 	case "rate_limit_error":
 		return model.ClassRateLimit
@@ -436,6 +494,9 @@ func classify(status int, kind, msg string) model.ErrorClass {
 	case "authentication_error", "permission_error", "billing_error":
 		return model.ClassAuth
 	case "request_too_large":
+		if binary {
+			return model.ClassContent
+		}
 		return model.ClassContextLength
 	case "not_found_error":
 		return model.ClassInvalid
@@ -443,7 +504,13 @@ func classify(status int, kind, msg string) model.ErrorClass {
 		if m := strings.ToLower(msg); strings.Contains(m, "prompt is too long") || strings.Contains(m, "exceed context limit") {
 			return model.ClassContextLength
 		}
+		if binary {
+			return model.ClassContent
+		}
 		return model.ClassInvalid
+	}
+	if binary && httperr.Refused(status) {
+		return model.ClassContent
 	}
 	return httperr.Class(status)
 }

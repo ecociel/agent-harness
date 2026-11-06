@@ -1,7 +1,9 @@
 package model_test
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ecociel/agent-harness/model"
@@ -91,5 +93,38 @@ func TestPricesCost(t *testing.T) {
 	// Cached above input must not bill negative uncached tokens.
 	if got, _ := prices.Cost("gpt-x", model.Usage{Input: 10, Cached: 20}); got < 0 {
 		t.Fatalf("negative cost %d", got)
+	}
+}
+
+func TestPartBytesNeverReachJSON(t *testing.T) {
+	m := model.Message{Role: model.RoleUser, Content: "see attached", Parts: []model.Part{{
+		Kind: model.PartImage, MediaType: "image/png", Name: "scan.png", Ref: "sha256:ab12", Text: "a scanned invoice", Bytes: []byte("PNGDATA")}}}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"role":"user","content":"see attached","parts":[{"kind":"image","media_type":"image/png","name":"scan.png","ref":"sha256:ab12","text":"a scanned invoice"}]}`
+	if string(b) != want {
+		t.Fatalf("got  %s\nwant %s", b, want)
+	}
+}
+
+func TestCloneCopiesParts(t *testing.T) {
+	orig := model.Request{Messages: []model.Message{{Role: model.RoleUser, Parts: []model.Part{{Kind: model.PartImage, Ref: "a"}}}}}
+	c := orig.Clone()
+	c.Messages[0].Parts[0].Bytes = []byte("x")
+	c.Messages[0].Parts = append(c.Messages[0].Parts, model.Part{Ref: "b"})
+	if orig.Messages[0].Parts[0].Bytes != nil || len(orig.Messages[0].Parts) != 1 {
+		t.Fatalf("clone wrote through: %+v", orig.Messages[0].Parts)
+	}
+}
+
+func TestEstimateTokensCountsPartText(t *testing.T) {
+	msgs := []model.Message{{Role: model.RoleUser, Parts: []model.Part{
+		{Kind: model.PartDocument, Ref: "a", Text: strings.Repeat("x", 400)},
+		{Kind: model.PartImage, Ref: "b"},
+	}}}
+	if got := model.EstimateTokens(msgs); got != 104 {
+		t.Fatalf("got %d, want 104", got)
 	}
 }
