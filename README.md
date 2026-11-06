@@ -87,6 +87,8 @@ for _, id := range ids {
 }
 ```
 
+A process that only answers a run, such as a handler that takes an approval, calls `agent.Deliver(ctx, harness.Resume(id, signal))` instead. It records the answer, claims nothing and does no work, and sets `Wake` to now so a worker picks the run up.
+
 A tool's `Effect` says what a crash means for it. `EffectRead` and `EffectIdempotent` are repeated, with the same `tool.IdempotencyKey`. `EffectOnce`, the zero value, is never repeated blindly: an unknown outcome parks the run until a person answers.
 
 The state machine is in [docs/state-machine.md](docs/state-machine.md), and the design, its evidence and its limits are in [docs/design/durable-core.md](docs/design/durable-core.md).

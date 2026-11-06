@@ -39,6 +39,7 @@ type machine struct {
 	durable bool
 	hooks   hookSet
 	run     Run
+	idle    bool        // Deliver: nobody here works on the run, so a run that can move is due now
 	err     error       // the original error of a failed run, for errors.Is
 	sealed  atomic.Bool // a redactor failed: no more text leaves this worker
 }
@@ -84,6 +85,48 @@ func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
 		return nil, err
 	}
 	return m.loop(ctx)
+}
+
+// Deliver records in.Signals and in.Cancel for an existing run and returns at once.
+// It claims nothing, runs no hook but the redactors, and calls no model or tool. It
+// is for a process that answers a run, such as an HTTP handler or an OAuth
+// callback, and leaves the work to a worker. A signal for no open wait, or for one
+// that expired, is ErrStaleSignal, and a repeat is ignored, as in Run.
+//
+// When what it recorded lets the run move, the last event's Wake is now, so a
+// projection of Wake hands the run to a worker at once. A cancel of a running run
+// takes the next position, so its worker is fenced at its next append. If the
+// worker took that position first, Deliver returns ErrFenced and wrote nothing, and
+// a repeat is safe.
+func (a *Agent) Deliver(ctx context.Context, in Input) (*Run, error) {
+	m := a.machine(ctx)
+	if in.RunID == "" {
+		return nil, fmt.Errorf("%w: no RunID", ErrNoSuchRun)
+	}
+	if err := m.load(ctx, in.RunID, Input{RunID: in.RunID}); err != nil {
+		return nil, err
+	}
+	r := &m.run
+	switch {
+	case r.State == StateStart:
+		return nil, fmt.Errorf("%w: %s", ErrNoSuchRun, in.RunID)
+	case r.State.Terminal():
+		res := m.view()
+		return &res, nil
+	}
+	evs, err := resolutions(r, in.Signals, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if in.Cancel != "" && r.State != StateClosing {
+		evs = append(evs, Event{Kind: KindRunStopping, Stop: StopCancelled, Text: in.Cancel})
+	}
+	m.idle = true
+	if err := m.record(ctx, evs...); err != nil {
+		return nil, err
+	}
+	res := m.view()
+	return &res, nil
 }
 
 // machine wires a for one call: its hooks, the redactors it inherits, and the
@@ -389,7 +432,11 @@ func (m *machine) record(ctx context.Context, evs ...Event) error {
 		}
 	}
 	stored := probe.Events[first:]
-	stored[len(stored)-1].Wake = probe.wake(now.Add(cmp.Or(m.a.Lease, DefaultLease)))
+	lease := now.Add(cmp.Or(m.a.Lease, DefaultLease))
+	if m.idle {
+		lease = now
+	}
+	stored[len(stored)-1].Wake = probe.wake(lease)
 	if err := m.journal.Append(context.WithoutCancel(ctx), probe.ID, stored); err != nil {
 		if errors.Is(err, ErrConflict) {
 			return ErrFenced

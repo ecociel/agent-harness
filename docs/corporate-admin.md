@@ -33,6 +33,7 @@ Because the next step is derived from the log, a turn survives process restarts 
 | `RecordResult` | `tool.done` in the journal, after `AfterTool` |
 | `Finish` | `verify` (`CheckOutput`) → `closing` → `done` |
 | `AskApproval` → `errAwaiting`, `Wait` | `suspended`: the run parks with `Run.Waits`, and any process resumes it with a `Signal` |
+| a decision or a stop written by a handler | `Agent.Deliver`: `wait.resolved` or `run.stopping`, no claim, `Wake` now |
 | `Refusal` | `harness.Stop(StopGuardrail \| StopPolicy, detail)` → `stopped` |
 | limits | `hooks/budget.Limits` (+ `Agent.MaxTurns`) |
 | a conversation's turns | a chain of runs, `Input.After` naming the previous turn; `HistoryReader` over the conversation |
