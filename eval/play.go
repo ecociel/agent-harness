@@ -139,3 +139,72 @@ func (sc Script) Provider(vars map[string]string) (*fake.Provider, error) {
 	}
 	return fake.Script(out...), nil
 }
+
+// SelfTest proves that the checks of every scenario tell a good transcript from a
+// bad one. open returns a Target whose model replies with the script given. Every
+// Good script must play and pass every check, and each Bad script must play and
+// fail exactly the kinds in its Fails. Across all scenarios, every kind they use
+// must be the only failure of at least one Bad script, so no kind is untested. It
+// returns every problem it found.
+func SelfTest(ctx context.Context, open func(Script) Target, ss []Scenario, kinds Kinds) error {
+	var errs []error
+	used := map[string]bool{}
+	alone := map[string]bool{}
+	for _, s := range ss {
+		if err := Validate(s, kinds); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if len(s.Selftest.Good) == 0 || len(s.Selftest.Bad) == 0 {
+			errs = append(errs, fmt.Errorf("%s: the selftest needs a good and a bad script", s.Name))
+		}
+		for _, c := range s.Checks {
+			used[c.Kind] = true
+		}
+		for i, sc := range s.Selftest.Good {
+			o, err := Play(ctx, open(sc), s)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: good script %d: %w", s.Name, i+1, err))
+				continue
+			}
+			for _, f := range Grade(s, o, kinds) {
+				errs = append(errs, fmt.Errorf("%s: good script %d fails %s", s.Name, i+1, f))
+			}
+		}
+		for i, b := range s.Selftest.Bad {
+			o, err := Play(ctx, open(b.Script), s)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: bad script %d: %w", s.Name, i+1, err))
+				continue
+			}
+			var failed []string
+			for _, f := range Grade(s, o, kinds) {
+				if !slices.Contains(failed, f.Kind) {
+					failed = append(failed, f.Kind)
+				}
+			}
+			want := slices.Clone(b.Fails)
+			slices.Sort(failed)
+			slices.Sort(want)
+			want = slices.Compact(want)
+			if !slices.Equal(failed, want) {
+				errs = append(errs, fmt.Errorf("%s: bad script %d fails %v, want %v", s.Name, i+1, failed, want))
+				continue
+			}
+			if len(failed) == 1 {
+				alone[failed[0]] = true
+			}
+		}
+	}
+	var lonely []string
+	for kind := range used {
+		if !alone[kind] {
+			lonely = append(lonely, kind)
+		}
+	}
+	slices.Sort(lonely)
+	for _, kind := range lonely {
+		errs = append(errs, fmt.Errorf("no bad script fails %s alone", kind))
+	}
+	return errors.Join(errs...)
+}

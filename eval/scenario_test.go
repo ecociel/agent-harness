@@ -241,3 +241,46 @@ func TestTheReportCountsPassesFailuresAndErrorsApart(t *testing.T) {
 		t.Errorf("masked %d: %+v", masked, clean.Results[1].Failed)
 	}
 }
+
+func scripted(sc eval.Script) eval.Target { return clerk{script: &sc} }
+
+func provenScenario() eval.Scenario {
+	s := mailOwners()
+	s.Checks = []eval.Spec{
+		{Kind: "answer_has", Args: []string{"sent"}},
+		{Kind: "called", Args: []string{"owners"}},
+		{Kind: "mail_sent_to", Args: []string{"jan@example.com"}},
+	}
+	s.Selftest.Bad = append(s.Selftest.Bad, eval.BadScript{Fails: []string{"called"}, Script: script(
+		say("Marta Keller and Jonas Frei, I believe."),
+		use("send_mail", `{"to":"{{owner_mail}}"}`), say("Sent to Jan."),
+	)})
+	return s
+}
+
+func TestSelfTestPassesAScenarioWhoseChecksAreEachProven(t *testing.T) {
+	if err := eval.SelfTest(context.Background(), scripted, []eval.Scenario{provenScenario()}, kinds()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelfTestRefusesABadScriptThatFailsTheWrongCheck(t *testing.T) {
+	s := provenScenario()
+	s.Selftest.Bad[0].Fails = []string{"called"}
+	err := eval.SelfTest(context.Background(), scripted, []eval.Scenario{s}, kinds())
+	want := "mail-owners: bad script 1 fails [answer_has], want [called]\nno bad script fails answer_has alone"
+	if err == nil || err.Error() != want {
+		t.Fatalf("got\n%v\nwant\n%s", err, want)
+	}
+}
+
+func TestSelfTestRefusesAGoodScriptThatFailsAndAKindNeverProven(t *testing.T) {
+	s := provenScenario()
+	s.Selftest.Good[0].Replies[3] = say("Done.")
+	s.Checks = append(s.Checks, eval.Spec{Kind: "final_stop", Args: []string{"completed"}})
+	err := eval.SelfTest(context.Background(), scripted, []eval.Scenario{s}, kinds())
+	want := "mail-owners: good script 1 fails answer_has: the last answer lacks \"sent\"\nno bad script fails final_stop alone"
+	if err == nil || err.Error() != want {
+		t.Fatalf("got\n%v\nwant\n%s", err, want)
+	}
+}
