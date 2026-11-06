@@ -36,7 +36,7 @@ type Rule struct {
 func R(name, pattern string) Rule { return Rule{Name: name, Pattern: regexp.MustCompile(pattern)} }
 
 // PII returns rules for common personal data: e-mail addresses, payment card
-// numbers, IBANs and Swiss AHV numbers.
+// numbers, IBANs, Swiss AHV numbers and Swiss phone numbers.
 func PII() []Rule {
 	return []Rule{
 		R("email", `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`),
@@ -44,6 +44,9 @@ func PII() []Rule {
 		// card number (rules are applied in order).
 		R("iban", `\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b`),
 		R("ahv", `\b756\.\d{4}\.\d{4}\.\d{2}\b`),
+		// Swiss numbers only, in their grouped forms (+41 79 123 45 67, 079 123 45 67),
+		// so an ordinary digit string is not taken for a phone number. Before card.
+		R("phone", `(?:\+41|\b0041) ?\(?0?\)?\d{2} ?\d{3} ?\d{2} ?\d{2}\b|\b0\d{2} \d{3} \d{2} \d{2}\b`),
 		R("card", `\b(?:\d[ -]?){13,16}\b`),
 	}
 }
