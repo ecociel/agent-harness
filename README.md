@@ -194,6 +194,7 @@ res, err := a.Run(ctx, harness.Prompt("Weather in Zurich?"))
 ```
 
 - Chat: `harness.NewSession(runner).Send(ctx, text)` keeps history across runs, and is safe to repeat after a crash.
+- Attachments: put `model.Part`s with a `Ref` on a user message and set `Agent.Resolve`. The journal keeps the reference and the part's text, and the provider gets the bytes. A provider that refuses a part fails with `model.ClassContent`, which a `Recover` hook can answer by retrying without it.
 - Graceful shutdown: `ctx, drain := harness.WithDrain(ctx)`. Runs finish their step, record it and return `ErrDrained`.
 - Patterns: see the `Example…` functions in `multi/example_test.go`.
 - Evals: `eval.Run(ctx, runner, tasks, parallel)` with `eval.Contains`, `eval.StoppedWith` or `eval.Judge`.

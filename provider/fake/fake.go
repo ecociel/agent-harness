@@ -4,10 +4,9 @@
 // A Provider answers either from a Script (responses consumed in order) or
 // from a Func that computes a response from the request. Every request is
 // recorded, message parts with their resolved bytes, so tests can assert what
-// the harness actually sent. When a
-// response carries no Usage, plausible token counts are estimated from the
-// request and the reply so budget and metrics hooks have real numbers to
-// work with.
+// the harness actually sent. When a response carries no Usage, plausible token
+// counts are estimated from the request and the reply so budget and metrics
+// hooks have real numbers to work with.
 package fake
 
 import (
