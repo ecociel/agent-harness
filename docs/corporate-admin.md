@@ -30,6 +30,7 @@ Because the next step is derived from the log, a turn survives process restarts 
 | `StartTool` | `tools`, per call |
 | `AskApproval` | `BeforeTool` → `hooks/approval` (`Ask` opens a durable wait, `Approver` decides on the spot, `Record` audits) |
 | `RunTool` | the `WrapTool` chain around `tool.Registry.Call` |
+| a write tool lending the turn's transaction (`Tx.Lend`) | `tool.EffectAtomic` and `AtomicJournal.Atomically`: the tool's writes and `tool.done` commit together |
 | `RecordResult` | `tool.done` in the journal, after `AfterTool` |
 | `Finish` | `verify` (`CheckOutput`) → `closing` → `done` |
 | `AskApproval` → `errAwaiting`, `Wait` | `suspended`: the run parks with `Run.Waits`, and any process resumes it with a `Signal` |

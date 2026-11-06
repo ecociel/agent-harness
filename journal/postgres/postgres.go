@@ -64,6 +64,53 @@ func (j *Journal) Append(ctx context.Context, runID string, evs []harness.Event)
 		return err
 	}
 	defer tx.Rollback()
+	if err := appendTx(ctx, tx, runID, evs); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type txKey struct{}
+
+// TxFrom returns the transaction of the unit ctx belongs to. An EffectAtomic tool
+// writes through it, so its writes commit with the call's result or not at all.
+func TxFrom(ctx context.Context) (*sql.Tx, bool) {
+	tx, ok := ctx.Value(txKey{}).(*sql.Tx)
+	return tx, ok
+}
+
+// Atomically implements harness.AtomicJournal with one transaction. A savepoint
+// before fn lets a failed tool's writes be undone while its error is still
+// recorded, and clears a transaction that a failed statement aborted. A taken
+// position rolls back everything, the tool's writes included, and is
+// harness.ErrConflict.
+func (j *Journal) Atomically(ctx context.Context, runID string, fn func(context.Context) ([]harness.Event, error)) error {
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT harness_effect`); err != nil {
+		return err
+	}
+	evs, err := fn(context.WithValue(ctx, txKey{}, tx))
+	if err != nil {
+		return err
+	}
+	if slices.ContainsFunc(evs, func(e harness.Event) bool { return e.Kind == harness.KindToolDone && e.Outcome == "error" }) {
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT harness_effect`); err != nil {
+			return err
+		}
+	}
+	if len(evs) > 0 {
+		if err := appendTx(ctx, tx, runID, evs); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func appendTx(ctx context.Context, tx *sql.Tx, runID string, evs []harness.Event) error {
 	for _, e := range evs {
 		doc, err := json.Marshal(e)
 		if err != nil {
@@ -87,13 +134,11 @@ func (j *Journal) Append(ctx context.Context, runID string, evs []harness.Event)
 	if i := slices.IndexFunc(evs, harness.Event.IsCancel); i >= 0 {
 		cancel = sql.NullInt64{Int64: evs[i].Seq, Valid: true}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO journal_runs (run_id, parent, root, state, wake, cancel) VALUES ($1, $2, $3, $4, $5, $6)
+	_, err := tx.ExecContext(ctx, `INSERT INTO journal_runs (run_id, parent, root, state, wake, cancel) VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (run_id) DO UPDATE SET state = COALESCE(NULLIF(EXCLUDED.state, ''), journal_runs.state), wake = EXCLUDED.wake,
 			cancel = COALESCE(journal_runs.cancel, EXCLUDED.cancel)`,
-		runID, last.ParentRun, last.RootRun, string(last.To), wake, cancel); err != nil {
-		return err
-	}
-	return tx.Commit()
+		runID, last.ParentRun, last.RootRun, string(last.To), wake, cancel)
+	return err
 }
 
 // Lineage implements harness.LineageReader with two primary-key reads, so it costs

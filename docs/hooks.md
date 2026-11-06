@@ -29,6 +29,10 @@ Retries belong in `Recover`, not `WrapModel`: an attempt inside middleware isn't
 
 `Agent.Deliver(ctx, in)` records `in.Signals` and `in.Cancel` and returns. It claims nothing, runs no hook except the redactors, and calls no model or tool. An HTTP handler that takes a decision, or an OAuth callback, uses it and leaves the work to a worker. A signal for no open wait, or an expired one, is `ErrStaleSignal`, and a repeat is ignored. When the run can move, the last event's `Wake` is now, so a projection of `Wake` hands it to a worker at once. A cancel of a running run fences its worker. If the worker appended first, `Deliver` returns `ErrFenced`, and sending it again is safe.
 
+## A tool's writes in the journal's transaction
+
+A tool with `Effect: tool.EffectAtomic` needs an `AtomicJournal`, or `Run` returns `ErrNotAtomic`. The machine records `tool.started` alone, then calls `Atomically(ctx, runID, fn)`. Inside `fn` run the `WrapTool` chain, the redactors, the tool and the `AfterTool` hooks, and `fn` returns the call's `tool.done`. The store appends it in the same unit as the tool's writes. A tool error is still a result: the store undoes the writes and records the error text. `WrapTool` and `AfterTool` hooks of an atomic call therefore run inside the unit, so keep them short.
+
 ## Sinks
 
 Tracing, metrics and logging are not hooks. They are event sinks, attached once on the context, and every run in the tree reports to them:

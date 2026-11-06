@@ -60,9 +60,16 @@ const (
 	EffectIdempotent
 	// EffectRead changes nothing. Adjacent read calls run in parallel.
 	EffectRead
+	// EffectAtomic writes only through the unit of work of the run's journal
+	// (harness.AtomicJournal), so its effect commits with its recorded result or not
+	// at all. A crash or a fence before the commit undoes the effect, and the call
+	// runs again under the same key, like EffectIdempotent, without the tool keeping
+	// a ledger of keys. An atomic call runs alone, never in a group. It comes last so
+	// the stored values of the other classes do not change.
+	EffectAtomic
 )
 
-// String returns "once", "idempotent" or "read".
+// String returns "once", "idempotent", "read" or "atomic".
 func (e Effect) String() string {
 	switch e {
 	case EffectOnce:
@@ -71,6 +78,8 @@ func (e Effect) String() string {
 		return "idempotent"
 	case EffectRead:
 		return "read"
+	case EffectAtomic:
+		return "atomic"
 	}
 	return fmt.Sprintf("effect(%d)", int(e))
 }

@@ -48,6 +48,28 @@ type Journal interface {
 	Load(ctx context.Context, runID string) ([]Event, error)
 }
 
+// AtomicJournal is a Journal that can commit a tool's writes with the record of the
+// call. It is optional, and only a run with an EffectAtomic tool needs it.
+//
+// Atomically opens the store's own unit of work, such as a transaction, calls fn with
+// a context that carries it, appends the events fn returns in the same unit, and
+// commits. If fn fails, nothing is stored and its error is returned. If a position is
+// taken, the unit rolls back with the tool's writes and Atomically returns
+// ErrConflict, which the run reports as ErrFenced. The store gives the tool its unit
+// through an accessor of its own, so the harness never sees its type.
+//
+// The run records tool.started alone first, then calls Atomically with an fn that
+// runs the WrapTool chain, the redactors and the tool, then AfterTool, and returns
+// the call's tool.done. A tool error is not an fn error. When tool.done says Outcome
+// "error", the store undoes what fn wrote and still appends the events, so the error
+// text is the recorded result. A crash leaves tool.started with nothing committed,
+// and the call is decided again and runs under the same key. Sinks hear the events
+// after the commit.
+type AtomicJournal interface {
+	Journal
+	Atomically(ctx context.Context, runID string, fn func(ctx context.Context) ([]Event, error)) error
+}
+
 // Lineage is what a run needs from a run above it, before its next step.
 type Lineage struct {
 	Parent    string // the run above this one, empty at the root
@@ -154,6 +176,9 @@ var (
 	// ErrNotDurable ends a run that must suspend but has no Journal to resume
 	// from.
 	ErrNotDurable = errors.New("harness: suspending needs Agent.Journal")
+	// ErrNotAtomic is what Run returns, writing nothing, when the agent has an
+	// EffectAtomic tool and its Journal is not an AtomicJournal.
+	ErrNotAtomic = errors.New("harness: an EffectAtomic tool needs an AtomicJournal")
 )
 
 type memJournal struct {
@@ -176,6 +201,16 @@ func (j *memJournal) Append(_ context.Context, runID string, evs []Event) error 
 	}
 	j.runs[runID] = append(j.runs[runID], evs...)
 	return nil
+}
+
+// Atomically has no transaction to offer: it runs fn and appends what it returns.
+// A tool's writes outside the journal are not undone.
+func (j *memJournal) Atomically(ctx context.Context, runID string, fn func(context.Context) ([]Event, error)) error {
+	evs, err := fn(ctx)
+	if err != nil {
+		return err
+	}
+	return j.Append(ctx, runID, evs)
 }
 
 func (j *memJournal) Load(_ context.Context, runID string) ([]Event, error) {

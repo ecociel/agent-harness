@@ -193,7 +193,7 @@ A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `Check
 | # | Concern | The package owns | The consumer supplies |
 |---|---|---|---|
 | 1 | Durability | `Journal`, `Fold`, idempotent `Run`, record before acting | The store, two methods |
-| 2 | Side-effect safety | `tool.started` before the effect, `IdempotencyKey`, `Effect`, `WaitUnknownOutcome` | Each tool's `Effect`, a ledger if wanted |
+| 2 | Side-effect safety | `tool.started` before the effect, `IdempotencyKey`, `Effect`, `WaitUnknownOutcome`, `EffectAtomic` committed through `AtomicJournal` | Each tool's `Effect`, a ledger if wanted, a transaction for atomic tools |
 | 3 | Suspension | `suspended`, `Wait`, `Signal`, `Await`, expiry, re-decide on resolve | Approval UI, who may approve, a sweeper |
 | 4 | Context, compaction | `Context` returns a recorded `Edit`, `BeforeModel` edits are per call | Summariser, retrieval, token counting |
 | 5 | Memory | Load in `Context` with `Edit.Source`, save in `AfterRun` | Memory store and policy |
@@ -305,6 +305,7 @@ Each of these was left on purpose.
 - **An edit cannot cross the pinned context.** A `Context` edit over both inherited and own messages fails the run when `Pinned` is set, so `hooks/compact` summarises only the inherited part then.
 - **A composite's body sees the inherited history but not `Pinned`.** A pattern passes `Messages` to its children, and `Pinned` stays with the composite's run.
 - **A `Session` over a runner with no journal chains in memory.** The journal lives in the `Session` value, so a restart forgets the conversation, and such a run now parks on a wait instead of failing with `ErrNotDurable`.
+- **The memory journal's unit undoes nothing.** `NewMemJournal().Atomically` runs the tool and appends, so an `EffectAtomic` tool on it is only as safe as an idempotent one. A crash test of atomic tools needs a store with a real transaction, or a stand-in like the suite's.
 - **A wrapper can hide the fast path.** A journal wrapped for tracing or fault injection has no `Lineage` unless the wrapper forwards it. Runs then fall back to `Load`, which is correct and slower. Nothing reports the fallback.
 
 ## Tradeoffs accepted

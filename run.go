@@ -62,6 +62,11 @@ func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
 		return nil, errors.New("harness: agent has no Provider")
 	}
 	m := a.machine(ctx)
+	if _, ok := m.journal.(AtomicJournal); !ok && slices.ContainsFunc(a.Tools.Specs(), func(s tool.Spec) bool {
+		return s.Effect == tool.EffectAtomic
+	}) {
+		return nil, ErrNotAtomic
+	}
 	id := in.RunID
 	if id == "" {
 		id = newRunID(a.Name)
@@ -404,6 +409,50 @@ func (m *machine) record(ctx context.Context, evs ...Event) error {
 	if len(evs) == 0 {
 		return nil
 	}
+	probe, stored, err := m.prepare(ctx, evs)
+	if err != nil {
+		return m.unprepared(ctx, err)
+	}
+	if err := m.journal.Append(context.WithoutCancel(ctx), probe.ID, stored); err != nil {
+		return m.appendFailed(probe.ID, err)
+	}
+	m.adopt(ctx, probe, stored)
+	return nil
+}
+
+// redactorFailed is how prepare reports what record must turn into a failed run.
+type redactorFailed struct{ err error }
+
+func (e *redactorFailed) Error() string { return e.err.Error() }
+
+// unprepared handles a prepare error: a redactor failure ends the run, anything
+// else stops the worker.
+func (m *machine) unprepared(ctx context.Context, err error) error {
+	var rf *redactorFailed
+	if errors.As(err, &rf) {
+		return m.fail(ctx, rf.err)
+	}
+	return err
+}
+
+func (m *machine) appendFailed(id string, err error) error {
+	if errors.Is(err, ErrConflict) {
+		return ErrFenced
+	}
+	return fmt.Errorf("harness: append %s: %w: %w", id, ErrDrained, err)
+}
+
+// adopt makes what was appended the fold, and tells the sinks.
+func (m *machine) adopt(ctx context.Context, probe Run, stored []Event) {
+	m.run = probe
+	for _, ev := range stored {
+		Emit(ctx, ev)
+	}
+}
+
+// prepare is record up to the append: it stamps, redacts and folds evs on a copy
+// of the run, and returns the copy with the events to store.
+func (m *machine) prepare(ctx context.Context, evs []Event) (Run, []Event, error) {
 	probe := m.run
 	probe.batch = slices.Clone(probe.batch)
 	now := time.Now()
@@ -425,10 +474,10 @@ func (m *machine) record(ctx context.Context, evs ...Event) error {
 			}
 		}
 		if err := m.scrub(ctx, &ev); err != nil {
-			return m.fail(ctx, err)
+			return Run{}, nil, &redactorFailed{err}
 		}
 		if err := probe.apply(ev); err != nil {
-			return err
+			return Run{}, nil, err
 		}
 	}
 	stored := probe.Events[first:]
@@ -437,17 +486,7 @@ func (m *machine) record(ctx context.Context, evs ...Event) error {
 		lease = now
 	}
 	stored[len(stored)-1].Wake = probe.wake(lease)
-	if err := m.journal.Append(context.WithoutCancel(ctx), probe.ID, stored); err != nil {
-		if errors.Is(err, ErrConflict) {
-			return ErrFenced
-		}
-		return fmt.Errorf("harness: append %s: %w: %w", probe.ID, ErrDrained, err)
-	}
-	m.run = probe
-	for _, ev := range stored {
-		Emit(ctx, ev)
-	}
-	return nil
+	return probe, stored, nil
 }
 
 // fail ends the run as a failure. A hook's Stop ends it on purpose instead. A run
@@ -924,6 +963,9 @@ func (m *machine) gate(ctx context.Context, calls []Call) error {
 // each result as it arrives. Tools only send on a channel: this goroutine stays
 // the only writer, so a parallel group needs no locking around the fold.
 func (m *machine) execute(ctx context.Context, calls []Call) error {
+	if calls[0].effect == tool.EffectAtomic {
+		return m.executeAtomic(ctx, calls[0])
+	}
 	started := make([]Event, len(calls))
 	for i, c := range calls {
 		started[i] = Event{Kind: KindToolStarted, Index: c.Index, Tool: c.Name, Attempt: c.attempt + 1}
@@ -965,17 +1007,62 @@ func (m *machine) execute(ctx context.Context, calls []Call) error {
 	return first
 }
 
+// executeAtomic records the intent alone, then runs the call and records its result
+// in one unit of the journal, so the tool's writes and the result commit together.
+func (m *machine) executeAtomic(ctx context.Context, c Call) error {
+	if err := m.record(ctx, Event{Kind: KindToolStarted, Index: c.Index, Tool: c.Name, Attempt: c.attempt + 1}); err != nil {
+		return err
+	}
+	if stopped, err := m.cancelledAbove(ctx); stopped || err != nil {
+		return err
+	}
+	v := m.view()
+	var (
+		probe  Run
+		stored []Event
+	)
+	err := m.journal.(AtomicJournal).Atomically(ctx, v.ID, func(ctx context.Context) ([]Event, error) {
+		ev, err := m.invoke1(ctx, v, c)
+		switch {
+		case err != nil && !isStop(err):
+			return nil, err
+		case m.durable && ctx.Err() != nil && ev.Outcome == "error":
+			return nil, ErrDrained // stopped under the tool: the unit says nothing about the effect
+		}
+		var perr error
+		probe, stored, perr = m.prepare(ctx, m.outcome(ctx, ev, err))
+		return stored, perr
+	})
+	switch {
+	case err == nil:
+		m.adopt(ctx, probe, stored)
+		return nil
+	case errors.Is(err, ErrFenced) || errors.Is(err, ErrDrained):
+		return err
+	}
+	var rf *redactorFailed
+	if errors.As(err, &rf) {
+		return m.unprepared(ctx, err)
+	}
+	return m.appendFailed(v.ID, err)
+}
+
 func isStop(err error) bool {
 	_, ok := AsStop(err)
 	return ok
 }
 
-// report records a finished call, revised by AfterTool hooks. The effect happened,
-// so a call is recorded even when its result cannot be, and a stop lands in the same
-// append as the call, so no crash can keep the fact and lose the decision.
+// report records a finished call, revised by AfterTool hooks.
 func (m *machine) report(ctx context.Context, ev Event, stop error) error {
+	return m.record(ctx, m.outcome(ctx, ev, stop)...)
+}
+
+// outcome is what a finished call records. The effect happened, so a call is recorded
+// even when its result cannot be, and a stop goes in the same append as the call, so
+// no crash can keep the fact and lose the decision.
+func (m *machine) outcome(ctx context.Context, ev Event, stop error) []Event {
 	if m.sealed.Load() {
-		return m.record(ctx, ev, m.stopEvent(errSealed))
+		return []Event{ev, m.stopEvent(errSealed)}
 	}
 	if ev.Outcome == "ok" || ev.Outcome == "error" {
 		c := m.run.batch[ev.Index]
@@ -995,9 +1082,9 @@ func (m *machine) report(ctx context.Context, ev Event, stop error) error {
 		}
 	}
 	if stop != nil {
-		return m.record(ctx, ev, m.stopEvent(stop))
+		return []Event{ev, m.stopEvent(stop)}
 	}
-	return m.record(ctx, ev)
+	return []Event{ev}
 }
 
 // invoke1 runs one call through its middleware. A fenced or drained child means

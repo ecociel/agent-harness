@@ -27,6 +27,12 @@ import (
 
 func open(t *testing.T) *postgres.Journal {
 	t.Helper()
+	j, _ := openDB(t)
+	return j
+}
+
+func openDB(t *testing.T) (*postgres.Journal, *sql.DB) {
+	t.Helper()
 	dsn := os.Getenv("JOURNAL_POSTGRES_DSN")
 	if dsn == "" {
 		if os.Getenv("CI") != "" {
@@ -43,7 +49,7 @@ func open(t *testing.T) *postgres.Journal {
 	if err := j.Migrate(context.Background()); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return j
+	return j, db
 }
 
 func TestConformance(t *testing.T) {
@@ -271,5 +277,74 @@ func TestDuplicateAppendAcrossConnectionsIsAConflict(t *testing.T) {
 	}
 	if err := b.Append(context.Background(), id, []harness.Event{ev}); !errors.Is(err, harness.ErrConflict) {
 		t.Fatalf("want ErrConflict from the other process, got %v", err)
+	}
+}
+
+// effects is a table an atomic tool writes in the journal's transaction.
+func effects(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS journal_test_effects (key text PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func effectCount(t *testing.T, db *sql.DB, key string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM journal_test_effects WHERE key = $1`, key).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func write(ctx context.Context, key string) error {
+	tx, ok := postgres.TxFrom(ctx)
+	if !ok {
+		return errors.New("no unit on the context")
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO journal_test_effects (key) VALUES ($1)`, key)
+	return err
+}
+
+func TestAtomicallyCommitsTheEffectWithItsEvents(t *testing.T) {
+	j, db := openDB(t)
+	effects(t, db)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		outcome string
+		taken   bool
+		effect  int
+		events  int
+		err     error
+	}{
+		{"ok", "ok", false, 1, 1, nil},
+		{"a tool error keeps its record and loses its writes", "error", false, 0, 1, nil},
+		{"a fenced unit loses both", "ok", true, 0, 1, harness.ErrConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, key := newID("unit"), newID("key")
+			if tc.taken {
+				if err := j.Append(ctx, id, []harness.Event{{Seq: 1, Time: time.Now(), Kind: harness.KindRunClaimed}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := j.Atomically(ctx, id, func(ctx context.Context) ([]harness.Event, error) {
+				if err := write(ctx, key); err != nil {
+					return nil, err
+				}
+				return []harness.Event{{Seq: 1, Time: time.Now(), Kind: harness.KindToolDone, Outcome: tc.outcome}}, nil
+			})
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("want %v, got %v", tc.err, err)
+			}
+			if n := effectCount(t, db, key); n != tc.effect {
+				t.Fatalf("%d effects", n)
+			}
+			evs, err := j.Load(ctx, id)
+			if err != nil || len(evs) != tc.events {
+				t.Fatalf("%v: %d events", err, len(evs))
+			}
+		})
 	}
 }

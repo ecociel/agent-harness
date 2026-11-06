@@ -55,6 +55,11 @@ var checks = []check{
 	{"TwoWorkersRepeatNothing", twoWorkersRepeatNothing},
 	{"CrashSweepOneAgent", func(t testing.TB, j harness.Journal) { sweep(t, j, oneAgent) }},
 	{"CrashSweepParallel", func(t testing.TB, j harness.Journal) { sweep(t, j, parallel) }},
+	{"CrashSweepAtomic", func(t testing.TB, j harness.Journal) {
+		if _, ok := j.(harness.AtomicJournal); ok {
+			sweep(t, j, atomicTools)
+		}
+	}},
 	{"CancelStopsARunningChild", cancelStopsARunningChild},
 	{"CancelEndsAParkedBranch", cancelEndsAParkedBranch},
 	{"LineageAgreesWithTheEvents", lineageAgreesWithTheEvents},
@@ -481,6 +486,34 @@ func (c *crash) Append(ctx context.Context, id string, evs []harness.Event) erro
 	return c.Journal.Append(ctx, id, evs)
 }
 
+// Atomically counts a unit as one append. Killed before it, the unit runs and fails
+// before its commit, so nothing of it stays. Killed after it, the unit commits and
+// the caller never hears back.
+func (c *crash) Atomically(ctx context.Context, id string, fn func(context.Context) ([]harness.Event, error)) error {
+	c.mu.Lock()
+	if c.dead {
+		c.mu.Unlock()
+		return errDead
+	}
+	c.n[id]++
+	hit := (c.run == "" || c.run == id) && c.n[id] == c.at
+	c.dead = hit
+	c.mu.Unlock()
+	inner := c.Journal.(harness.AtomicJournal)
+	switch {
+	case hit && c.after:
+		_ = inner.Atomically(ctx, id, fn)
+		return errDead
+	case hit:
+		_ = inner.Atomically(ctx, id, func(ctx context.Context) ([]harness.Event, error) {
+			_, _ = fn(ctx)
+			return nil, errDead
+		})
+		return errDead
+	}
+	return inner.Atomically(ctx, id, fn)
+}
+
 // recorder notes every run in a tree, because Journal has no way to list them.
 type recorder struct {
 	harness.Journal
@@ -493,6 +526,13 @@ func (r *recorder) Append(ctx context.Context, id string, evs []harness.Event) e
 	r.ids[id] = true
 	r.mu.Unlock()
 	return r.Journal.Append(ctx, id, evs)
+}
+
+func (r *recorder) Atomically(ctx context.Context, id string, fn func(context.Context) ([]harness.Event, error)) error {
+	r.mu.Lock()
+	r.ids[id] = true
+	r.mu.Unlock()
+	return r.Journal.(harness.AtomicJournal).Atomically(ctx, id, fn)
 }
 
 func (r *recorder) runs() []string {
@@ -550,7 +590,7 @@ func (w *world) agent(name, toolName string) *harness.Agent {
 // provider decides from the request alone, like a model, reading what followed the
 // last user message. Its answer quotes the prompt and the tool's result, so a lost
 // input or result fails the comparison.
-func (w *world) provider(agent, toolName string) model.Provider {
+func (w *world) provider(agent string, toolNames ...string) model.Provider {
 	return model.ProviderFunc(func(_ context.Context, req model.Request) iter.Seq2[model.Event, error] {
 		w.mu.Lock()
 		w.paid++
@@ -561,14 +601,21 @@ func (w *world) provider(agent, toolName string) model.Provider {
 				turn = req.Messages[i:]
 			}
 		}
+		var results []string
 		for _, m := range turn {
 			if m.Role == model.RoleTool {
-				return model.Stream(model.Response{Usage: model.Usage{Input: 10, Output: 1},
-					Text: fmt.Sprintf("%s heard %q and got %q", agent, model.LastUser(req.Messages), m.Content)})
+				results = append(results, m.Content)
 			}
 		}
-		return model.Stream(model.Response{Usage: model.Usage{Input: 10, Output: 1},
-			ToolCalls: []model.ToolCall{{ID: "c1", Name: toolName, Arguments: json.RawMessage(`{}`)}}})
+		if len(results) > 0 {
+			return model.Stream(model.Response{Usage: model.Usage{Input: 10, Output: 1},
+				Text: fmt.Sprintf("%s heard %q and got %q", agent, model.LastUser(req.Messages), strings.Join(results, ", "))})
+		}
+		var calls []model.ToolCall
+		for i, name := range toolNames {
+			calls = append(calls, model.ToolCall{ID: fmt.Sprintf("c%d", i+1), Name: name, Arguments: json.RawMessage(`{}`)})
+		}
+		return model.Stream(model.Response{Usage: model.Usage{Input: 10, Output: 1}, ToolCalls: calls})
 	})
 }
 
@@ -603,7 +650,70 @@ func finish(t testing.TB, w *world, build func() harness.Runner, id string, in h
 type scenario struct {
 	tools []string
 	build func(w *world, j harness.Journal) harness.Runner
+	// atomic names the EffectAtomic tool, whose effect must commit with its tool.done.
+	atomic string
 }
+
+// units applies what an atomic tool wrote only when its unit commits. It is the
+// suite's stand-in for the store's own transaction, so it works on any AtomicJournal.
+type units struct {
+	harness.AtomicJournal
+	w    *world
+	tool string
+}
+
+type unitKey struct{}
+
+func (u units) Atomically(ctx context.Context, id string, fn func(context.Context) ([]harness.Event, error)) error {
+	var writes []string
+	if err := u.AtomicJournal.Atomically(context.WithValue(ctx, unitKey{}, &writes), id, fn); err != nil {
+		return err
+	}
+	u.w.mu.Lock()
+	defer u.w.mu.Unlock()
+	u.w.ran[u.tool] = append(u.w.ran[u.tool], writes...)
+	return nil
+}
+
+// effectHasItsRecord fails if the atomic tool's effect and its tool.done disagree.
+func (s scenario) effectHasItsRecord(t testing.TB, name string, w *world, evs []harness.Event) {
+	t.Helper()
+	if s.atomic == "" {
+		return
+	}
+	done := 0
+	for _, e := range evs {
+		if e.Kind == harness.KindToolDone && e.Tool == s.atomic {
+			done++
+		}
+	}
+	if n := w.count(s.atomic); n != done {
+		t.Fatalf("%s: %s took effect %d times with %d results recorded", name, s.atomic, n, done)
+	}
+}
+
+// on is the journal the scenario runs on for one world.
+func (s scenario) on(w *world, j harness.Journal) harness.Journal {
+	if s.atomic == "" {
+		return j
+	}
+	return units{j.(harness.AtomicJournal), w, s.atomic}
+}
+
+var atomicTools = scenario{tools: []string{"book", "pay"}, atomic: "book", build: func(w *world, j harness.Journal) harness.Runner {
+	book := tool.Func(tool.Spec{Name: "book", Effect: tool.EffectAtomic}, func(ctx context.Context, _ json.RawMessage) (string, error) {
+		writes, ok := ctx.Value(unitKey{}).(*[]string)
+		if !ok {
+			return "", errors.New("book ran outside a unit")
+		}
+		*writes = append(*writes, tool.IdempotencyKey(ctx))
+		return "book ok", nil
+	})
+	a := w.agent("clerk", "pay")
+	a.Tools.MustAdd(book)
+	a.Provider, a.Journal = w.provider("clerk", "book", "pay"), j
+	return a
+}}
 
 var oneAgent = scenario{tools: []string{"pay"}, build: func(w *world, j harness.Journal) harness.Runner {
 	a := w.agent("solo", "pay")
@@ -640,8 +750,9 @@ func sweep(t testing.TB, j harness.Journal, s scenario) {
 	root := newID("clean")
 	in := harness.Prompt("the task")
 	in.RunID = root
-	counted := kill(j, "", -1, false)
-	clean, err := s.advance(newWorld(), counted, root, in, new([]harness.Signal))
+	w := newWorld()
+	counted := kill(s.on(w, j), "", -1, false)
+	clean, err := s.advance(w, counted, root, in, new([]harness.Signal))
 	if err != nil || !clean.OK() {
 		t.Fatalf("uncrashed run: %v %+v", err, clean)
 	}
@@ -663,7 +774,7 @@ func (s scenario) check(t testing.TB, base harness.Journal, want, suffix string,
 	id := newID("crash")
 	name := fmt.Sprintf("%s%s#%d after=%v", id, suffix, at, after)
 	w := newWorld()
-	j := &recorder{Journal: base, ids: map[string]bool{}}
+	j := &recorder{Journal: s.on(w, base), ids: map[string]bool{}}
 	in := harness.Prompt("the task")
 	in.RunID = id
 	var sent []harness.Signal
@@ -675,6 +786,7 @@ func (s scenario) check(t testing.TB, base harness.Journal, want, suffix string,
 			t.Fatalf("%s: %s ran %d times before recovery", name, tn, n)
 		}
 	}
+	s.effectHasItsRecord(t, name, w, load(t, j, id))
 	next := harness.Resume(id, sent...) // the sender retries what it cannot know landed
 	if len(load(t, j, id)) == 0 {
 		next = in // nothing was written: the caller repeats its request
@@ -699,6 +811,7 @@ func (s scenario) check(t testing.TB, base harness.Journal, want, suffix string,
 			t.Errorf("%s: once-only tool %s ran %d times: %v", name, tn, n, w.ran[tn])
 		}
 	}
+	s.effectHasItsRecord(t, name, w, load(t, j, id))
 	if res.Stop != harness.StopCompleted || res.Output != want {
 		t.Errorf("%s: %s %q\nwant %q", name, res.Stop, res.Output, want)
 	}
