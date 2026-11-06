@@ -60,7 +60,7 @@ type Input struct {
 	// edit it. Like Messages, it is ignored once the run exists.
 	Pinned []model.Message
 	// Meta is data about the run for hooks and tools: tenant, principal, labels. At
-	// most MaxMeta keys. It is recorded at start, redacted like any text, returned in
+	// most MaxMeta keys. It is recorded at start, its values redacted like any text (keys are names and are not), returned in
 	// Run.Meta and never sent to the model. A process that resumes a run reads
 	// identity from here, not from its own context, so a resume by anyone acts as the
 	// run's owner. Like Messages, it is ignored once the run exists: the journal

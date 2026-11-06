@@ -75,7 +75,9 @@ func (j *Journal) Append(ctx context.Context, runID string, evs []harness.Event)
 type txKey struct{}
 
 // TxFrom returns the transaction of the unit ctx belongs to. An EffectAtomic tool
-// writes through it, so its writes commit with the call's result or not at all.
+// writes through it, so its writes commit with the call's result or not at all. A
+// tool whose statement fails must return the error: the transaction is then
+// aborted, and only an "error" result rolls back to the savepoint before it.
 func TxFrom(ctx context.Context) (*sql.Tx, bool) {
 	tx, ok := ctx.Value(txKey{}).(*sql.Tx)
 	return tx, ok

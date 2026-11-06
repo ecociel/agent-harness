@@ -227,3 +227,27 @@ func TestAChainedRunWithPinnedContextCompactsItsInheritance(t *testing.T) {
 		}
 	}
 }
+
+// Once the inherited part is one summary, the run's own messages are what is left to
+// compact, and they can be.
+func TestAChainedRunWithPinnedContextCompactsItsOwnMessagesLater(t *testing.T) {
+	ctx := context.Background()
+	j := harness.NewMemJournal()
+	first := &harness.Agent{Journal: j, Provider: fake.Script(fake.Text("ok"))}
+	if _, err := first.Run(ctx, harness.Input{RunID: "o/0", Messages: []model.Message{model.User("short")}}); err != nil {
+		t.Fatal(err)
+	}
+	p := fake.Script(fake.Call("look", nil), fake.Call("look", nil), fake.Call("look", nil), fake.Text("done"))
+	a := &harness.Agent{Journal: j, Provider: p, Tools: tool.NewRegistry(look()),
+		Hooks: []harness.Hook{&compact.Compactor{MaxTokens: 50, KeepLast: 1}}}
+	in := harness.Prompt("next")
+	in.RunID, in.After, in.Pinned = "o/1", "o/0", []model.Message{model.User("pinned")}
+	res, err := a.Run(ctx, in)
+	if err != nil || !res.OK() {
+		t.Fatalf("%v %+v", err, res)
+	}
+	last := p.Requests()[len(p.Requests())-1].Messages
+	if !strings.HasPrefix(last[0].Content, "[Summary") || last[1].Content != "pinned" || !strings.HasPrefix(last[2].Content, "[Summary") {
+		t.Fatalf("the last request is %q, %q, %q", last[0].Content, last[1].Content, last[2].Content)
+	}
+}

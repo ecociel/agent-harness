@@ -52,9 +52,10 @@ type Journal interface {
 // AtomicJournal is a Journal that can commit a tool's writes with the record of the
 // call. It is optional, and only a run with an EffectAtomic tool needs it.
 //
-// Atomically opens the store's own unit of work, such as a transaction, calls fn with
+// Atomically opens the store's own unit of work, such as a transaction, calls fn once with
 // a context that carries it, appends the events fn returns in the same unit, and
-// commits. If fn fails, nothing is stored and its error is returned. If a position is
+// commits. A store that retries a unit must not call fn again: fn runs the tool.
+// If fn fails, nothing is stored and its error is returned. If a position is
 // taken, the unit rolls back with the tool's writes and Atomically returns
 // ErrConflict, which the run reports as ErrFenced. The store gives the tool its unit
 // through an accessor of its own, so the harness never sees its type.
@@ -72,7 +73,7 @@ type AtomicJournal interface {
 }
 
 // Renewer is a Journal that can extend a working run's Wake without an event. It
-// is optional. While a model call or a tool runs longer than a third of
+// is optional. While a model call or a tool execution (not a hook) runs longer than a third of
 // Agent.Lease, the worker calls Renew every Lease/3 from its own goroutine, with
 // headSeq the highest Seq it has appended. A store renews only while that is still
 // the run's head, so a fenced worker cannot keep a run alive:

@@ -14,9 +14,10 @@ import (
 // consumer can save them anywhere and rebuild the struct.
 //
 // Turn only moves when a run finishes, so a Send repeated after a crash resumes
-// that run instead of paying for it twice, and a Session survives a restart with
-// no extra machinery. A Runner with no journal of its own, and none from its
-// context, chains through one in memory that lives as long as the Session value.
+// that run instead of paying for it twice, and a Session over a durable Runner
+// survives a restart with no extra machinery. A Runner with no journal of its own,
+// and none from its context, chains through one in memory that lives as long as
+// the Session value, so a Session rebuilt from its fields cannot continue it.
 type Session struct {
 	ID     string
 	Runner Runner

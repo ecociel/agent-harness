@@ -105,9 +105,12 @@ func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
 // callback, and leaves the work to a worker. A signal for no open wait, or for one
 // that expired, is ErrStaleSignal, and a repeat is ignored, as in Run.
 //
-// When what it recorded lets the run move, the last event's Wake is now, so a
-// projection of Wake hands the run to a worker at once. A cancel of a running run
-// takes the next position, so its worker is fenced at its next append. If the
+// When it resolves the waits of a parked run, or records a cancel, the last
+// event's Wake is now, so a projection of Wake hands the run to a worker at once (a
+// sweep takes roots; a child moves when its parent does). A signal to a run that
+// is not parked keeps Wake a lease away, because its worker may still be in a
+// step. A cancel of a running run takes the next position, so its worker is fenced
+// at its next append. If the
 // worker took that position first, Deliver returns ErrFenced and wrote nothing, and
 // a repeat is safe.
 func (a *Agent) Deliver(ctx context.Context, in Input) (*Run, error) {
@@ -133,7 +136,9 @@ func (a *Agent) Deliver(ctx context.Context, in Input) (*Run, error) {
 	if in.Cancel != "" && r.State != StateClosing {
 		evs = append(evs, Event{Kind: KindRunStopping, Stop: StopCancelled, Text: in.Cancel})
 	}
-	m.idle = true
+	// A worker may still be inside a step of a run that was not parked. A signal
+	// must not hand that run to a second worker, and a cancel must.
+	m.idle = r.State == StateSuspended || in.Cancel != ""
 	if err := m.record(ctx, evs...); err != nil {
 		return nil, err
 	}
@@ -1090,6 +1095,9 @@ func (m *machine) executeAtomic(ctx context.Context, c Call) error {
 	)
 	stop := m.renewing(ctx)
 	err := m.journal.(AtomicJournal).Atomically(ctx, v.ID, func(ctx context.Context) ([]Event, error) {
+		if locked {
+			return nil, errors.New("harness: Atomically called fn twice")
+		}
 		ev, err := m.invoke1(ctx, v, c)
 		switch {
 		case err != nil && !isStop(err):

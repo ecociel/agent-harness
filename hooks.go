@@ -271,7 +271,7 @@ type Decision struct {
 	Wait   *Wait      `json:"-"` // moved onto Event.Waits when recorded
 	// Tags are facts about the decision that a later reader of the journal needs
 	// without the hook: a risk class, a reason code. They are recorded on tool.gated,
-	// redacted like any text, and never shown to the model.
+	// their values redacted like any text, and never shown to the model.
 	Tags map[string]string `json:"tags,omitempty"`
 }
 
