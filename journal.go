@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+
+	"github.com/ecociel/agent-harness/model"
 )
 
 // Journal is the one durable thing: an append-only log of events per run. It is
@@ -64,6 +66,54 @@ type LineageReader interface {
 	Lineage(ctx context.Context, runID string) (Lineage, error)
 }
 
+// HistoryReader is a Journal that can answer for a finished run's final history
+// without its caller walking the run's After chain one Load at a time. It is
+// optional: without it, Prior folds each predecessor in turn. History returns what
+// Prior would, and ErrNoSuchRun for a run that is unknown or not finished.
+type HistoryReader interface {
+	History(ctx context.Context, runID string) ([]model.Message, error)
+}
+
+// Prior returns the final history of a finished run: what a run started with After
+// set to runID inherits. It never holds that run's Pinned context. A run that is
+// unknown or not finished is ErrNoSuchRun.
+func Prior(ctx context.Context, j Journal, runID string) ([]model.Message, error) {
+	if h, ok := j.(HistoryReader); ok {
+		return h.History(ctx, runID)
+	}
+	return prior(ctx, j, runID, map[string]bool{})
+}
+
+// prior walks the chain through Load. A chain that returns to a run it passed can
+// only come from a damaged journal.
+func prior(ctx context.Context, j Journal, runID string, seen map[string]bool) ([]model.Message, error) {
+	if seen[runID] {
+		return nil, fmt.Errorf("%w: the history of %s leads back to it", ErrIllegalTransition, runID)
+	}
+	seen[runID] = true
+	evs, err := j.Load(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if len(evs) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoSuchRun, runID)
+	}
+	var base []model.Message
+	if after := evs[0].After; after != "" {
+		if base, err = prior(ctx, j, after, seen); err != nil {
+			return nil, err
+		}
+	}
+	r, err := FoldOn(base, evs)
+	switch {
+	case err != nil:
+		return nil, err
+	case !r.State.Terminal():
+		return nil, fmt.Errorf("%w: %s has not finished", ErrNoSuchRun, runID)
+	}
+	return append([]model.Message{}, r.Messages...), nil
+}
+
 // lineage asks j for one run, through Load if j has no faster way.
 func lineage(ctx context.Context, j Journal, runID string) (Lineage, error) {
 	if r, ok := j.(LineageReader); ok {
@@ -98,7 +148,8 @@ var (
 	// names no wait of this run or arrives after the wait expired.
 	ErrStaleSignal = errors.New("harness: signal does not match an open wait")
 	// ErrNoSuchRun is what Run returns, writing nothing, when asked to continue a
-	// run that has no journal and was given no Messages to start from.
+	// run that has no journal and was given no Messages to start from, or to start
+	// one whose After names no finished run.
 	ErrNoSuchRun = errors.New("harness: no such run")
 	// ErrNotDurable ends a run that must suspend but has no Journal to resume
 	// from.

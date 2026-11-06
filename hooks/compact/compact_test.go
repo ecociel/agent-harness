@@ -201,3 +201,29 @@ func TestAFullContextTakesAtLeastHalf(t *testing.T) {
 		t.Fatalf("%v %+v", err, res)
 	}
 }
+
+// A run that continues a conversation and carries pinned context compacts only what
+// it inherited, because an edit across the pinned context fails the run.
+func TestAChainedRunWithPinnedContextCompactsItsInheritance(t *testing.T) {
+	ctx := context.Background()
+	j := harness.NewMemJournal()
+	first := &harness.Agent{Journal: j, Provider: fake.Script(fake.Text("ok"))}
+	in := harness.Input{RunID: "c/0", Messages: longHistory()}
+	if _, err := first.Run(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	p := fake.Script(fake.Call("look", nil), fake.Call("look", nil), fake.Text("done"))
+	a := &harness.Agent{Journal: j, Provider: p, Tools: tool.NewRegistry(look()),
+		Hooks: []harness.Hook{&compact.Compactor{MaxTokens: 50, KeepLast: 1}}}
+	in = harness.Prompt(strings.Repeat("next ", 100))
+	in.RunID, in.After, in.Pinned = "c/1", "c/0", []model.Message{model.User("pinned")}
+	res, err := a.Run(ctx, in)
+	if err != nil || !res.OK() {
+		t.Fatalf("%v %+v", err, res)
+	}
+	for i, req := range p.Requests() {
+		if sent := req.Messages; !strings.HasPrefix(sent[0].Content, "[Summary") || sent[1].Content != "pinned" {
+			t.Fatalf("request %d starts %q, %q", i, sent[0].Content, sent[1].Content)
+		}
+	}
+}

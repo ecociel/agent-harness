@@ -90,7 +90,7 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 | `Journal` | `Append` and `Load`. The unique index is both the ownership fence and the outbox. |
 | `Run` | The fold. No mutex, no `Agent` pointer, no scratch map. Hooks get it by value, as a shallow copy (see Agreed decisions not yet built). It replaces `Result`. |
 | `Composite` | A run whose work is to run others. Every pattern is one. It has a body and no model. |
-| `Input` | `RunID`, `Messages`, `Signals`, `Cancel`. |
+| `Input` | `RunID`, `Messages`, `After`, `Pinned`, `Meta`, `Signals`, `Cancel`. `After` chains a run to a finished one, `Pinned` is sent on every request of this run only, `Meta` is identity for hooks and tools. All three are recorded on `run.started`. |
 | `Pin` | Recorded at start: instructions, model, limits, schema, tool fingerprints. Wiring stays live. |
 | `Wait`, `Signal` | What a suspended run needs, and the answer. |
 | `Edit` | The only durable way to change history. It stamps `Source` for provenance. |
@@ -207,7 +207,7 @@ A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `Check
 | 13 | Timeouts, shutdown | `Spec.Timeout`, `WithDrain`, `ErrDrained`, tree-wide `Input.Cancel`, the fence | Deadlines, when to call `Run` |
 | 14 | Tool execution | Batch order, adjacent reads in parallel, single writer, `closeBatch` | Tools |
 | 15 | Multi-agent | `Composite`, derived child IDs, finished children answer from their journals, wait forwarding | Which patterns, `ChildTool` on a tool that starts runs |
-| 16 | Sessions | A run is workflow state. `Session{ID, Turn, History}` is conversation only | Where to save those fields |
+| 16 | Sessions | A conversation is a chain of runs (`Input.After`, `Prior`, `FoldOn`). `Session{ID, Turn}` names the next one | Where to save those fields, a `HistoryReader` for long chains |
 | 17 | Evaluation | `Fold` needs no provider, tool or hook. A what-if copies an event prefix | Eval suites |
 | 18 | Versioning | `Pin`, `Drift`, calls to a changed tool denied and replanned | Migrations in `Journal.Load` |
 | 19 | Operability | `Fold` exposes `State`, `Waits`, `Updated`, `Claims`, `Class`. `Wake` for sweeps | Dashboards, the sweep |
@@ -301,6 +301,10 @@ Each of these was left on purpose.
 - **Metrics can miss the last event before a crash.** They are sinks, so nothing counts twice, and the journal is the source to reconcile a total from.
 - **A retry after a cut stream repeats text to sinks.** Deltas already streamed stay streamed, so a live UI shows the partial reply and then the whole one. By reading the code.
 - **The Anthropic adapter stays on API version `2023-06-01`, with a default `max_tokens` of 4096.** Thinking counts against that limit, so set `MaxTokens` on current models. Version `2026-10-21` refuses `temperature` on every model, so moving to it is a separate change.
+- **A chained run reads its whole chain at every `Run`.** Without a `HistoryReader`, `Prior` loads and folds each predecessor, so a conversation of n turns costs O(n) reads per step. A store that keeps many turns implements `HistoryReader`. A wrapper hides it like `Lineage`.
+- **An edit cannot cross the pinned context.** A `Context` edit over both inherited and own messages fails the run when `Pinned` is set, so `hooks/compact` summarises only the inherited part then.
+- **A composite's body sees the inherited history but not `Pinned`.** A pattern passes `Messages` to its children, and `Pinned` stays with the composite's run.
+- **A `Session` over a runner with no journal chains in memory.** The journal lives in the `Session` value, so a restart forgets the conversation, and such a run now parks on a wait instead of failing with `ErrNotDurable`.
 - **A wrapper can hide the fast path.** A journal wrapped for tracing or fault injection has no `Lineage` unless the wrapper forwards it. Runs then fall back to `Load`, which is correct and slower. Nothing reports the fallback.
 
 ## Tradeoffs accepted

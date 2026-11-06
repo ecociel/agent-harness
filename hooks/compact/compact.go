@@ -56,7 +56,10 @@ func (c *Compactor) Context(ctx context.Context, r harness.Run) (harness.Edit, e
 	if full {
 		cut = max(cut, len(r.Messages)/2) // the estimate was wrong, so take at least half
 	}
-	for cut > 0 && r.Messages[cut].Role == model.RoleTool {
+	if len(r.Pinned) > 0 && r.Inherited > 0 && cut > r.Inherited {
+		cut = r.Inherited // an edit may not cross the pinned context
+	}
+	for cut > 0 && cut < len(r.Messages) && r.Messages[cut].Role == model.RoleTool {
 		cut--
 	}
 	if cut < 2 {

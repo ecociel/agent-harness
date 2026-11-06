@@ -46,8 +46,15 @@ type Input struct {
 	RunID string
 	// Messages starts the run. They are ignored once the run exists.
 	Messages []model.Message
+	// After names a finished run of the same journal whose final history this run
+	// continues. That history comes before Messages in every request and in
+	// Run.Messages without being copied: run.started records only the name, so a
+	// conversation is a chain of runs and storage grows with what is new. Like
+	// Messages, it is ignored once the run exists. A run whose After names no
+	// finished run is ErrNoSuchRun, and nothing is written.
+	After string
 	// Pinned is context the model sees on every request of this run, after the
-	// history and before this run's own messages, and that no other run inherits: a
+	// inherited history and before this run's own messages, and that no other run inherits: a
 	// snapshot, retrieved memory, a reminder. It is recorded at start, so a resume
 	// sends the same request, and it is redacted like any text. A Context hook cannot
 	// edit it. Like Messages, it is ignored once the run exists.

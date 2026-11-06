@@ -35,6 +35,9 @@ Because the next step is derived from the log, a turn survives process restarts 
 | `AskApproval` → `errAwaiting`, `Wait` | `suspended`: the run parks with `Run.Waits`, and any process resumes it with a `Signal` |
 | `Refusal` | `harness.Stop(StopGuardrail \| StopPolicy, detail)` → `stopped` |
 | limits | `hooks/budget.Limits` (+ `Agent.MaxTurns`) |
+| a conversation's turns | a chain of runs, `Input.After` naming the previous turn; `HistoryReader` over the conversation |
+| tenant and principal on the turn row | `Input.Meta`, recorded on `run.started` and read from `Run.Meta` on every resume |
+| subject snapshot and memory in the prompt | `Input.Pinned`, sent on every request of the turn and never inherited |
 
 ## Types
 

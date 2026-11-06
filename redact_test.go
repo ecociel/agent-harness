@@ -54,7 +54,7 @@ func fill(v reflect.Value, path string, visited *[]string) {
 // identifiers lists the strings a redactor deliberately does not see: run and
 // call identity, tool and model names, and hook names. A new string field fails
 // this test until someone decides which side it is on.
-var identifiers = regexp.MustCompile(`\.(RunID|RootRun|ParentRun|Agent|Hook|Tool|Offered\[\]|Name|ID|ToolCallID|Source|Target|Key|Run|Kind|Wait|By|Model|Outcome)$|\.Tools(\[\]|\{\})$|\.Decision\.Wait\.`)
+var identifiers = regexp.MustCompile(`\.(RunID|RootRun|ParentRun|Agent|Hook|Tool|Offered\[\]|Name|ID|ToolCallID|Source|Target|Key|Run|Kind|Wait|By|Model|Outcome|After)$|\.Tools(\[\]|\{\})$|\.Decision\.Wait\.`)
 
 func TestRedactionCoversEveryString(t *testing.T) {
 	var ev Event

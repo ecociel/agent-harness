@@ -71,6 +71,7 @@ type Event struct {
 
 	Pin      *Pin              `json:"pin,omitempty"`      // run.started
 	Messages []model.Message   `json:"messages,omitempty"` // run.started
+	After    string            `json:"after,omitempty"`    // run.started
 	Pinned   []model.Message   `json:"pinned,omitempty"`   // run.started
 	Meta     map[string]string `json:"meta,omitempty"`     // run.started
 	Drift    *Drift            `json:"drift,omitempty"`    // run.claimed

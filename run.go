@@ -60,30 +60,15 @@ func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
 	if a.Provider == nil && a.composite == nil {
 		return nil, errors.New("harness: agent has no Provider")
 	}
-	m := &machine{a: a, hooks: indexHooks(a.Hooks), journal: a.Journal, durable: a.Journal != nil}
-	if inherited, ok := ctx.Value(keyRedactors).([]Redactor); ok {
-		m.hooks.redact = slices.Concat(inherited, m.hooks.redact)
-	}
-	if m.journal == nil {
-		if j, ok := ctx.Value(keyJournal).(Journal); ok {
-			m.journal, m.durable = j, true
-		} else {
-			m.journal = NewMemJournal()
-		}
-	}
+	m := a.machine(ctx)
 	id := in.RunID
 	if id == "" {
 		id = newRunID(a.Name)
 	}
-	evs, err := m.journal.Load(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("harness: load %s: %w: %w", id, ErrDrained, err)
+	if err := m.load(ctx, id, in); err != nil {
+		return nil, err
 	}
-	r, err := Fold(evs)
-	if err != nil {
-		return nil, fmt.Errorf("harness: fold %s: %w", id, err)
-	}
-	m.run = *r
+	var err error
 	switch {
 	case m.run.State != StateStart:
 		err = m.attach(ctx, in)
@@ -101,6 +86,64 @@ func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
 	return m.loop(ctx)
 }
 
+// machine wires a for one call: its hooks, the redactors it inherits, and the
+// journal it runs on.
+func (a *Agent) machine(ctx context.Context) *machine {
+	m := &machine{a: a, hooks: indexHooks(a.Hooks), journal: a.Journal, durable: a.Journal != nil}
+	if inherited, ok := ctx.Value(keyRedactors).([]Redactor); ok {
+		m.hooks.redact = slices.Concat(inherited, m.hooks.redact)
+	}
+	if m.journal == nil {
+		if j, ok := ctx.Value(keyJournal).(Journal); ok {
+			m.journal, m.durable = j, true
+		} else {
+			m.journal = NewMemJournal()
+		}
+	}
+	return m
+}
+
+// load folds the run named id from the journal, on the history it inherits.
+func (m *machine) load(ctx context.Context, id string, in Input) error {
+	evs, err := m.journal.Load(ctx, id)
+	if err != nil {
+		return fmt.Errorf("harness: load %s: %w: %w", id, ErrDrained, err)
+	}
+	base, err := m.base(ctx, evs, in)
+	if err != nil {
+		return err
+	}
+	r, err := FoldOn(base, evs)
+	if err != nil {
+		return fmt.Errorf("harness: fold %s: %w", id, err)
+	}
+	m.run = *r
+	return nil
+}
+
+// base is the history a chained run inherits: the journal's After for a run that
+// exists, the input's for one about to start.
+func (m *machine) base(ctx context.Context, evs []Event, in Input) ([]model.Message, error) {
+	after := in.After
+	switch {
+	case len(evs) > 0:
+		after = evs[0].After
+	case len(in.Messages) == 0:
+		return nil, nil // nothing will start
+	}
+	if after == "" {
+		return nil, nil
+	}
+	base, err := Prior(ctx, m.journal, after)
+	switch {
+	case errors.Is(err, ErrNoSuchRun) && len(evs) == 0:
+		return nil, err
+	case err != nil:
+		return nil, fmt.Errorf("harness: history of %s: %w: %w", after, ErrDrained, err)
+	}
+	return base, nil
+}
+
 // start records the run's identity, pin and input before anything else happens.
 func (m *machine) start(ctx context.Context, id string, in Input) error {
 	root, meta := id, in.Meta
@@ -115,7 +158,7 @@ func (m *machine) start(ctx context.Context, id string, in Input) error {
 		return fmt.Errorf("harness: Meta of %s has %d keys, at most %d", id, len(meta), MaxMeta)
 	}
 	return m.record(ctx, Event{Kind: KindRunStarted, RunID: id, RootRun: root, ParentRun: ParentRun(ctx),
-		Agent: m.a.Name, Depth: Depth(ctx), Pin: m.a.pin(), Messages: in.Messages, Pinned: in.Pinned, Meta: meta})
+		Agent: m.a.Name, Depth: Depth(ctx), Pin: m.a.pin(), Messages: in.Messages, After: in.After, Pinned: in.Pinned, Meta: meta})
 }
 
 func (a *Agent) pin() *Pin {
@@ -578,7 +621,7 @@ func (m *machine) compose(ctx context.Context) error {
 		if e.zero() {
 			continue
 		}
-		if err := checkEdit(m.run.Messages, e); err != nil {
+		if err := checkEdit(&m.run, e); err != nil {
 			return m.fail(ctx, fmt.Errorf("hook %s: %w", h.Name(), err))
 		}
 		if err := m.record(ctx, Event{Kind: KindHistoryEdited, Hook: h.Name(), Edit: &e}); err != nil {
@@ -605,9 +648,13 @@ func (m *machine) compose(ctx context.Context) error {
 }
 
 // checkEdit validates hook output at the boundary, so the fold can trust it.
-func checkEdit(msgs []model.Message, e Edit) error {
+func checkEdit(r *Run, e Edit) error {
+	msgs := r.Messages
 	if e.From < 0 || e.To < e.From || e.To > len(msgs) {
 		return fmt.Errorf("edit range [%d:%d] outside %d messages", e.From, e.To, len(msgs))
+	}
+	if len(r.Pinned) > 0 && e.From < r.Inherited && e.To > r.Inherited {
+		return fmt.Errorf("edit range [%d:%d] crosses the pinned context at %d", e.From, e.To, r.Inherited)
 	}
 	if !balanced(slices.Concat(msgs[:e.From:e.From], e.With, msgs[e.To:])) {
 		return errors.New("edit separates a tool call from its result")
@@ -644,8 +691,9 @@ func (m *machine) request() model.Request {
 	if r.Pin.Instructions != "" {
 		msgs = append(msgs, model.System(r.Pin.Instructions))
 	}
+	msgs = append(msgs, r.Messages[:r.Inherited]...)
 	msgs = append(msgs, r.Pinned...)
-	msgs = append(msgs, r.Messages...)
+	msgs = append(msgs, r.Messages[r.Inherited:]...)
 	var specs []model.ToolSpec
 	for _, s := range m.a.Tools.Specs() {
 		specs = append(specs, s.ModelSpec())

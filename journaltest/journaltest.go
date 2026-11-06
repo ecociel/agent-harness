@@ -58,6 +58,7 @@ var checks = []check{
 	{"CancelStopsARunningChild", cancelStopsARunningChild},
 	{"CancelEndsAParkedBranch", cancelEndsAParkedBranch},
 	{"LineageAgreesWithTheEvents", lineageAgreesWithTheEvents},
+	{"CrashSweepAChain", crashSweepAChain},
 }
 
 func newID(prefix string) string {
@@ -97,6 +98,7 @@ func everyFieldSurvives(t testing.TB, j harness.Journal) {
 		Duration: 1500 * time.Millisecond, Index: 4, Attempt: 5,
 		Pin:      &harness.Pin{Instructions: "be careful", Shape: "parallel: a, b", Model: "m", MaxTurns: 8, Temperature: &temperature},
 		Messages: []model.Message{model.User("hello"), {Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "c", Name: "t", Arguments: json.RawMessage(`{"a":[1,2]}`)}}}},
+		After:    "the run before",
 		Pinned:   []model.Message{model.User("memory")},
 		Meta:     map[string]string{"tenant": "acme", "note": "nul\x00byte"},
 		Edit:     &harness.Edit{From: 1, To: 2, With: []model.Message{model.Assistant("short")}, Source: "compact"},
@@ -545,14 +547,21 @@ func (w *world) agent(name, toolName string) *harness.Agent {
 	return &harness.Agent{Name: name, Provider: w.provider(name, toolName), Tools: tool.NewRegistry(pay)}
 }
 
-// provider decides from the request alone, like a model. Its answer quotes the
-// prompt and the tool's result, so a lost input or result fails the comparison.
+// provider decides from the request alone, like a model, reading what followed the
+// last user message. Its answer quotes the prompt and the tool's result, so a lost
+// input or result fails the comparison.
 func (w *world) provider(agent, toolName string) model.Provider {
 	return model.ProviderFunc(func(_ context.Context, req model.Request) iter.Seq2[model.Event, error] {
 		w.mu.Lock()
 		w.paid++
 		w.mu.Unlock()
-		for _, m := range req.Messages {
+		turn := req.Messages
+		for i, m := range turn {
+			if m.Role == model.RoleUser {
+				turn = req.Messages[i:]
+			}
+		}
+		for _, m := range turn {
 			if m.Role == model.RoleTool {
 				return model.Stream(model.Response{Usage: model.Usage{Input: 10, Output: 1},
 					Text: fmt.Sprintf("%s heard %q and got %q", agent, model.LastUser(req.Messages), m.Content)})
@@ -714,4 +723,100 @@ func (s scenario) check(t testing.TB, base harness.Journal, want, suffix string,
 		t.Errorf("%s: a finished run must answer from its journal: %v %+v", name, err, again)
 	}
 	return unknown
+}
+
+// chain is a conversation of three runs, each continuing the one before. Turn i
+// calls its own once-only tool, so the operator can tell the turns apart.
+type chain struct {
+	w  *world
+	id string
+}
+
+const turns = 3
+
+func (c chain) run(i int) string { return fmt.Sprintf("%s/%d", c.id, i) }
+
+func (c chain) agent(j harness.Journal, i int) harness.Runner {
+	a := c.w.agent("chat", fmt.Sprintf("pay%d", i))
+	a.Journal = j
+	return a
+}
+
+// drive runs every turn to its end, with a fresh process for each call. A turn
+// that finished answers from its journal, so driving again after a crash resumes
+// where the chain stopped.
+func (c chain) drive(j harness.Journal) ([]model.Message, error) {
+	for i := range turns {
+		in := harness.Prompt(fmt.Sprintf("turn %d", i))
+		in.RunID = c.run(i)
+		if i > 0 {
+			in.After = c.run(i - 1)
+		}
+		for step := 0; ; step++ {
+			if step == 12 {
+				return nil, fmt.Errorf("%s did not converge", in.RunID)
+			}
+			res, err := c.agent(j, i).Run(context.Background(), in)
+			if err != nil {
+				return nil, err
+			}
+			if res.State.Terminal() {
+				break
+			}
+			in = harness.Resume(in.RunID, answer(c.w, res.Waits)...)
+		}
+	}
+	return harness.Prior(context.Background(), j, c.run(turns-1))
+}
+
+// crashSweepAChain kills a conversation of chained runs before and after every
+// append of every turn, drives it again, and holds its final history to the
+// uncrashed one's. A journal with a HistoryReader must agree with the folds.
+func crashSweepAChain(t testing.TB, j harness.Journal) {
+	clean := chain{w: newWorld(), id: newID("chain")}
+	counted := kill(j, "", -1, false)
+	want, err := clean.drive(counted)
+	if err != nil {
+		t.Fatalf("uncrashed chain: %v", err)
+	}
+	if n := len(want); n != 4*turns {
+		t.Fatalf("the uncrashed chain holds %d messages", n)
+	}
+	if _, ok := j.(harness.HistoryReader); ok {
+		folded, err := harness.Prior(context.Background(), struct{ harness.Journal }{j}, clean.run(turns-1))
+		if err != nil || !sameMessages(folded, want) {
+			t.Fatalf("History disagrees with the folds: %v", err)
+		}
+	}
+	for i := range turns {
+		for at := 1; at <= counted.n[clean.run(i)]; at++ {
+			for _, after := range []bool{false, true} {
+				c := chain{w: newWorld(), id: newID("chain")}
+				name := fmt.Sprintf("turn %d #%d after=%v", i, at, after)
+				if _, err := c.drive(kill(j, c.run(i), at, after)); !errors.Is(err, harness.ErrDrained) {
+					t.Fatalf("%s: a crash must read as a resumable stop, got %v", name, err)
+				}
+				got, err := c.drive(j)
+				if err != nil {
+					t.Fatalf("%s: restart: %v", name, err)
+				}
+				if !sameMessages(got, want) {
+					g, _ := json.Marshal(got)
+					w, _ := json.Marshal(want)
+					t.Fatalf("%s: the history differs\n got %s\nwant %s", name, g, w)
+				}
+				for k := range turns {
+					if n := c.w.count(fmt.Sprintf("pay%d", k)); n != 1 {
+						t.Fatalf("%s: turn %d's once-only tool ran %d times", name, k, n)
+					}
+				}
+			}
+		}
+	}
+}
+
+func sameMessages(a, b []model.Message) bool {
+	x, _ := json.Marshal(a)
+	y, _ := json.Marshal(b)
+	return bytes.Equal(x, y)
 }
