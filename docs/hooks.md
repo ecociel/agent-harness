@@ -35,6 +35,8 @@ ctx = harness.WithEvents(ctx, metrics.Sink(registry))
 ctx = harness.WithEvents(ctx, logging.Sink(logger, slog.LevelDebug))
 ```
 
+Spans carry structure, timing, tokens and outcomes, and no message text, tool arguments or tool results, so what an exporter sends out is never conversation content by default. `trace.WithContent(trace.ContentFull)` on `trace.SinkWith` or `trace.FromEvents` adds them.
+
 A sink gets each durable event once, after it is journaled, and only what has passed the redactors. It can miss the last event before a crash, so the journal is the source to reconcile a total from.
 
 ## Built in

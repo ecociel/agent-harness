@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/ecociel/agent-harness"
+	"github.com/ecociel/agent-harness/model"
 )
 
 // SpanData is what an Exporter receives once a span has ended.
@@ -64,13 +65,40 @@ func runSpan(run string) string {
 // when each run and wait began, and the calls of the latest model reply per run.
 // Sink and FromEvents both run on it, so the two cannot drift.
 type folder struct {
-	starts map[string]time.Time
-	opened map[string]time.Time
+	content Content
+	starts  map[string]time.Time
+	opened  map[string]time.Time
+	calls   map[string][]model.ToolCall
 }
 
-func newFolder() *folder {
-	return &folder{starts: map[string]time.Time{}, opened: map[string]time.Time{}}
+func newFolder(opts []Option) *folder {
+	var c config
+	for _, o := range opts {
+		o(&c)
+	}
+	return &folder{content: c.content, starts: map[string]time.Time{}, opened: map[string]time.Time{}, calls: map[string][]model.ToolCall{}}
 }
+
+// Content says whether span attributes carry message and argument text. The
+// default, ContentNone, exports structure, timing, tokens and outcomes only: what
+// leaves the process through an exporter is never conversation content unless a
+// consumer opts in. ContentFull adds the model's reply text, tool arguments, tool
+// results, the value a wait was answered with and a failed run's error text.
+type Content int
+
+// The two settings of Content.
+const (
+	ContentNone Content = iota
+	ContentFull
+)
+
+type config struct{ content Content }
+
+// Option configures Sink, SinkWith and FromEvents.
+type Option func(*config)
+
+// WithContent sets whether spans carry content. The default is ContentNone.
+func WithContent(c Content) Option { return func(o *config) { o.content = c } }
 
 // span folds one event in and returns the span it ends, if any.
 func (f *folder) span(e harness.Event) (SpanData, bool) {
@@ -105,11 +133,23 @@ func (f *folder) span(e harness.Event) (SpanData, bool) {
 		if e.Failure != nil {
 			s.Status, s.Error = "error", string(e.Failure.Class)
 		}
+		if e.Kind == harness.KindModelDone && e.Reply != nil {
+			f.calls[e.RunID] = e.Reply.ToolCalls
+			if f.content == ContentFull {
+				s.Attrs["gen_ai.output.text"] = e.Reply.Text
+			}
+		}
 	case harness.KindToolDone:
 		s.SpanID, s.Name = id(8, "tool", e.RunID, e.Turn, e.Index), "execute_tool "+e.Tool
 		s.Attrs = map[string]any{"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": e.Tool, "harness.tool.outcome": e.Outcome}
 		if e.Outcome == "error" {
 			s.Status = "error"
+		}
+		if f.content == ContentFull {
+			s.Attrs["gen_ai.tool.call.result"] = e.Text
+			if calls := f.calls[e.RunID]; e.Index >= 0 && e.Index < len(calls) {
+				s.Attrs["gen_ai.tool.call.arguments"] = string(calls[e.Index].Arguments)
+			}
 		}
 	case harness.KindWaitResolved:
 		if e.Signal == nil {
@@ -122,6 +162,9 @@ func (f *folder) span(e harness.Event) (SpanData, bool) {
 			delete(f.opened, e.Signal.Wait)
 		}
 		s.Attrs = map[string]any{"harness.wait.kind": e.Signal.Kind, "harness.wait.expired": e.Signal.Expired}
+		if f.content == ContentFull {
+			s.Attrs["harness.wait.value"] = e.Signal.Value
+		}
 	case harness.KindRunEnded:
 		if at, ok := f.starts[e.RunID]; ok {
 			s.Start = at
@@ -131,7 +174,10 @@ func (f *folder) span(e harness.Event) (SpanData, bool) {
 		s.Attrs = map[string]any{"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": e.Agent,
 			"harness.run_id": e.RunID, "harness.depth": e.Depth, "harness.stop": e.Outcome}
 		if e.To == harness.StateFailed {
-			s.Status, s.Error = "error", e.Text
+			s.Status, s.Error = "error", e.Outcome
+			if f.content == ContentFull {
+				s.Error = e.Text
+			}
 		}
 	default:
 		return SpanData{}, false
@@ -147,8 +193,8 @@ func (f *folder) span(e harness.Event) (SpanData, bool) {
 // event in events, where the live sink starts it at the process that began it.
 // Tool spans carry their outcome. A wait becomes a span of its own, from the event
 // that opened it to the one that resolved it.
-func FromEvents(events []harness.Event) []SpanData {
-	f := newFolder()
+func FromEvents(events []harness.Event, opts ...Option) []SpanData {
+	f := newFolder(opts)
 	var out []SpanData
 	for _, e := range events {
 		if s, ok := f.span(e); ok {
@@ -161,10 +207,14 @@ func FromEvents(events []harness.Event) []SpanData {
 // Sink returns an event sink that exports a span per run, model attempt, tool call
 // and wait. Pass it to harness.WithEvents. A run span's start is known only to the
 // process that saw it start, so after a resume it starts at the resuming worker.
-func Sink(exporters ...Exporter) harness.EventSink {
+func Sink(exporters ...Exporter) harness.EventSink { return SinkWith(nil, exporters...) }
+
+// SinkWith is Sink with options. Spans carry no message, argument or result text
+// unless opts include WithContent(ContentFull).
+func SinkWith(opts []Option, exporters ...Exporter) harness.EventSink {
 	var (
 		mu sync.Mutex
-		f  = newFolder()
+		f  = newFolder(opts)
 	)
 	return func(e harness.Event) {
 		mu.Lock()

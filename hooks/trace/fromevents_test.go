@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ecociel/agent-harness"
@@ -26,11 +27,11 @@ func ask() tool.Tool {
 
 // record runs a model call, a tool that parks and resumes, and a final answer,
 // observed live by a sink and recorded in a journal.
-func record(t *testing.T) (live []trace.SpanData, events []harness.Event) {
+func record(t *testing.T, opts ...trace.Option) (live []trace.SpanData, events []harness.Event) {
 	t.Helper()
 	mem := &trace.Memory{}
 	j := harness.NewMemJournal()
-	ctx := harness.WithEvents(context.Background(), trace.Sink(mem))
+	ctx := harness.WithEvents(context.Background(), trace.SinkWith(opts, mem))
 	a := &harness.Agent{Name: "lead", Model: "m1", Journal: j,
 		Provider: fake.Script(
 			model.Response{ToolCalls: []model.ToolCall{{ID: "c1", Name: "ask", Arguments: json.RawMessage(`{"q":"secret-arg"}`)}}, Usage: model.Usage{Input: 5, Output: 2}},
@@ -53,18 +54,25 @@ func record(t *testing.T) (live []trace.SpanData, events []harness.Event) {
 }
 
 func TestFromEventsEqualsTheLiveSink(t *testing.T) {
-	live, events := record(t)
-	got := trace.FromEvents(events)
-	if !reflect.DeepEqual(got, live) {
-		t.Fatalf("FromEvents differs from the live sink\n got: %+v\nlive: %+v", got, live)
-	}
-	var names []string
-	for _, s := range got {
-		names = append(names, s.Name)
-	}
-	want := "[chat execute_tool ask wait user execute_tool ask chat invoke_agent lead]"
-	if fmt.Sprint(names) != want {
-		t.Fatalf("spans = %v, want %s", names, want)
+	for name, opts := range map[string][]trace.Option{
+		"content none": nil,
+		"content full": {trace.WithContent(trace.ContentFull)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			live, events := record(t, opts...)
+			got := trace.FromEvents(events, opts...)
+			if !reflect.DeepEqual(got, live) {
+				t.Fatalf("FromEvents differs from the live sink\n got: %+v\nlive: %+v", got, live)
+			}
+			var names []string
+			for _, s := range got {
+				names = append(names, s.Name)
+			}
+			want := "[chat execute_tool ask wait user execute_tool ask chat invoke_agent lead]"
+			if fmt.Sprint(names) != want {
+				t.Fatalf("spans = %v, want %s", names, want)
+			}
+		})
 	}
 }
 
@@ -90,5 +98,44 @@ func TestWaitSpansCarryKindAndToolSpansTheirOutcome(t *testing.T) {
 	}
 	if parked.Attrs["harness.tool.outcome"] != "parked" || finished.Attrs["harness.tool.outcome"] != "ok" {
 		t.Errorf("tool outcomes: %v %v", parked.Attrs, finished.Attrs)
+	}
+}
+
+func dump(spans []trace.SpanData) string {
+	b, _ := json.Marshal(spans)
+	return string(b)
+}
+
+func TestContentStaysOutOfSpansUnlessAsked(t *testing.T) {
+	secrets := []string{"secret-arg", "tool-result-secret", "final-secret-answer", "typed-secret"}
+	_, events := record(t)
+	none := dump(trace.FromEvents(events))
+	for _, s := range secrets {
+		if contains(none, s) {
+			t.Errorf("ContentNone leaked %q: %s", s, none)
+		}
+	}
+	full := trace.FromEvents(events, trace.WithContent(trace.ContentFull))
+	var args, result, reply, value bool
+	for _, s := range full {
+		args = args || s.Attrs["gen_ai.tool.call.arguments"] == `{"q":"secret-arg"}`
+		result = result || s.Attrs["gen_ai.tool.call.result"] == "tool-result-secret"
+		reply = reply || s.Attrs["gen_ai.output.text"] == "final-secret-answer"
+		value = value || s.Attrs["harness.wait.value"] == "typed-secret"
+	}
+	if !args || !result || !reply || !value {
+		t.Errorf("ContentFull missing args=%v result=%v reply=%v value=%v: %s", args, result, reply, value, dump(full))
+	}
+}
+
+func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+func TestAFailedRunsErrorTextIsContent(t *testing.T) {
+	ev := []harness.Event{{Seq: 3, Kind: harness.KindRunEnded, RunID: "r", Agent: "a", To: harness.StateFailed, Outcome: "error", Text: "boom: customer@example.com"}}
+	if got := trace.FromEvents(ev)[0]; got.Status != "error" || got.Error != "error" {
+		t.Errorf("%+v", got)
+	}
+	if got := trace.FromEvents(ev, trace.WithContent(trace.ContentFull))[0]; got.Error != "boom: customer@example.com" {
+		t.Errorf("%+v", got)
 	}
 }
