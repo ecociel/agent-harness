@@ -108,3 +108,23 @@ func TestARuleNameIsNotAReplacementPattern(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestPIIPhone(t *testing.T) {
+	for in, want := range map[string]string{
+		"call +41 79 123 45 67 now":       "call [redacted:phone] now",
+		"call +41791234567 now":           "call [redacted:phone] now",
+		"call 0041 79 123 45 67 now":      "call [redacted:phone] now",
+		"call 079 123 45 67 now":          "call [redacted:phone] now",
+		"call 044 123 45 67 now":          "call [redacted:phone] now",
+		"order 20240131 of 1234567890":    "order 20240131 of 1234567890",
+		"total 1 079 123 45 678 units":    "total 1 079 123 45 678 units",
+		"card 4111 1111 1111 1111 ok":     "card [redacted:card]ok",
+		"iban CH93 0076 2011 6238 5295 7": "iban [redacted:iban]",
+		"ahv 756.1234.5678.97":            "ahv [redacted:ahv]",
+	} {
+		got, _ := guard.Redactor(guard.PII()).Redact(context.Background(), harness.KindToolDone, in)
+		if got != want {
+			t.Errorf("%q: got %q want %q", in, got, want)
+		}
+	}
+}
