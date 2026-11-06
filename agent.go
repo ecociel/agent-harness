@@ -46,6 +46,14 @@ type Input struct {
 	RunID string
 	// Messages starts the run. They are ignored once the run exists.
 	Messages []model.Message
+	// Meta is data about the run for hooks and tools: tenant, principal, labels. At
+	// most MaxMeta keys. It is recorded at start, redacted like any text, returned in
+	// Run.Meta and never sent to the model. A process that resumes a run reads
+	// identity from here, not from its own context, so a resume by anyone acts as the
+	// run's owner. Like Messages, it is ignored once the run exists: the journal
+	// wins. A run started from a tool or a pattern inherits its parent's Meta unless
+	// its Input sets its own.
+	Meta map[string]string
 	// Signals resolve open waits. A repeat of a delivered signal is ignored.
 	Signals []Signal
 	// Cancel, if set, ends the run and the tree below it with StopCancelled, from any

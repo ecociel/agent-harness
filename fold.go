@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -138,9 +139,11 @@ type Run struct {
 	// closes. So every tool call here has a result at each model call and at the
 	// end of the run, and a finished run's Messages can start the next run.
 	Messages []model.Message `json:"messages"`
-	Usage    model.Usage     `json:"usage"`
-	Turn     int             `json:"turns"` // model turns begun
-	Repairs  int             `json:"repairs"`
+	// Meta is Input.Meta as recorded at start.
+	Meta    map[string]string `json:"meta,omitempty"`
+	Usage   model.Usage       `json:"usage"`
+	Turn    int               `json:"turns"` // model turns begun
+	Repairs int               `json:"repairs"`
 	// ModelCalls and ToolCalls count this run only, so a sum over the runs of a tree
 	// counts each call once. LostCalls are model calls a crash or a cancel cut off,
 	// billed or not, so what the provider charged lies between ModelCalls and
@@ -223,6 +226,7 @@ func (r *Run) apply(ev Event) error {
 		r.ID, r.RootRun, r.ParentRun, r.Agent, r.Depth = ev.RunID, ev.RootRun, ev.ParentRun, ev.Agent, ev.Depth
 		r.Pin, r.Started = *ev.Pin, ev.Time
 		r.Messages = slices.Clone(ev.Messages)
+		r.Meta = maps.Clone(ev.Meta)
 		r.State = StateCompose
 		if r.composite() {
 			r.State = StateBody

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"os"
 	"slices"
 	"sync/atomic"
@@ -21,6 +22,8 @@ const (
 	DefaultMaxTurns   = 8
 	DefaultMaxRepairs = 2
 	DefaultLease      = 10 * time.Minute
+	// MaxMeta is how many keys Input.Meta may hold.
+	MaxMeta = 32
 )
 
 // maxInlineBackoff is the longest retry delay a worker sleeps through. A longer
@@ -100,13 +103,19 @@ func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
 
 // start records the run's identity, pin and input before anything else happens.
 func (m *machine) start(ctx context.Context, id string, in Input) error {
-	root := id
+	root, meta := id, in.Meta
 	p, nested := ctx.Value(keyParent).(parentInfo)
 	if nested {
 		root = p.root
+		if meta == nil {
+			meta = p.meta
+		}
+	}
+	if len(meta) > MaxMeta {
+		return fmt.Errorf("harness: Meta of %s has %d keys, at most %d", id, len(meta), MaxMeta)
 	}
 	return m.record(ctx, Event{Kind: KindRunStarted, RunID: id, RootRun: root, ParentRun: ParentRun(ctx),
-		Agent: m.a.Name, Depth: Depth(ctx), Pin: m.a.pin(), Messages: in.Messages})
+		Agent: m.a.Name, Depth: Depth(ctx), Pin: m.a.pin(), Messages: in.Messages, Meta: meta})
 }
 
 func (a *Agent) pin() *Pin {
@@ -538,6 +547,7 @@ func (m *machine) ringTool() ToolFunc {
 func (m *machine) view() Run {
 	v := m.run
 	v.Messages = slices.Clone(v.Messages)
+	v.Meta = maps.Clone(v.Meta)
 	v.Waits = slices.Clone(v.Waits)
 	v.batch = slices.Clone(v.batch)
 	v.Events = v.Events[:len(v.Events):len(v.Events)]
@@ -772,7 +782,7 @@ func (m *machine) body(ctx context.Context) error {
 // nest is the context a run hands to what it starts: a child takes its parent, its
 // journal and its redactors from here.
 func (m *machine) nest(ctx context.Context, v Run) context.Context {
-	ctx = context.WithValue(ctx, keyParent, parentInfo{runID: v.ID, root: v.RootRun, depth: v.Depth})
+	ctx = context.WithValue(ctx, keyParent, parentInfo{runID: v.ID, root: v.RootRun, depth: v.Depth, meta: v.Meta})
 	if m.durable {
 		ctx = context.WithValue(ctx, keyJournal, m.journal)
 	}

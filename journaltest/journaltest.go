@@ -97,6 +97,7 @@ func everyFieldSurvives(t testing.TB, j harness.Journal) {
 		Duration: 1500 * time.Millisecond, Index: 4, Attempt: 5,
 		Pin:      &harness.Pin{Instructions: "be careful", Shape: "parallel: a, b", Model: "m", MaxTurns: 8, Temperature: &temperature},
 		Messages: []model.Message{model.User("hello"), {Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "c", Name: "t", Arguments: json.RawMessage(`{"a":[1,2]}`)}}}},
+		Meta:     map[string]string{"tenant": "acme", "note": "nul\x00byte"},
 		Edit:     &harness.Edit{From: 1, To: 2, With: []model.Message{model.Assistant("short")}, Source: "compact"},
 		Offered:  []string{"t", "u"},
 		Reply:    &model.Response{Text: "answer", Usage: model.Usage{Input: 10, Output: 2}},
