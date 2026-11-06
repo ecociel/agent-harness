@@ -300,3 +300,53 @@ func TestATreeBudgetOverAPatternIsAPlainSum(t *testing.T) {
 		t.Fatalf("the projection holds %d for %d paid calls", got, paid)
 	}
 }
+
+func done(name string, u model.Usage) harness.Event {
+	return harness.Event{Kind: harness.KindModelDone, Model: name, Reply: &model.Response{Usage: u}}
+}
+
+func TestCostIsPricedPerModelWithCachedAndReasoningTokens(t *testing.T) {
+	prices := model.Prices{
+		"big":   {InputPerM: 10_000_000, CachedPerM: 1_000_000, OutputPerM: 40_000_000, ReasoningPerM: 60_000_000},
+		"small": {InputPerM: 1_000_000, CachedPerM: 100_000, OutputPerM: 4_000_000},
+	}
+	b := budget.New(budget.Limits{}).WithPrices(prices)
+	big := model.Usage{Input: 100_000, Cached: 50_000, Output: 10_000, Reasoning: 5_000}
+	small := model.Usage{Input: 1_000_000, Output: 100_000}
+	failed := harness.Event{Kind: harness.KindModelFailed, Model: "small", Failure: &harness.Failure{Usage: model.Usage{Input: 1_000_000}}}
+	r := harness.Run{Usage: big.Add(small).Add(model.Usage{Input: 1_000_000}), ModelCalls: 3,
+		Events: []harness.Event{done("big", big), done("small", small), failed}}
+	// big: 0.5 + 0.05 + 0.2 + 0.3 = 1.05; small: 1.0 + 0.4 = 1.4; failed small: 1.0
+	if got := b.Spent(r).CostUSD; got < 3.4499 || got > 3.4501 {
+		t.Fatalf("cost = %v, want 3.45", got)
+	}
+}
+
+func TestChildrensUsageIsPricedAtTheDefault(t *testing.T) {
+	b := budget.New(budget.Limits{}).WithPrices(model.Prices{"*": {InputPerM: 2_000_000, CachedPerM: 2_000_000, OutputPerM: 2_000_000}})
+	// 1M tokens of the run's usage have no event of its own: they came from children.
+	r := harness.Run{Usage: model.Usage{Input: 1_500_000}, Events: []harness.Event{done("m", model.Usage{Input: 500_000})}}
+	if got := b.Spent(r).CostUSD; got != 3 {
+		t.Fatalf("cost = %v, want 3", got)
+	}
+}
+
+func TestAnUnpricedModelBillsZeroButTheTokensStillCount(t *testing.T) {
+	b := budget.New(budget.Limits{}).WithPrices(model.Prices{"known": {InputPerM: 1_000_000}})
+	r := harness.Run{Usage: used(1_000_000, 0), Events: []harness.Event{done("unknown", used(1_000_000, 0))}}
+	if s := b.Spent(r); s.CostUSD != 0 || s.Usage.Input != 1_000_000 {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestWithPriceStillWorks(t *testing.T) {
+	b := budget.New(budget.Limits{CostUSD: 1}).WithPrice(budget.Price{InputPerM: 0.5, OutputPerM: 2})
+	r := harness.Run{Usage: used(1_000_000, 250_000), Events: []harness.Event{done("any", used(1_000_000, 250_000))}}
+	s := b.Spent(r)
+	if s.CostUSD != 1 {
+		t.Fatalf("cost = %v, want 1", s.CostUSD)
+	}
+	if why, ok := b.Exceeded(s); !ok || !strings.Contains(why, "cost limit") {
+		t.Fatalf("%q %v", why, ok)
+	}
+}
