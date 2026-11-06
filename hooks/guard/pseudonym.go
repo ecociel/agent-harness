@@ -87,7 +87,7 @@ func (p Pseudonymizer) engine() engine {
 	return engine{rules: p.Rules, replace: func(ctx context.Context, r Rule, match string) (string, error) {
 		tok := token(p.Key, r.Name, match)
 		if err := p.Vault.Put(ctx, tok, match); err != nil {
-			return "", errors.New("guard: the vault failed")
+			return "", errVault
 		}
 		return tok, nil
 	}}
