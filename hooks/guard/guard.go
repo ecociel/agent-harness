@@ -36,10 +36,12 @@ type Rule struct {
 func R(name, pattern string) Rule { return Rule{Name: name, Pattern: regexp.MustCompile(pattern)} }
 
 // PII returns rules for common personal data: e-mail addresses, payment card
-// numbers, IBANs, Swiss AHV numbers and Swiss phone numbers.
+// numbers, IBANs, Swiss AHV numbers and Swiss phone numbers. Every rule has an
+// upper bound on a match (an e-mail local part up to 64 characters, a domain up to
+// 255), so the set works with Stream and a Pseudonymizer window.
 func PII() []Rule {
 	return []Rule{
-		R("email", `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`),
+		R("email", `[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}`),
 		// IBAN and AHV come before card so their digits are not taken for a
 		// card number (rules are applied in order).
 		R("iban", `\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b`),
@@ -52,12 +54,15 @@ func PII() []Rule {
 }
 
 // Secrets returns rules for credentials that must never reach a model or a
-// user: API keys, private keys and password assignments.
+// user: API keys, private keys and password assignments. Every rule has an upper
+// bound on a match (a key or password value up to 256 characters), so the set works
+// with Stream. The private key rule matches the BEGIN header line only, because a
+// key body has no sensible bound; the header is what marks the block.
 func Secrets() []Rule {
 	return []Rule{
-		R("api_key", `\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}\b`),
-		R("private_key", `-----BEGIN [A-Z ]*PRIVATE KEY-----`),
-		R("password", `(?i)\b(?:password|passwort|pwd)\s*(?:[:=]|\bis\b)\s*\S+`),
+		R("api_key", `\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,256}\b`),
+		R("private_key", `-----BEGIN [A-Z ]{0,32}PRIVATE KEY-----`),
+		R("password", `(?i)\b(?:password|passwort|pwd)\s{0,16}(?:[:=]|\bis\b)\s{0,16}\S{1,256}`),
 	}
 }
 

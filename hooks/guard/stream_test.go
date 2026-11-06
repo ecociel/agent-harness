@@ -148,10 +148,9 @@ func TestStreamRejectsARuleThatCanExceedTheWindow(t *testing.T) {
 		rules  []guard.Rule
 		window int
 	}{
-		"unbounded":      {guard.PII()[:1], 64},
+		"unbounded":      {[]guard.Rule{guard.R("x", `a+`)}, 64},
 		"longer than it": {[]guard.Rule{mail}, 47},
-		"no window":      {[]guard.Rule{mail}, 0},
-		"password":       {guard.Secrets(), 1000},
+		"negative":       {[]guard.Rule{mail}, -1},
 	} {
 		if _, err := guard.Stream(c.rules, c.window); err == nil {
 			t.Errorf("%s: no error", name)
@@ -167,5 +166,22 @@ func TestStreamAsAPlainRedactor(t *testing.T) {
 	got, err := red.Redact(context.Background(), harness.KindToolDone, "x a@b.ch y")
 	if err != nil || got != "x [redacted:email] y" {
 		t.Fatal(got, err)
+	}
+}
+
+func TestEveryShippedRuleIsBounded(t *testing.T) {
+	for name, rules := range map[string][]guard.Rule{"PII": guard.PII(), "Secrets": guard.Secrets()} {
+		if _, err := guard.Stream(rules, 0); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+		for _, r := range rules {
+			if _, err := guard.Stream([]guard.Rule{r}, 0); err != nil {
+				t.Errorf("%s/%s: %v", name, r.Name, err)
+			}
+		}
+	}
+	p := guard.Pseudonymizer{Rules: guard.PII(), Key: []byte("k"), Vault: guard.NewMemVault()}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }

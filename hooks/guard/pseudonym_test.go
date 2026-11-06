@@ -15,6 +15,8 @@ import (
 	"github.com/ecociel/agent-harness/provider/fake"
 )
 
+var unbounded = []guard.Rule{guard.R("email", `[a-z0-9._]+@[a-z0-9.]+\.[a-z]{2,}`)}
+
 const addr = "anna.meier@example.ch"
 
 var tokenRe = regexp.MustCompile(`⟦email:[0-9a-f]{12}⟧`)
@@ -139,12 +141,12 @@ func TestPseudonymizerStreamsLive(t *testing.T) {
 
 func TestPseudonymizerWithoutAWindowHoldsTheReplyForUnboundedRules(t *testing.T) {
 	v := guard.NewMemVault()
-	p := guard.Pseudonymizer{Rules: guard.PII()[:1], Key: []byte("k"), Vault: v}
+	p := guard.Pseudonymizer{Rules: unbounded, Key: []byte("k"), Vault: v}
 	_, out := deltas(t, chunked("a "+addr+" b", 2), p)
 	if !tokenRe.MatchString(out) || strings.Contains(out, "anna") {
 		t.Fatal(out)
 	}
-	if err := (guard.Pseudonymizer{Rules: guard.PII()[:1], Key: []byte("k"), Vault: v, Window: 8}).Validate(); err == nil {
+	if err := (guard.Pseudonymizer{Rules: unbounded, Key: []byte("k"), Vault: v, Window: 8}).Validate(); err == nil {
 		t.Fatal("an unbounded rule with a window was accepted")
 	}
 }

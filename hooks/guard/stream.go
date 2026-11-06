@@ -160,6 +160,9 @@ func newStreamer(e engine, window int) (streamer, error) {
 	if n < 0 {
 		return streamer{}, fmt.Errorf("guard: a rule has no upper bound on a match; bound it with {m,n} so a window can hold it")
 	}
+	if window == 0 {
+		window = max(n, 1)
+	}
 	if window < max(n, 1) {
 		return streamer{}, fmt.Errorf("guard: window %d is smaller than the longest match %d", window, n)
 	}
@@ -363,7 +366,8 @@ func (r ruleRedactor) Redact(ctx context.Context, _ harness.Kind, text string) (
 //
 // A match is replaced by "[redacted:<name>]", as Redactor does. A rule whose
 // matches can exceed window, or have no upper bound, is a configuration error
-// reported here and not a leak at run time.
+// reported here and not a leak at run time. A window of zero means the longest
+// match any rule can make.
 func Stream(rules []Rule, window int) (harness.Redactor, error) {
 	e := engine{rules: rules, replace: func(_ context.Context, r Rule, _ string) (string, error) {
 		return "[redacted:" + r.Name + "]", nil
