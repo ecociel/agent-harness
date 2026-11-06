@@ -48,7 +48,11 @@ func fill(v reflect.Value, path string, visited *[]string) {
 // identifiers lists the strings a redactor deliberately does not see: run and
 // call identity, tool and model names, and hook names. A new string field fails
 // this test until someone decides which side it is on.
-var identifiers = regexp.MustCompile(`\.(RunID|RootRun|ParentRun|Agent|Hook|Tool|Offered\[\]|Name|ID|ToolCallID|Source|Target|Key|Run|Kind|Wait|By|Model|Outcome)$|\.Tools\[\]$|\.Decision\.Wait\.`)
+var identifiers = regexp.MustCompile(`\.(RunID|RootRun|ParentRun|Agent|Hook|Tool|Offered\[\]|Name|ID|ToolCallID|Source|Target|Key|Run|Kind|Wait|By|Model|Outcome|Ref|MediaType)$|\.Tools\[\]$|\.Decision\.Wait\.`)
+
+// consumerText overrides identifiers: a part's name is a file name the consumer
+// chose, so it is text, not identity.
+var consumerText = regexp.MustCompile(`\.Parts\[\]\.Name$`)
 
 func TestRedactionCoversEveryString(t *testing.T) {
 	var ev Event
@@ -62,7 +66,7 @@ func TestRedactionCoversEveryString(t *testing.T) {
 	})
 	got := reflect.ValueOf(ev)
 	for _, p := range paths {
-		if identifiers.MatchString(p) {
+		if identifiers.MatchString(p) && !consumerText.MatchString(p) {
 			continue
 		}
 		if s := lookup(got, strings.TrimPrefix(p, "Event.")); strings.Contains(s, secret) {
