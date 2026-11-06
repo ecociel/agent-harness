@@ -108,7 +108,7 @@ The state machine is in [docs/state-machine.md](docs/state-machine.md), and the 
 | `CheckOutput` | on the candidate answer, recorded | output guardrails, verifiers |
 | `AfterRun` | when the outcome is decided, at least once | saving memory |
 
-Built in: `guard`, `budget`, `approval`, `compact`, `offload`, `retry`, `profile`, `trajectory`, and the sinks `trace`, `metrics` and `logging`. See [docs/hooks.md](docs/hooks.md).
+Built in: `guard`, `budget`, `approval`, `compact`, `offload`, `retry`, `profile`, `trajectory`, and the sinks `trace`, `metrics` and `logging`. Trace spans leave out conversation content unless asked. See [docs/hooks.md](docs/hooks.md).
 
 ## Multi-agent patterns
 

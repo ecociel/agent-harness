@@ -35,6 +35,8 @@ ctx = harness.WithEvents(ctx, metrics.Sink(registry))
 ctx = harness.WithEvents(ctx, logging.Sink(logger, slog.LevelDebug))
 ```
 
+Spans carry structure, timing, tokens and outcomes, and no message text, tool arguments or tool results, so what an exporter sends out is never conversation content by default. `trace.WithContent(trace.ContentFull)` on `trace.SinkWith` or `trace.FromEvents` adds them.
+
 A sink gets each durable event once, after it is journaled, and only what has passed the redactors. It can miss the last event before a crash, so the journal is the source to reconcile a total from.
 
 ## Built in
@@ -42,15 +44,15 @@ A sink gets each durable event once, after it is journaled, and only what has pa
 | Package | Points | Concern |
 |---|---|---|
 | `hooks/guard` | `BeforeRun`, `BeforeTool`, `CheckOutput` | deny inputs, veto tools, revise or block outputs. `guard.Redactor` is the rule-based `Redact` ring. `Guard.Redact` only rewrites the final answer |
-| `hooks/budget` | `BeforeRun`, `BeforeModel` | tokens, cost, model and tool calls, wall time, loop detection, read from the `Run`. `WithPool` applies limits to a tree or tenant, from the consumer's own projection |
+| `hooks/budget` | `BeforeRun`, `BeforeModel` | tokens, cost, model and tool calls, wall time, loop detection, read from the `Run`. `WithPrices(model.Prices)` prices each model's calls, cached and reasoning tokens included, and a model with no entry bills zero. `WithPool` applies limits to a tree or tenant, from the consumer's own projection |
 | `hooks/approval` | `BeforeTool` | scopes, a risk threshold, an `Approver` or a durable wait (`Ask`), audit records |
 | `hooks/compact` | `Context`, `Recover` | summarise old turns as a recorded edit, and answer a full context |
 | `hooks/offload` | `WrapTool` | move large results to a `Store`, with a `read_offloaded` tool. A durable run needs a durable `Store` |
 | `hooks/retry` | `Recover` | backoff and retries as recorded decisions, then one try on `FallbackModel`. `retry.Fallback` routes that name to another provider |
 | `hooks/profile` | `BeforeModel` | per-model instructions, hidden tools, output caps |
 | `hooks/trajectory` | `AfterRun` | full runs for evals. `trajectory.From` reads one from any `Run` |
-| `hooks/trace` | sink | OpenTelemetry-shaped spans with stable IDs |
-| `hooks/metrics` | sink | counters and latency histograms behind a `Recorder` |
+| `hooks/trace` | sink | OpenTelemetry-shaped spans with stable IDs for runs, model calls, tool calls and waits. `trace.FromEvents` builds the same spans offline from any journal |
+| `hooks/metrics` | sink | counters and latency histograms behind a `Recorder`. Token counters carry `input`, `output`, `cached` and `reasoning` kinds |
 | `hooks/logging` | sink | `log/slog` lines |
 
 ## Writing one
