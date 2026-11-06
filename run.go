@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +43,12 @@ type machine struct {
 	idle    bool        // Deliver: nobody here works on the run, so a run that can move is due now
 	err     error       // the original error of a failed run, for errors.Is
 	sealed  atomic.Bool // a redactor failed: no more text leaves this worker
+
+	// appending orders this worker's appends with its renewals, so a renewal never
+	// names a head this worker is replacing.
+	appending sync.Mutex
+	head      atomic.Int64 // the highest Seq this worker appended
+	fenced    atomic.Bool  // a renewal found the head moved
 }
 
 // Run advances the run named by in as far as it can go and returns where it
@@ -166,6 +173,7 @@ func (m *machine) load(ctx context.Context, id string, in Input) error {
 		return fmt.Errorf("harness: fold %s: %w", id, err)
 	}
 	m.run = *r
+	m.head.Store(r.seq)
 	return nil
 }
 
@@ -413,11 +421,54 @@ func (m *machine) record(ctx context.Context, evs ...Event) error {
 	if err != nil {
 		return m.unprepared(ctx, err)
 	}
-	if err := m.journal.Append(context.WithoutCancel(ctx), probe.ID, stored); err != nil {
+	m.appending.Lock()
+	err = ErrFenced
+	if !m.fenced.Load() {
+		err = m.journal.Append(context.WithoutCancel(ctx), probe.ID, stored)
+	}
+	if err == nil {
+		m.head.Store(probe.seq)
+	}
+	m.appending.Unlock()
+	if err != nil {
 		return m.appendFailed(probe.ID, err)
 	}
 	m.adopt(ctx, probe, stored)
 	return nil
+}
+
+// renewing extends the lease every Lease/3 while a step runs, if the journal can.
+// The returned function stops it.
+func (m *machine) renewing(ctx context.Context) (stop func()) {
+	r, ok := m.journal.(Renewer)
+	if !ok || !m.durable {
+		return func() {}
+	}
+	lease := cmp.Or(m.a.Lease, DefaultLease)
+	id, done, stopped := m.run.ID, make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		tick := time.NewTicker(lease / 3)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+			}
+			m.appending.Lock()
+			err := r.Renew(context.WithoutCancel(ctx), id, m.head.Load(), time.Now().Add(lease))
+			m.appending.Unlock()
+			if errors.Is(err, ErrFenced) {
+				m.fenced.Store(true)
+				return
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // redactorFailed is how prepare reports what record must turn into a failed run.
@@ -436,7 +487,7 @@ func (m *machine) unprepared(ctx context.Context, err error) error {
 }
 
 func (m *machine) appendFailed(id string, err error) error {
-	if errors.Is(err, ErrConflict) {
+	if errors.Is(err, ErrConflict) || errors.Is(err, ErrFenced) {
 		return ErrFenced
 	}
 	return fmt.Errorf("harness: append %s: %w: %w", id, ErrDrained, err)
@@ -815,6 +866,7 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 	start := time.Now()
 	var first time.Duration
 	sink := m.deltaSink(ctx, attempt)
+	stop := m.renewing(ctx)
 	resp, err := model.Collect(p.Complete(ctx, req), func(ev model.Event) {
 		switch ev.(type) {
 		case model.TextDelta, model.ToolCallDelta:
@@ -824,6 +876,7 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 		}
 		sink(ev)
 	})
+	stop()
 	if err != nil {
 		return m.modelFailed(ctx, req.Model, err, attempt, time.Since(start))
 	}
@@ -993,6 +1046,7 @@ func (m *machine) execute(ctx context.Context, calls []Call) error {
 		err error
 	}
 	results := make(chan outcome, len(calls))
+	defer m.renewing(ctx)()
 	v := m.view()
 	for _, c := range calls {
 		go func() {
@@ -1032,7 +1086,9 @@ func (m *machine) executeAtomic(ctx context.Context, c Call) error {
 	var (
 		probe  Run
 		stored []Event
+		locked bool
 	)
+	stop := m.renewing(ctx)
 	err := m.journal.(AtomicJournal).Atomically(ctx, v.ID, func(ctx context.Context) ([]Event, error) {
 		ev, err := m.invoke1(ctx, v, c)
 		switch {
@@ -1042,9 +1098,23 @@ func (m *machine) executeAtomic(ctx context.Context, c Call) error {
 			return nil, ErrDrained // stopped under the tool: the unit says nothing about the effect
 		}
 		var perr error
-		probe, stored, perr = m.prepare(ctx, m.outcome(ctx, ev, err))
-		return stored, perr
+		if probe, stored, perr = m.prepare(ctx, m.outcome(ctx, ev, err)); perr != nil {
+			return nil, perr
+		}
+		m.appending.Lock() // held until the unit commits: see appending
+		locked = true
+		if m.fenced.Load() {
+			return nil, ErrFenced
+		}
+		return stored, nil
 	})
+	if err == nil {
+		m.head.Store(probe.seq)
+	}
+	if locked {
+		m.appending.Unlock()
+	}
+	stop()
 	switch {
 	case err == nil:
 		m.adopt(ctx, probe, stored)

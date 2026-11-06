@@ -66,7 +66,7 @@ type Journal interface {
 }
 ```
 
-`journal/postgres` is a complete one, including a sweep query and the optional `LineageReader`, which makes a cancel check cost one row instead of a parent's whole history. `journaltest.Run` checks any store against the contract, with crash sweeps through real agents.
+`journal/postgres` is a complete one, including a sweep query, `AtomicJournal`, `Renewer` for steps longer than the lease, and the optional `LineageReader`, which makes a cancel check cost one row instead of a parent's whole history. `journaltest.Run` checks any store against the contract, with crash sweeps through real agents.
 
 ```go
 agent := &harness.Agent{Name: "refunds", Provider: p, Tools: tools, Journal: journal,

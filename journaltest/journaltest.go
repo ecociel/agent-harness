@@ -64,6 +64,7 @@ var checks = []check{
 	{"CancelEndsAParkedBranch", cancelEndsAParkedBranch},
 	{"LineageAgreesWithTheEvents", lineageAgreesWithTheEvents},
 	{"CrashSweepAChain", crashSweepAChain},
+	{"RenewalBehindTheHeadIsRefused", renewalBehindTheHeadIsRefused},
 }
 
 func newID(prefix string) string {
@@ -933,4 +934,31 @@ func sameMessages(a, b []model.Message) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)
 	return bytes.Equal(x, y)
+}
+
+// A renewal keeps a run from the sweep, so one from a worker whose position was
+// taken would keep a dead worker's run alive.
+func renewalBehindTheHeadIsRefused(t testing.TB, j harness.Journal) {
+	r, ok := j.(harness.Renewer)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	id := newID("renew")
+	until := time.Now().Add(time.Hour)
+	if err := j.Append(ctx, id, []harness.Event{event(1, "a"), event(2, "b")}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := r.Renew(ctx, id, 2, until); err != nil {
+		t.Fatalf("a renewal on the head: %v", err)
+	}
+	if err := j.Append(ctx, id, []harness.Event{event(3, "c")}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := r.Renew(ctx, id, 2, until); !errors.Is(err, harness.ErrFenced) {
+		t.Fatalf("a renewal behind the head must be ErrFenced, got %v", err)
+	}
+	if err := r.Renew(ctx, id, 3, until); err != nil {
+		t.Fatalf("a renewal on the new head: %v", err)
+	}
 }

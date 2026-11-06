@@ -37,6 +37,7 @@ Because the next step is derived from the log, a turn survives process restarts 
 | a decision or a stop written by a handler | `Agent.Deliver`: `wait.resolved` or `run.stopping`, no claim, `Wake` now |
 | a retry card after a crash during a send | `WaitUnknownOutcome`, answered with `Signal{Rerun: true}` (run again) or a `Value` (the result) |
 | risk class and gate reason on the approval | `Decision.Tags`, recorded on `tool.gated` |
+| the lease heartbeat on the turn row | `Renewer.Renew(runID, headSeq, until)`, refused once the head moved |
 | `Refusal` | `harness.Stop(StopGuardrail \| StopPolicy, detail)` → `stopped` |
 | limits | `hooks/budget.Limits` (+ `Agent.MaxTurns`) |
 | a conversation's turns | a chain of runs, `Input.After` naming the previous turn; `HistoryReader` over the conversation |

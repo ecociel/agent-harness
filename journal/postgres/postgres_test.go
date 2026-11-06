@@ -348,3 +348,28 @@ func TestAtomicallyCommitsTheEffectWithItsEvents(t *testing.T) {
 		})
 	}
 }
+
+func TestARenewalMovesWakeOnlyWhileTheHeadHolds(t *testing.T) {
+	j := open(t)
+	ctx := context.Background()
+	id := newID("renew")
+	ev := func(seq int64) harness.Event {
+		return harness.Event{Seq: seq, Time: time.Now(), Kind: harness.KindHistoryEdited, Wake: time.Now().Add(time.Minute)}
+	}
+	if err := j.Append(ctx, id, []harness.Event{ev(1), ev(2)}); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour)
+	if err := j.Renew(ctx, id, 2, later); err != nil {
+		t.Fatalf("renew on the head: %v", err)
+	}
+	if slices.Contains(due(t, j, time.Now().Add(30*time.Minute)), id) {
+		t.Fatal("a renewed run is not due inside its renewal")
+	}
+	if err := j.Append(ctx, id, []harness.Event{ev(3)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Renew(ctx, id, 2, later.Add(time.Hour)); !errors.Is(err, harness.ErrFenced) {
+		t.Fatalf("a renewal behind the head: want ErrFenced, got %v", err)
+	}
+}

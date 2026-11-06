@@ -33,8 +33,10 @@ CREATE TABLE IF NOT EXISTS journal_runs (
 	root   text NOT NULL,
 	state  text NOT NULL,
 	wake   timestamptz,
-	cancel bigint
+	cancel bigint,
+	head_seq bigint NOT NULL DEFAULT 0
 );
+ALTER TABLE journal_runs ADD COLUMN IF NOT EXISTS head_seq bigint NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS journal_runs_due ON journal_runs (wake) WHERE parent = '';
 CREATE INDEX IF NOT EXISTS journal_runs_root ON journal_runs (root);
 `
@@ -134,11 +136,29 @@ func appendTx(ctx context.Context, tx *sql.Tx, runID string, evs []harness.Event
 	if i := slices.IndexFunc(evs, harness.Event.IsCancel); i >= 0 {
 		cancel = sql.NullInt64{Int64: evs[i].Seq, Valid: true}
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO journal_runs (run_id, parent, root, state, wake, cancel) VALUES ($1, $2, $3, $4, $5, $6)
+	_, err := tx.ExecContext(ctx, `INSERT INTO journal_runs (run_id, parent, root, state, wake, cancel, head_seq) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (run_id) DO UPDATE SET state = COALESCE(NULLIF(EXCLUDED.state, ''), journal_runs.state), wake = EXCLUDED.wake,
-			cancel = COALESCE(journal_runs.cancel, EXCLUDED.cancel)`,
-		runID, last.ParentRun, last.RootRun, string(last.To), wake, cancel)
+			cancel = COALESCE(journal_runs.cancel, EXCLUDED.cancel), head_seq = EXCLUDED.head_seq`,
+		runID, last.ParentRun, last.RootRun, string(last.To), wake, cancel, last.Seq)
 	return err
+}
+
+// Renew implements harness.Renewer. It moves the run's wake only while headSeq is
+// still the last position written, so a fenced worker cannot keep a run from the
+// sweep.
+func (j *Journal) Renew(ctx context.Context, runID string, headSeq int64, until time.Time) error {
+	res, err := j.db.ExecContext(ctx, `UPDATE journal_runs SET wake = $3 WHERE run_id = $1 AND head_seq = $2`, runID, headSeq, until)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %s moved past %d", harness.ErrFenced, runID, headSeq)
+	}
+	return nil
 }
 
 // Lineage implements harness.LineageReader with two primary-key reads, so it costs

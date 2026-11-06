@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/ecociel/agent-harness/model"
 )
@@ -21,7 +22,7 @@ import (
 // One projection replaces a third method. The last event of every append carries
 // Wake: when this run next needs someone to call Run, or zero if nobody needs to,
 // because it ended or only a signal can move it. A running run's Wake is its Lease
-// past that append, so a crashed worker and a drained one look the same. A parked
+// past that append, or past its last renewal (see Renewer), so a crashed worker and a drained one look the same. A parked
 // run's Wake is its earliest expiry. Project Wake and the event's To into a row per
 // run and one query finds everything that needs a worker:
 //
@@ -68,6 +69,21 @@ type Journal interface {
 type AtomicJournal interface {
 	Journal
 	Atomically(ctx context.Context, runID string, fn func(ctx context.Context) ([]Event, error)) error
+}
+
+// Renewer is a Journal that can extend a working run's Wake without an event. It
+// is optional. While a model call or a tool runs longer than a third of
+// Agent.Lease, the worker calls Renew every Lease/3 from its own goroutine, with
+// headSeq the highest Seq it has appended. A store renews only while that is still
+// the run's head, so a fenced worker cannot keep a run alive:
+//
+//	UPDATE runs SET wake = $until WHERE run_id = $1 AND head_seq = $2
+//
+// and returns ErrFenced when the head has moved. The worker then stops at its next
+// append. Without a Renewer, Wake is the last append plus Lease, and a step slower
+// than the lease is swept.
+type Renewer interface {
+	Renew(ctx context.Context, runID string, headSeq int64, until time.Time) error
 }
 
 // Lineage is what a run needs from a run above it, before its next step.
@@ -211,6 +227,16 @@ func (j *memJournal) Atomically(ctx context.Context, runID string, fn func(conte
 		return err
 	}
 	return j.Append(ctx, runID, evs)
+}
+
+// Renew has no Wake to extend, and only checks the head.
+func (j *memJournal) Renew(_ context.Context, runID string, headSeq int64, _ time.Time) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if int64(len(j.runs[runID])) != headSeq {
+		return fmt.Errorf("%w: %s moved past %d", ErrFenced, runID, headSeq)
+	}
+	return nil
 }
 
 func (j *memJournal) Load(_ context.Context, runID string) ([]Event, error) {

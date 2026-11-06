@@ -35,6 +35,10 @@ Retries belong in `Recover`, not `WrapModel`: an attempt inside middleware isn't
 
 A tool with `Effect: tool.EffectAtomic` needs an `AtomicJournal`, or `Run` returns `ErrNotAtomic`. The machine records `tool.started` alone, then calls `Atomically(ctx, runID, fn)`. Inside `fn` run the `WrapTool` chain, the redactors, the tool and the `AfterTool` hooks, and `fn` returns the call's `tool.done`. The store appends it in the same unit as the tool's writes. A tool error is still a result: the store undoes the writes and records the error text. `WrapTool` and `AfterTool` hooks of an atomic call therefore run inside the unit, so keep them short.
 
+## Long steps
+
+A model call or a tool that may take longer than `Agent.Lease` would be swept as a crash. A journal that implements `Renewer` avoids that: every `Lease/3` during a step the worker calls `Renew(ctx, runID, headSeq, until)`, and the store moves the run's wake only while `headSeq` is still its last position. A refused renewal returns `ErrFenced`, and the worker stops at its next append. `journal/postgres` keeps `head_seq` on its run row for this.
+
 ## Sinks
 
 Tracing, metrics and logging are not hooks. They are event sinks, attached once on the context, and every run in the tree reports to them:
