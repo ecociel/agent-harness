@@ -196,7 +196,7 @@ res, err := a.Run(ctx, harness.Prompt("Weather in Zurich?"))
 - Chat: `harness.NewSession(runner).Send(ctx, text)` keeps history across runs, and is safe to repeat after a crash.
 - Graceful shutdown: `ctx, drain := harness.WithDrain(ctx)`. Runs finish their step, record it and return `ErrDrained`.
 - Patterns: see the `Example…` functions in `multi/example_test.go`.
-- Evals: `eval.Run(ctx, runner, tasks, parallel)` with `eval.Contains`, `eval.StoppedWith` or `eval.Judge`.
+- Evals: `eval.Run(ctx, runner, tasks, parallel)` with `eval.Contains`, `eval.StoppedWith` or `eval.Judge` for single prompts. For conversations, `eval.RunScenarios(ctx, target, scenarios, kinds, parallel)` plays multi-turn scenarios through your own `eval.Target`, grades them with `eval.Generic()` plus your own check kinds and writes a report, and `eval.SelfTest` proves each check tells a good script from a bad one.
 
 Run the checks:
 

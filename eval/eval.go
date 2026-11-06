@@ -1,11 +1,3 @@
-// Package eval runs a Runner against a set of tasks and scores the results —
-// the "private evals define what good looks like" half of the harness talk.
-//
-// A Task is shaped like a Harbor task: an instruction (the prompt) and a
-// verifier (Check) that scores the result, which can be code, a string
-// match, or another agent acting as judge. Report tracks accuracy together
-// with tokens and latency, because a harness change that is more accurate
-// but three times as expensive is not obviously better.
 package eval
 
 import (
