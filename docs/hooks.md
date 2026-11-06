@@ -49,7 +49,7 @@ A sink gets each durable event once, after it is journaled, and only what has pa
 | `hooks/retry` | `Recover` | backoff and retries as recorded decisions, then one try on `FallbackModel`. `retry.Fallback` routes that name to another provider |
 | `hooks/profile` | `BeforeModel` | per-model instructions, hidden tools, output caps |
 | `hooks/trajectory` | `AfterRun` | full runs for evals. `trajectory.From` reads one from any `Run` |
-| `hooks/trace` | sink | OpenTelemetry-shaped spans with stable IDs |
+| `hooks/trace` | sink | OpenTelemetry-shaped spans with stable IDs for runs, model calls, tool calls and waits. `trace.FromEvents` builds the same spans offline from any journal |
 | `hooks/metrics` | sink | counters and latency histograms behind a `Recorder`. Token counters carry `input`, `output`, `cached` and `reasoning` kinds |
 | `hooks/logging` | sink | `log/slog` lines |
 
