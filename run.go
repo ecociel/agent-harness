@@ -813,7 +813,17 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 		p = m.hooks.wrapModel[i].WrapModel(v, p)
 	}
 	start := time.Now()
-	resp, err := model.Collect(p.Complete(ctx, req), m.deltaSink(ctx))
+	var first time.Duration
+	sink := m.deltaSink(ctx, attempt)
+	resp, err := model.Collect(p.Complete(ctx, req), func(ev model.Event) {
+		switch ev.(type) {
+		case model.TextDelta, model.ToolCallDelta:
+			if first == 0 {
+				first = time.Since(start)
+			}
+		}
+		sink(ev)
+	})
 	if err != nil {
 		return m.modelFailed(ctx, req.Model, err, attempt, time.Since(start))
 	}
@@ -832,7 +842,8 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 		}
 	}
 	resp.Usage = billed
-	return m.record(ctx, Event{Kind: KindModelDone, Model: req.Model, Attempt: attempt, Reply: &resp, Duration: time.Since(start)})
+	return m.record(ctx, Event{Kind: KindModelDone, Model: req.Model, Attempt: attempt, Reply: &resp,
+		Duration: time.Since(start), FirstToken: first})
 }
 
 // checkReply validates hook output at the boundary, so the journal can store it.
@@ -846,12 +857,13 @@ func checkReply(h Hook, resp model.Response) error {
 }
 
 // deltaSink streams text to sinks. It sits outside the ring, so a delta is
-// redacted before it exists here.
-func (m *machine) deltaSink(ctx context.Context) func(model.Event) {
+// redacted before it exists here. A delta names its turn and attempt, so a sink can
+// drop the text of an attempt that a retry replaced.
+func (m *machine) deltaSink(ctx context.Context, attempt int) func(model.Event) {
 	turn := m.run.Turn
 	return func(ev model.Event) {
 		if d, ok := ev.(model.TextDelta); ok {
-			m.ephemeral(ctx, Event{Kind: KindDelta, Text: d.Text, Turn: turn})
+			m.ephemeral(ctx, Event{Kind: KindDelta, Text: d.Text, Turn: turn, Attempt: attempt})
 		}
 	}
 }

@@ -100,7 +100,7 @@ func everyFieldSurvives(t testing.TB, j harness.Journal) {
 		RunID: "r", RootRun: "root", ParentRun: "parent", Agent: "a", Depth: 2, Turn: 3,
 		From: harness.StateTools, To: harness.StateCompose, Wake: time.Date(2026, 10, 30, 12, 0, 1, 987654321, time.UTC),
 		Hook: "h", Tool: "t", Model: "m", Point: harness.PointBeforeTool, Outcome: "ok", Text: "text",
-		Duration: 1500 * time.Millisecond, Index: 4, Attempt: 5,
+		Duration: 1500 * time.Millisecond, FirstToken: 250 * time.Millisecond, Index: 4, Attempt: 5,
 		Pin:      &harness.Pin{Instructions: "be careful", Shape: "parallel: a, b", Model: "m", MaxTurns: 8, Temperature: &temperature},
 		Messages: []model.Message{model.User("hello"), {Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "c", Name: "t", Arguments: json.RawMessage(`{"a":[1,2]}`)}}}},
 		After:    "the run before",
@@ -111,7 +111,8 @@ func everyFieldSurvives(t testing.TB, j harness.Journal) {
 		Reply:    &model.Response{Text: "answer", Usage: model.Usage{Input: 10, Output: 2}},
 		Below:    &harness.Spend{Usage: model.Usage{Input: 7}, Turns: 2, ModelCalls: 3, LostCalls: 1, ToolCalls: 4},
 		Waits:    []harness.Wait{{ID: "w", Run: "r", Kind: "approval", Detail: "sure?", Expires: time.Date(2026, 11, 1, 0, 0, 0, 1, time.UTC)}},
-		Signal:   &harness.Signal{Wait: "w", Value: "yes", By: "op"},
+		Signal:   &harness.Signal{Wait: "w", Value: "yes", By: "op", Rerun: true},
+		Decision: &harness.Decision{Action: harness.ActionDeny, Reason: "no", Tags: map[string]string{"risk": "write"}},
 		Stop:     harness.StopCompleted,
 	}
 	id := newID("fields")

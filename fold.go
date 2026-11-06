@@ -583,8 +583,9 @@ func (r *Run) open(waits []Wait, now time.Time) {
 func (r *Run) addWaits(waits []Wait) { r.Waits = append(r.Waits, waits...) }
 
 // resolve closes one wait. The unknown-outcome wait is the one kind whose signal
-// IS the result, because the call must not run again. Any other wait sends its
-// call back to be decided, with the signal visible to the hooks.
+// IS the result, because the call must not run again, unless the answer says to
+// run it. Any other wait sends its call back to be decided, with the signal
+// visible to the hooks.
 func (r *Run) resolve(s Signal, now time.Time) {
 	i := slices.IndexFunc(r.Waits, func(w Wait) bool { return w.ID == s.Wait })
 	if i < 0 {
@@ -597,7 +598,7 @@ func (r *Run) resolve(s Signal, now time.Time) {
 	} else if w.Call >= 0 && w.Call < len(r.batch) {
 		c := &r.batch[w.Call]
 		c.Signals = append(c.Signals, s)
-		if w.Kind == WaitUnknownOutcome && w.Run == r.ID {
+		if w.Kind == WaitUnknownOutcome && w.Run == r.ID && !s.Rerun {
 			c.finish(s.Value)
 		} else {
 			r.redecide(c, plannedOnOldTool)

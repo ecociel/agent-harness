@@ -238,6 +238,10 @@ type Signal struct {
 	By      string `json:"by,omitempty"`
 	Kind    string `json:"kind,omitempty"`    // the wait's Kind; the harness fills it in
 	Expired bool   `json:"expired,omitempty"` // no one answered in time
+	// Rerun answers a WaitUnknownOutcome: whoever answered knows the call did not
+	// take effect, so it is decided again and runs again under the same key, as
+	// attempt n+1, instead of taking Value as its result. Other waits ignore it.
+	Rerun bool `json:"rerun,omitempty"`
 }
 
 type suspension struct{ waits []Wait }
@@ -265,6 +269,10 @@ type Decision struct {
 	Reason string     `json:"reason,omitempty"`
 	Stop   StopReason `json:"stop,omitempty"`
 	Wait   *Wait      `json:"-"` // moved onto Event.Waits when recorded
+	// Tags are facts about the decision that a later reader of the journal needs
+	// without the hook: a risk class, a reason code. They are recorded on tool.gated,
+	// redacted like any text, and never shown to the model.
+	Tags map[string]string `json:"tags,omitempty"`
 }
 
 // Allow returns a Decision that lets the call run.

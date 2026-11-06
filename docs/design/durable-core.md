@@ -198,7 +198,7 @@ A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `Check
 | 4 | Context, compaction | `Context` returns a recorded `Edit`, `BeforeModel` edits are per call | Summariser, retrieval, token counting |
 | 5 | Memory | Load in `Context` with `Edit.Source`, save in `AfterRun` | Memory store and policy |
 | 6 | Token spend | Usage in `model.done`, folded once, `LostCalls` as the honest bound. A tree is a plain sum over its runs | Price table, limits, tenant totals inside `Append` |
-| 7 | Tracing | Stable `RunID`, `RootRun`, `ParentRun`, `Seq`. Span IDs hash run and step | Exporter, as a sink |
+| 7 | Tracing | Stable `RunID`, `RootRun`, `ParentRun`, `Seq`. Span IDs hash run and step. `FirstToken` on `model.done`, and deltas that name their `Turn` and `Attempt` | Exporter, as a sink |
 | 8 | Metrics | The event vocabulary | Backend, as a sink |
 | 9 | Guardrails | `BeforeRun`, `BeforeTool`, `AfterModel`, `AfterTool`, `CheckOutput`, `WrapModel` for streams | Rules |
 | 10 | Redaction | The ring, the `record` backstop, inheritance by child runs, fail closed | Patterns |

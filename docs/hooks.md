@@ -21,6 +21,8 @@ One rule makes hooks safe across a crash: **a hook only ever returns a value.** 
 
 `Redact` is special. It is a ring, not a step: it wraps the provider and the tools directly, inside `WrapModel` and `WrapTool`, and every durable event passes through it again. A redactor that fails ends the run with the text discarded. Children inherit it. While one is attached, a reply reaches sinks only when complete, unless the redactor also implements `ModelMiddleware` to filter the stream.
 
+A `BeforeTool` decision can carry `Tags`, free-form facts such as a risk class or a reason code. They are recorded on `tool.gated` and redacted, so a later fold or a page reads them from the journal without the hook. The model never sees them.
+
 Retries belong in `Recover`, not `WrapModel`: an attempt inside middleware isn't journaled, so a crash forgets it.
 
 [examples/hooks](../examples/hooks/README.md) has a small runnable program for every point and every package below.

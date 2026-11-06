@@ -66,8 +66,11 @@ type Event struct {
 	Outcome  string        `json:"outcome,omitempty"`
 	Text     string        `json:"text,omitempty"`
 	Duration time.Duration `json:"duration_ns,omitempty"`
-	Index    int           `json:"index,omitempty"`   // tool.*: the call's position in the batch
-	Attempt  int           `json:"attempt,omitempty"` // model.*, tool.started
+	// FirstToken is how long a model call took to stream its first text or tool
+	// call, on model.done. Zero when nothing streamed before the end.
+	FirstToken time.Duration `json:"first_token_ns,omitempty"`
+	Index      int           `json:"index,omitempty"`   // tool.*: the call's position in the batch
+	Attempt    int           `json:"attempt,omitempty"` // model.*, tool.started, delta
 
 	Pin      *Pin              `json:"pin,omitempty"`      // run.started
 	Messages []model.Message   `json:"messages,omitempty"` // run.started
@@ -259,6 +262,14 @@ func (e *Event) redact(visit func(*string)) {
 	if e.Decision != nil {
 		d := *e.Decision
 		visit(&d.Reason)
+		if d.Tags != nil {
+			tags := make(map[string]string, len(d.Tags))
+			for k, v := range d.Tags {
+				visit(&v)
+				tags[k] = v
+			}
+			d.Tags = tags
+		}
 		e.Decision = &d
 	}
 	if e.Handoff != nil {
