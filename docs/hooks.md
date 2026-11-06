@@ -41,7 +41,7 @@ A sink gets each durable event once, after it is journaled, and only what has pa
 
 | Package | Points | Concern |
 |---|---|---|
-| `hooks/guard` | `BeforeRun`, `BeforeTool`, `CheckOutput` | deny inputs, veto tools, revise or block outputs. `guard.Redactor` is the rule-based `Redact` ring. `Guard.Redact` only rewrites the final answer |
+| `hooks/guard` | `BeforeRun`, `BeforeTool`, `CheckOutput` | deny inputs, veto tools, revise or block outputs. `guard.Redactor` is the rule-based `Redact` ring and buffers the reply. `guard.Stream(rules, window)` is the same ring live: it holds back the last `window` bytes, at least the longest match, and every rule must have a bounded match (`{m,n}`, not `+` or `*`). `Guard.Redact` only rewrites the final answer |
 | `hooks/budget` | `BeforeRun`, `BeforeModel` | tokens, cost, model and tool calls, wall time, loop detection, read from the `Run`. `WithPool` applies limits to a tree or tenant, from the consumer's own projection |
 | `hooks/approval` | `BeforeTool` | scopes, a risk threshold, an `Approver` or a durable wait (`Ask`), audit records |
 | `hooks/compact` | `Context`, `Recover` | summarise old turns as a recorded edit, and answer a full context |
