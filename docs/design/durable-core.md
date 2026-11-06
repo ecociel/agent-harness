@@ -90,7 +90,7 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 | `Journal` | `Append` and `Load`. The unique index is both the ownership fence and the outbox. |
 | `Run` | The fold. No mutex, no `Agent` pointer, no scratch map. Hooks get it by value, as a shallow copy (see Agreed decisions not yet built). It replaces `Result`. |
 | `Composite` | A run whose work is to run others. Every pattern is one. It has a body and no model. |
-| `Input` | `RunID`, `Messages`, `Signals`, `Cancel`. |
+| `Input` | `RunID`, `Messages`, `After`, `Pinned`, `Meta`, `Signals`, `Cancel`. `After` chains a run to a finished one, `Pinned` is sent on every request of this run only, `Meta` is identity for hooks and tools. All three are recorded on `run.started`. |
 | `Pin` | Recorded at start: instructions, model, limits, schema, tool fingerprints. Wiring stays live. |
 | `Wait`, `Signal` | What a suspended run needs, and the answer. |
 | `Edit` | The only durable way to change history. It stamps `Source` for provenance. |
@@ -101,7 +101,7 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 2. **Hooks return values.** The shell records the value. No hook runs on the replay path, so a decision can't come out differently later. A hook runs at least once, so anything it does outside the run must tolerate a repeat.
 3. **Intent before effect**, for tools and for paid calls. On resume, an open `model` state or a `started` call can only mean the outcome was lost.
 4. **Redaction is the innermost ring.** It wraps the provider and the tool call directly, inside `WrapModel` and `WrapTool`, and `record` is the backstop. With a redactor configured, no hook sees raw data, and a redactor error fails closed. With none configured, the ring does nothing. A redactor that can't filter a stream buffers the reply, so live streaming is lost while it is attached.
-5. **The index is the fence.** A worker taking a run appends `run.claimed`, and the previous worker's next append fails with `ErrFenced`. There is no lease code and no heartbeat in the core. Candidate 1 had a heartbeat, and it produced a real data race.
+5. **The index is the fence.** A worker taking a run appends `run.claimed`, and the previous worker's next append fails with `ErrFenced`. The core keeps no lease state. A journal may add `Renewer`: while a step runs longer than `Lease/3`, the worker renews its `Wake` on its own goroutine, only while the head is still the position it wrote, and holds one mutex across its appends and renewals so a renewal never names a head it is replacing. Candidate 1 had an unconditioned heartbeat on shared state, and it produced a real data race; this one writes no event and touches the fold through nothing but an atomic.
 6. **Contexts stop workers, not runs.** Cancelling a context acts like a crash and returns `ErrDrained`. Only `Input.Cancel` ends a durable run.
 7. **`Event.Wake`** is on the last event of every append. Projected into a row inside the `Append` transaction, it gives one sweep query for crashed workers, due timers and drained runs, with no third `Journal` method.
 8. **Every tool call gets exactly one result.** `closeBatch` answers each call in call order, whatever ended the batch. A call that never ran gets a synthetic `{"skipped":true}` result. An unanswered tool call can't reach history.
@@ -193,12 +193,12 @@ A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `Check
 | # | Concern | The package owns | The consumer supplies |
 |---|---|---|---|
 | 1 | Durability | `Journal`, `Fold`, idempotent `Run`, record before acting | The store, two methods |
-| 2 | Side-effect safety | `tool.started` before the effect, `IdempotencyKey`, `Effect`, `WaitUnknownOutcome` | Each tool's `Effect`, a ledger if wanted |
+| 2 | Side-effect safety | `tool.started` before the effect, `IdempotencyKey`, `Effect`, `WaitUnknownOutcome`, `EffectAtomic` committed through `AtomicJournal` | Each tool's `Effect`, a ledger if wanted, a transaction for atomic tools |
 | 3 | Suspension | `suspended`, `Wait`, `Signal`, `Await`, expiry, re-decide on resolve | Approval UI, who may approve, a sweeper |
 | 4 | Context, compaction | `Context` returns a recorded `Edit`, `BeforeModel` edits are per call | Summariser, retrieval, token counting |
 | 5 | Memory | Load in `Context` with `Edit.Source`, save in `AfterRun` | Memory store and policy |
 | 6 | Token spend | Usage in `model.done`, folded once, `LostCalls` as the honest bound. A tree is a plain sum over its runs | Price table, limits, tenant totals inside `Append` |
-| 7 | Tracing | Stable `RunID`, `RootRun`, `ParentRun`, `Seq`. Span IDs hash run and step | Exporter, as a sink |
+| 7 | Tracing | Stable `RunID`, `RootRun`, `ParentRun`, `Seq`. Span IDs hash run and step. `FirstToken` on `model.done`, and deltas that name their `Turn` and `Attempt` | Exporter, as a sink |
 | 8 | Metrics | The event vocabulary | Backend, as a sink |
 | 9 | Guardrails | `BeforeRun`, `BeforeTool`, `AfterModel`, `AfterTool`, `CheckOutput`, `WrapModel` for streams | Rules |
 | 10 | Redaction | The ring, the `record` backstop, inheritance by child runs, fail closed | Patterns |
@@ -207,7 +207,7 @@ A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `Check
 | 13 | Timeouts, shutdown | `Spec.Timeout`, `WithDrain`, `ErrDrained`, tree-wide `Input.Cancel`, the fence | Deadlines, when to call `Run` |
 | 14 | Tool execution | Batch order, adjacent reads in parallel, single writer, `closeBatch` | Tools |
 | 15 | Multi-agent | `Composite`, derived child IDs, finished children answer from their journals, wait forwarding | Which patterns, `ChildTool` on a tool that starts runs |
-| 16 | Sessions | A run is workflow state. `Session{ID, Turn, History}` is conversation only | Where to save those fields |
+| 16 | Sessions | A conversation is a chain of runs (`Input.After`, `Prior`, `FoldOn`). `Session{ID, Turn}` names the next one | Where to save those fields, a `HistoryReader` for long chains |
 | 17 | Evaluation | `Fold` needs no provider, tool or hook. A what-if copies an event prefix | Eval suites |
 | 18 | Versioning | `Pin`, `Drift`, calls to a changed tool denied and replanned | Migrations in `Journal.Load` |
 | 19 | Operability | `Fold` exposes `State`, `Waits`, `Updated`, `Claims`, `Class`. `Wake` for sweeps | Dashboards, the sweep |
@@ -301,6 +301,13 @@ Each of these was left on purpose.
 - **Metrics can miss the last event before a crash.** They are sinks, so nothing counts twice, and the journal is the source to reconcile a total from.
 - **A retry after a cut stream repeats text to sinks.** Deltas already streamed stay streamed, so a live UI shows the partial reply and then the whole one. By reading the code.
 - **The Anthropic adapter stays on API version `2023-06-01`, with a default `max_tokens` of 4096.** Thinking counts against that limit, so set `MaxTokens` on current models. Version `2026-10-21` refuses `temperature` on every model, so moving to it is a separate change.
+- **A chained run reads its whole chain at every `Run`.** Without a `HistoryReader`, `Prior` loads and folds each predecessor, so a conversation of n turns costs O(n) reads per step. A store that keeps many turns implements `HistoryReader`. A wrapper hides it like `Lineage`.
+- **An edit cannot cross the pinned context.** A `Context` edit over both inherited and own messages fails the run when `Pinned` is set, so `hooks/compact` then summarises the inherited part first and the run's own messages once that is one summary.
+- **Renewal covers model calls and tool executions, not hooks.** A slow `Context` summariser or gate hook still needs a `Lease` above its duration.
+- **A store must call an atomic unit's fn once.** fn runs the tool, so a store that retries a serialization failure must give up instead and let the run be taken again.
+- **A composite's body sees the inherited history but not `Pinned`.** A pattern passes `Messages` to its children, and `Pinned` stays with the composite's run.
+- **A `Session` over a runner with no journal chains in memory.** The journal lives in the `Session` value, so a restart forgets the conversation, and such a run now parks on a wait instead of failing with `ErrNotDurable`.
+- **The memory journal's unit undoes nothing.** `NewMemJournal().Atomically` runs the tool and appends, so an `EffectAtomic` tool on it is only as safe as an idempotent one. A crash test of atomic tools needs a store with a real transaction, or a stand-in like the suite's.
 - **A wrapper can hide the fast path.** A journal wrapped for tracing or fault injection has no `Lineage` unless the wrapper forwards it. Runs then fall back to `Load`, which is correct and slower. Nothing reports the fallback.
 
 ## Tradeoffs accepted

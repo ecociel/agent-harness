@@ -357,10 +357,11 @@ func TestHandoffStickySurvivesARestart(t *testing.T) {
 	}
 	h := build()
 	s := harness.NewSession(h)
-	if _, err := s.Send(context.Background(), "one"); err != nil {
+	first, err := s.Send(context.Background(), "one")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := h.Owner(s.History); got != "b" {
+	if got := h.Owner(first.Messages); got != "b" {
 		t.Fatalf("owner %q", got)
 	}
 	s.Runner = build()
@@ -374,12 +375,14 @@ func TestHandoffWithoutStickyStartsOver(t *testing.T) {
 	a := &harness.Agent{Name: "a", Provider: fake.Script(fake.Call("transfer_to_b", nil), fake.Text("a again"))}
 	b := &harness.Agent{Name: "b", Provider: fake.Script(fake.Text("b1"))}
 	s := harness.NewSession(&multi.Handoff{Agents: []*harness.Agent{a, b}})
+	var res *harness.Run
 	for _, text := range []string{"one", "two"} {
-		if _, err := s.Send(context.Background(), text); err != nil {
+		var err error
+		if res, err = s.Send(context.Background(), text); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got := s.History[len(s.History)-1].Content; got != "a again" {
+	if got := res.Messages[len(res.Messages)-1].Content; got != "a again" {
 		t.Fatal(got)
 	}
 }

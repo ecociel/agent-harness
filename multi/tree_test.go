@@ -95,7 +95,7 @@ func TestASessionOverAPatternKeepsAPlainHistory(t *testing.T) {
 	if err != nil || !res.OK() {
 		t.Fatalf("%v %+v", err, res)
 	}
-	for _, m := range s.History {
+	for _, m := range res.Messages {
 		if m.Role == model.RoleTool || len(m.ToolCalls) > 0 {
 			t.Fatalf("history holds the lead's scripted turn: %+v", m)
 		}

@@ -33,8 +33,10 @@ CREATE TABLE IF NOT EXISTS journal_runs (
 	root   text NOT NULL,
 	state  text NOT NULL,
 	wake   timestamptz,
-	cancel bigint
+	cancel bigint,
+	head_seq bigint NOT NULL DEFAULT 0
 );
+ALTER TABLE journal_runs ADD COLUMN IF NOT EXISTS head_seq bigint NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS journal_runs_due ON journal_runs (wake) WHERE parent = '';
 CREATE INDEX IF NOT EXISTS journal_runs_root ON journal_runs (root);
 `
@@ -64,6 +66,55 @@ func (j *Journal) Append(ctx context.Context, runID string, evs []harness.Event)
 		return err
 	}
 	defer tx.Rollback()
+	if err := appendTx(ctx, tx, runID, evs); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type txKey struct{}
+
+// TxFrom returns the transaction of the unit ctx belongs to. An EffectAtomic tool
+// writes through it, so its writes commit with the call's result or not at all. A
+// tool whose statement fails must return the error: the transaction is then
+// aborted, and only an "error" result rolls back to the savepoint before it.
+func TxFrom(ctx context.Context) (*sql.Tx, bool) {
+	tx, ok := ctx.Value(txKey{}).(*sql.Tx)
+	return tx, ok
+}
+
+// Atomically implements harness.AtomicJournal with one transaction. A savepoint
+// before fn lets a failed tool's writes be undone while its error is still
+// recorded, and clears a transaction that a failed statement aborted. A taken
+// position rolls back everything, the tool's writes included, and is
+// harness.ErrConflict.
+func (j *Journal) Atomically(ctx context.Context, runID string, fn func(context.Context) ([]harness.Event, error)) error {
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT harness_effect`); err != nil {
+		return err
+	}
+	evs, err := fn(context.WithValue(ctx, txKey{}, tx))
+	if err != nil {
+		return err
+	}
+	if slices.ContainsFunc(evs, func(e harness.Event) bool { return e.Kind == harness.KindToolDone && e.Outcome == "error" }) {
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT harness_effect`); err != nil {
+			return err
+		}
+	}
+	if len(evs) > 0 {
+		if err := appendTx(ctx, tx, runID, evs); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func appendTx(ctx context.Context, tx *sql.Tx, runID string, evs []harness.Event) error {
 	for _, e := range evs {
 		doc, err := json.Marshal(e)
 		if err != nil {
@@ -87,13 +138,29 @@ func (j *Journal) Append(ctx context.Context, runID string, evs []harness.Event)
 	if i := slices.IndexFunc(evs, harness.Event.IsCancel); i >= 0 {
 		cancel = sql.NullInt64{Int64: evs[i].Seq, Valid: true}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO journal_runs (run_id, parent, root, state, wake, cancel) VALUES ($1, $2, $3, $4, $5, $6)
+	_, err := tx.ExecContext(ctx, `INSERT INTO journal_runs (run_id, parent, root, state, wake, cancel, head_seq) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (run_id) DO UPDATE SET state = COALESCE(NULLIF(EXCLUDED.state, ''), journal_runs.state), wake = EXCLUDED.wake,
-			cancel = COALESCE(journal_runs.cancel, EXCLUDED.cancel)`,
-		runID, last.ParentRun, last.RootRun, string(last.To), wake, cancel); err != nil {
+			cancel = COALESCE(journal_runs.cancel, EXCLUDED.cancel), head_seq = EXCLUDED.head_seq`,
+		runID, last.ParentRun, last.RootRun, string(last.To), wake, cancel, last.Seq)
+	return err
+}
+
+// Renew implements harness.Renewer. It moves the run's wake only while headSeq is
+// still the last position written, so a fenced worker cannot keep a run from the
+// sweep.
+func (j *Journal) Renew(ctx context.Context, runID string, headSeq int64, until time.Time) error {
+	res, err := j.db.ExecContext(ctx, `UPDATE journal_runs SET wake = $3 WHERE run_id = $1 AND head_seq = $2`, runID, headSeq, until)
+	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %s moved past %d", harness.ErrFenced, runID, headSeq)
+	}
+	return nil
 }
 
 // Lineage implements harness.LineageReader with two primary-key reads, so it costs

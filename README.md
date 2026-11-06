@@ -66,7 +66,7 @@ type Journal interface {
 }
 ```
 
-`journal/postgres` is a complete one, including a sweep query and the optional `LineageReader`, which makes a cancel check cost one row instead of a parent's whole history. `journaltest.Run` checks any store against the contract, with crash sweeps through real agents.
+`journal/postgres` is a complete one, including a sweep query, `AtomicJournal`, `Renewer` for steps longer than the lease, and the optional `LineageReader`, which makes a cancel check cost one row instead of a parent's whole history. `journaltest.Run` checks any store against the contract, with crash sweeps through real agents.
 
 ```go
 agent := &harness.Agent{Name: "refunds", Provider: p, Tools: tools, Journal: journal,
@@ -87,7 +87,9 @@ for _, id := range ids {
 }
 ```
 
-A tool's `Effect` says what a crash means for it. `EffectRead` and `EffectIdempotent` are repeated, with the same `tool.IdempotencyKey`. `EffectOnce`, the zero value, is never repeated blindly: an unknown outcome parks the run until a person answers.
+A process that only answers a run, such as a handler that takes an approval, calls `agent.Deliver(ctx, harness.Resume(id, signal))` instead. It records the answer, claims nothing and does no work, and sets `Wake` to now so a worker picks the run up.
+
+A tool's `Effect` says what a crash means for it. `EffectRead` and `EffectIdempotent` are repeated, with the same `tool.IdempotencyKey`. `EffectOnce`, the zero value, is never repeated blindly: an unknown outcome parks the run until a person answers. An operator who knows such a call did not happen answers with `Signal{Rerun: true}`, and the call is decided again and runs under the same key. `EffectAtomic` writes only through the journal's own transaction: a journal that implements `AtomicJournal` commits the tool's writes with its `tool.done` or not at all, so a crash undoes the effect and the call runs again under the same key. `journal/postgres` hands the tool its transaction through `postgres.TxFrom(ctx)`.
 
 The state machine is in [docs/state-machine.md](docs/state-machine.md), and the design, its evidence and its limits are in [docs/design/durable-core.md](docs/design/durable-core.md).
 
@@ -193,7 +195,9 @@ res, err := a.Run(ctx, harness.Prompt("Weather in Zurich?"))
 // res.Output, res.Stop, res.Path, res.Usage, res.Spent() …
 ```
 
-- Chat: `harness.NewSession(runner).Send(ctx, text)` keeps history across runs, and is safe to repeat after a crash.
+- Chat: `harness.NewSession(runner).Send(ctx, text)` runs each turn as its own run, chained to the one before with `Input.After`, and is safe to repeat after a crash. A chained run inherits its predecessor's final history without copying it, so storage grows with what is new. `harness.Prior` reads a finished run's history, `harness.FoldOn` folds a chained run, and a journal may answer faster through `HistoryReader`.
+- Identity: `Input.Meta` (tenant, principal, labels) is recorded at start and read back from `Run.Meta`, so a resume by any process acts for the run's owner. A child started from a tool inherits it.
+- Per-run context: `Input.Pinned` (a snapshot, retrieved memory) is recorded at start and sent on every request of that run, after the history and before the run's own messages. No other run inherits it, and a `Context` hook cannot edit it.
 - Graceful shutdown: `ctx, drain := harness.WithDrain(ctx)`. Runs finish their step, record it and return `ErrDrained`.
 - Patterns: see the `Example…` functions in `multi/example_test.go`.
 - Evals: `eval.Run(ctx, runner, tasks, parallel)` with `eval.Contains`, `eval.StoppedWith` or `eval.Judge` for single prompts. For conversations, `eval.RunScenarios(ctx, target, scenarios, kinds, parallel)` plays multi-turn scenarios through your own `eval.Target`, grades them with `eval.Generic()` plus your own check kinds and writes a report, and `eval.SelfTest` proves each check tells a good script from a bad one.

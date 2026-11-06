@@ -30,11 +30,19 @@ Because the next step is derived from the log, a turn survives process restarts 
 | `StartTool` | `tools`, per call |
 | `AskApproval` | `BeforeTool` → `hooks/approval` (`Ask` opens a durable wait, `Approver` decides on the spot, `Record` audits) |
 | `RunTool` | the `WrapTool` chain around `tool.Registry.Call` |
+| a write tool lending the turn's transaction (`Tx.Lend`) | `tool.EffectAtomic` and `AtomicJournal.Atomically`: the tool's writes and `tool.done` commit together |
 | `RecordResult` | `tool.done` in the journal, after `AfterTool` |
 | `Finish` | `verify` (`CheckOutput`) → `closing` → `done` |
 | `AskApproval` → `errAwaiting`, `Wait` | `suspended`: the run parks with `Run.Waits`, and any process resumes it with a `Signal` |
+| a decision or a stop written by a handler | `Agent.Deliver`: `wait.resolved` or `run.stopping`, no claim, `Wake` now |
+| a retry card after a crash during a send | `WaitUnknownOutcome`, answered with `Signal{Rerun: true}` (run again) or a `Value` (the result) |
+| risk class and gate reason on the approval | `Decision.Tags`, recorded on `tool.gated` |
+| the lease heartbeat on the turn row | `Renewer.Renew(runID, headSeq, until)`, refused once the head moved |
 | `Refusal` | `harness.Stop(StopGuardrail \| StopPolicy, detail)` → `stopped` |
 | limits | `hooks/budget.Limits` (+ `Agent.MaxTurns`) |
+| a conversation's turns | a chain of runs, `Input.After` naming the previous turn; `HistoryReader` over the conversation |
+| tenant and principal on the turn row | `Input.Meta`, recorded on `run.started` and read from `Run.Meta` on every resume |
+| subject snapshot and memory in the prompt | `Input.Pinned`, sent on every request of the turn and never inherited |
 
 ## Types
 

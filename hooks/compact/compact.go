@@ -56,23 +56,33 @@ func (c *Compactor) Context(ctx context.Context, r harness.Run) (harness.Edit, e
 	if full {
 		cut = max(cut, len(r.Messages)/2) // the estimate was wrong, so take at least half
 	}
-	for cut > 0 && r.Messages[cut].Role == model.RoleTool {
+	from := 0
+	if len(r.Pinned) > 0 && r.Inherited > 0 && cut > r.Inherited {
+		// An edit may not cross the pinned context: summarise the inherited part
+		// while it has something to gain, then the run's own messages.
+		if r.Inherited >= 2 {
+			cut = r.Inherited
+		} else {
+			from = r.Inherited
+		}
+	}
+	for cut > from && cut < len(r.Messages) && r.Messages[cut].Role == model.RoleTool {
 		cut--
 	}
-	if cut < 2 {
+	if cut-from < 2 {
 		return harness.Edit{}, nil // one message has nothing to gain from a summary
 	}
 	summarize := c.Summarize
 	if summarize == nil {
 		summarize = Digest
 	}
-	summary, err := summarize(ctx, r.Messages[:cut])
+	summary, err := summarize(ctx, r.Messages[from:cut])
 	if err != nil {
 		harness.Note(ctx, "summary failed, history kept: %v", err)
 		return harness.Edit{}, nil
 	}
-	harness.Note(ctx, "%d of %d messages summarised", cut, len(r.Messages))
-	return harness.Edit{To: cut, Source: c.Name(),
+	harness.Note(ctx, "%d of %d messages summarised", cut-from, len(r.Messages))
+	return harness.Edit{From: from, To: cut, Source: c.Name(),
 		With: []model.Message{model.User("[Summary of the earlier conversation]\n" + summary)}}, nil
 }
 

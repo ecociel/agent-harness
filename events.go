@@ -66,25 +66,31 @@ type Event struct {
 	Outcome  string        `json:"outcome,omitempty"`
 	Text     string        `json:"text,omitempty"`
 	Duration time.Duration `json:"duration_ns,omitempty"`
-	Index    int           `json:"index,omitempty"`   // tool.*: the call's position in the batch
-	Attempt  int           `json:"attempt,omitempty"` // model.*, tool.started
+	// FirstToken is how long a model call took to stream its first text or tool
+	// call, on model.done. Zero when nothing streamed before the end.
+	FirstToken time.Duration `json:"first_token_ns,omitempty"`
+	Index      int           `json:"index,omitempty"`   // tool.*: the call's position in the batch
+	Attempt    int           `json:"attempt,omitempty"` // model.*, tool.started, delta
 
-	Pin      *Pin            `json:"pin,omitempty"`      // run.started
-	Messages []model.Message `json:"messages,omitempty"` // run.started
-	Drift    *Drift          `json:"drift,omitempty"`    // run.claimed
-	Edit     *Edit           `json:"edit,omitempty"`     // history.edited
-	Offered  []string        `json:"offered,omitempty"`  // model.started
-	Reply    *model.Response `json:"reply,omitempty"`    // model.done, and a body's answer on body.done
-	Below    *Spend          `json:"below,omitempty"`    // body.done
-	Failure  *Failure        `json:"failure,omitempty"`  // model.failed, run.stopping
-	Recovery *Recovery       `json:"recovery,omitempty"` // model.failed
-	Decision *Decision       `json:"decision,omitempty"` // tool.gated
-	Effect   tool.Effect     `json:"effect,omitempty"`   // tool.gated
-	Handoff  *tool.Handoff   `json:"handoff,omitempty"`  // tool.done
-	Waits    []Wait          `json:"waits,omitempty"`    // the waits this event opens
-	Signal   *Signal         `json:"signal,omitempty"`   // wait.resolved
-	Verdict  *Verdict        `json:"verdict,omitempty"`  // output.checked
-	Stop     StopReason      `json:"stop,omitempty"`     // run.stopping, body.done
+	Pin      *Pin              `json:"pin,omitempty"`      // run.started
+	Messages []model.Message   `json:"messages,omitempty"` // run.started
+	After    string            `json:"after,omitempty"`    // run.started
+	Pinned   []model.Message   `json:"pinned,omitempty"`   // run.started
+	Meta     map[string]string `json:"meta,omitempty"`     // run.started
+	Drift    *Drift            `json:"drift,omitempty"`    // run.claimed
+	Edit     *Edit             `json:"edit,omitempty"`     // history.edited
+	Offered  []string          `json:"offered,omitempty"`  // model.started
+	Reply    *model.Response   `json:"reply,omitempty"`    // model.done, and a body's answer on body.done
+	Below    *Spend            `json:"below,omitempty"`    // body.done
+	Failure  *Failure          `json:"failure,omitempty"`  // model.failed, run.stopping
+	Recovery *Recovery         `json:"recovery,omitempty"` // model.failed
+	Decision *Decision         `json:"decision,omitempty"` // tool.gated
+	Effect   tool.Effect       `json:"effect,omitempty"`   // tool.gated
+	Handoff  *tool.Handoff     `json:"handoff,omitempty"`  // tool.done
+	Waits    []Wait            `json:"waits,omitempty"`    // the waits this event opens
+	Signal   *Signal           `json:"signal,omitempty"`   // wait.resolved
+	Verdict  *Verdict          `json:"verdict,omitempty"`  // output.checked
+	Stop     StopReason        `json:"stop,omitempty"`     // run.stopping, body.done
 }
 
 // EventSink receives events. It is called synchronously from the run (and, for
@@ -142,6 +148,7 @@ type parentInfo struct {
 	runID string
 	root  string
 	depth int
+	meta  map[string]string
 }
 
 // WithParent marks ctx as belonging to runID (a run, or a pattern acting as
@@ -149,10 +156,11 @@ type parentInfo struct {
 // level deeper.
 func WithParent(ctx context.Context, runID string) context.Context {
 	root := runID
+	var meta map[string]string
 	if p, ok := ctx.Value(keyParent).(parentInfo); ok {
-		root = p.root
+		root, meta = p.root, p.meta
 	}
-	return context.WithValue(ctx, keyParent, parentInfo{runID: runID, root: root, depth: Depth(ctx)})
+	return context.WithValue(ctx, keyParent, parentInfo{runID: runID, root: root, depth: Depth(ctx), meta: meta})
 }
 
 // Depth returns the nesting depth of a run started with ctx: 0 at the top, 1
@@ -219,6 +227,15 @@ func (e Event) IsCancel() bool { return e.Kind == KindRunStopping && e.Stop == S
 func (e *Event) redact(visit func(*string)) {
 	visit(&e.Text)
 	e.Messages = redactMessages(e.Messages, visit)
+	e.Pinned = redactMessages(e.Pinned, visit)
+	if e.Meta != nil {
+		meta := make(map[string]string, len(e.Meta))
+		for k, v := range e.Meta {
+			visit(&v)
+			meta[k] = v
+		}
+		e.Meta = meta
+	}
 	if e.Pin != nil {
 		p := *e.Pin
 		visit(&p.Instructions)
@@ -245,6 +262,14 @@ func (e *Event) redact(visit func(*string)) {
 	if e.Decision != nil {
 		d := *e.Decision
 		visit(&d.Reason)
+		if d.Tags != nil {
+			tags := make(map[string]string, len(d.Tags))
+			for k, v := range d.Tags {
+				visit(&v)
+				tags[k] = v
+			}
+			d.Tags = tags
+		}
 		e.Decision = &d
 	}
 	if e.Handoff != nil {

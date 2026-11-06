@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"os"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +23,8 @@ const (
 	DefaultMaxTurns   = 8
 	DefaultMaxRepairs = 2
 	DefaultLease      = 10 * time.Minute
+	// MaxMeta is how many keys Input.Meta may hold.
+	MaxMeta = 32
 )
 
 // maxInlineBackoff is the longest retry delay a worker sleeps through. A longer
@@ -36,8 +40,15 @@ type machine struct {
 	durable bool
 	hooks   hookSet
 	run     Run
+	idle    bool        // Deliver: nobody here works on the run, so a run that can move is due now
 	err     error       // the original error of a failed run, for errors.Is
 	sealed  atomic.Bool // a redactor failed: no more text leaves this worker
+
+	// appending orders this worker's appends with its renewals, so a renewal never
+	// names a head this worker is replacing.
+	appending sync.Mutex
+	head      atomic.Int64 // the highest Seq this worker appended
+	fenced    atomic.Bool  // a renewal found the head moved
 }
 
 // Run advances the run named by in as far as it can go and returns where it
@@ -57,30 +68,20 @@ func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
 	if a.Provider == nil && a.composite == nil {
 		return nil, errors.New("harness: agent has no Provider")
 	}
-	m := &machine{a: a, hooks: indexHooks(a.Hooks), journal: a.Journal, durable: a.Journal != nil}
-	if inherited, ok := ctx.Value(keyRedactors).([]Redactor); ok {
-		m.hooks.redact = slices.Concat(inherited, m.hooks.redact)
-	}
-	if m.journal == nil {
-		if j, ok := ctx.Value(keyJournal).(Journal); ok {
-			m.journal, m.durable = j, true
-		} else {
-			m.journal = NewMemJournal()
-		}
+	m := a.machine(ctx)
+	if _, ok := m.journal.(AtomicJournal); !ok && slices.ContainsFunc(a.Tools.Specs(), func(s tool.Spec) bool {
+		return s.Effect == tool.EffectAtomic
+	}) {
+		return nil, ErrNotAtomic
 	}
 	id := in.RunID
 	if id == "" {
 		id = newRunID(a.Name)
 	}
-	evs, err := m.journal.Load(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("harness: load %s: %w: %w", id, ErrDrained, err)
+	if err := m.load(ctx, id, in); err != nil {
+		return nil, err
 	}
-	r, err := Fold(evs)
-	if err != nil {
-		return nil, fmt.Errorf("harness: fold %s: %w", id, err)
-	}
-	m.run = *r
+	var err error
 	switch {
 	case m.run.State != StateStart:
 		err = m.attach(ctx, in)
@@ -98,15 +99,127 @@ func (a *Agent) Run(ctx context.Context, in Input) (*Run, error) {
 	return m.loop(ctx)
 }
 
+// Deliver records in.Signals and in.Cancel for an existing run and returns at once.
+// It claims nothing, runs no hook but the redactors, and calls no model or tool. It
+// is for a process that answers a run, such as an HTTP handler or an OAuth
+// callback, and leaves the work to a worker. A signal for no open wait, or for one
+// that expired, is ErrStaleSignal, and a repeat is ignored, as in Run.
+//
+// When it resolves the waits of a parked run, or records a cancel, the last
+// event's Wake is now, so a projection of Wake hands the run to a worker at once (a
+// sweep takes roots; a child moves when its parent does). A signal to a run that
+// is not parked keeps Wake a lease away, because its worker may still be in a
+// step. A cancel of a running run takes the next position, so its worker is fenced
+// at its next append. If the
+// worker took that position first, Deliver returns ErrFenced and wrote nothing, and
+// a repeat is safe.
+func (a *Agent) Deliver(ctx context.Context, in Input) (*Run, error) {
+	m := a.machine(ctx)
+	if in.RunID == "" {
+		return nil, fmt.Errorf("%w: no RunID", ErrNoSuchRun)
+	}
+	if err := m.load(ctx, in.RunID, Input{RunID: in.RunID}); err != nil {
+		return nil, err
+	}
+	r := &m.run
+	switch {
+	case r.State == StateStart:
+		return nil, fmt.Errorf("%w: %s", ErrNoSuchRun, in.RunID)
+	case r.State.Terminal():
+		res := m.view()
+		return &res, nil
+	}
+	evs, err := resolutions(r, in.Signals, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if in.Cancel != "" && r.State != StateClosing {
+		evs = append(evs, Event{Kind: KindRunStopping, Stop: StopCancelled, Text: in.Cancel})
+	}
+	// A worker may still be inside a step of a run that was not parked. A signal
+	// must not hand that run to a second worker, and a cancel must.
+	m.idle = r.State == StateSuspended || in.Cancel != ""
+	if err := m.record(ctx, evs...); err != nil {
+		return nil, err
+	}
+	res := m.view()
+	return &res, nil
+}
+
+// machine wires a for one call: its hooks, the redactors it inherits, and the
+// journal it runs on.
+func (a *Agent) machine(ctx context.Context) *machine {
+	m := &machine{a: a, hooks: indexHooks(a.Hooks), journal: a.Journal, durable: a.Journal != nil}
+	if inherited, ok := ctx.Value(keyRedactors).([]Redactor); ok {
+		m.hooks.redact = slices.Concat(inherited, m.hooks.redact)
+	}
+	if m.journal == nil {
+		if j, ok := ctx.Value(keyJournal).(Journal); ok {
+			m.journal, m.durable = j, true
+		} else {
+			m.journal = NewMemJournal()
+		}
+	}
+	return m
+}
+
+// load folds the run named id from the journal, on the history it inherits.
+func (m *machine) load(ctx context.Context, id string, in Input) error {
+	evs, err := m.journal.Load(ctx, id)
+	if err != nil {
+		return fmt.Errorf("harness: load %s: %w: %w", id, ErrDrained, err)
+	}
+	base, err := m.base(ctx, evs, in)
+	if err != nil {
+		return err
+	}
+	r, err := FoldOn(base, evs)
+	if err != nil {
+		return fmt.Errorf("harness: fold %s: %w", id, err)
+	}
+	m.run = *r
+	m.head.Store(r.seq)
+	return nil
+}
+
+// base is the history a chained run inherits: the journal's After for a run that
+// exists, the input's for one about to start.
+func (m *machine) base(ctx context.Context, evs []Event, in Input) ([]model.Message, error) {
+	after := in.After
+	switch {
+	case len(evs) > 0:
+		after = evs[0].After
+	case len(in.Messages) == 0:
+		return nil, nil // nothing will start
+	}
+	if after == "" {
+		return nil, nil
+	}
+	base, err := Prior(ctx, m.journal, after)
+	switch {
+	case errors.Is(err, ErrNoSuchRun) && len(evs) == 0:
+		return nil, err
+	case err != nil:
+		return nil, fmt.Errorf("harness: history of %s: %w: %w", after, ErrDrained, err)
+	}
+	return base, nil
+}
+
 // start records the run's identity, pin and input before anything else happens.
 func (m *machine) start(ctx context.Context, id string, in Input) error {
-	root := id
+	root, meta := id, in.Meta
 	p, nested := ctx.Value(keyParent).(parentInfo)
 	if nested {
 		root = p.root
+		if meta == nil {
+			meta = p.meta
+		}
+	}
+	if len(meta) > MaxMeta {
+		return fmt.Errorf("harness: Meta of %s has %d keys, at most %d", id, len(meta), MaxMeta)
 	}
 	return m.record(ctx, Event{Kind: KindRunStarted, RunID: id, RootRun: root, ParentRun: ParentRun(ctx),
-		Agent: m.a.Name, Depth: Depth(ctx), Pin: m.a.pin(), Messages: in.Messages})
+		Agent: m.a.Name, Depth: Depth(ctx), Pin: m.a.pin(), Messages: in.Messages, After: in.After, Pinned: in.Pinned, Meta: meta})
 }
 
 func (a *Agent) pin() *Pin {
@@ -309,6 +422,93 @@ func (m *machine) record(ctx context.Context, evs ...Event) error {
 	if len(evs) == 0 {
 		return nil
 	}
+	probe, stored, err := m.prepare(ctx, evs)
+	if err != nil {
+		return m.unprepared(ctx, err)
+	}
+	m.appending.Lock()
+	err = ErrFenced
+	if !m.fenced.Load() {
+		err = m.journal.Append(context.WithoutCancel(ctx), probe.ID, stored)
+	}
+	if err == nil {
+		m.head.Store(probe.seq)
+	}
+	m.appending.Unlock()
+	if err != nil {
+		return m.appendFailed(probe.ID, err)
+	}
+	m.adopt(ctx, probe, stored)
+	return nil
+}
+
+// renewing extends the lease every Lease/3 while a step runs, if the journal can.
+// The returned function stops it.
+func (m *machine) renewing(ctx context.Context) (stop func()) {
+	r, ok := m.journal.(Renewer)
+	if !ok || !m.durable {
+		return func() {}
+	}
+	lease := cmp.Or(m.a.Lease, DefaultLease)
+	id, done, stopped := m.run.ID, make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		tick := time.NewTicker(lease / 3)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+			}
+			m.appending.Lock()
+			err := r.Renew(context.WithoutCancel(ctx), id, m.head.Load(), time.Now().Add(lease))
+			m.appending.Unlock()
+			if errors.Is(err, ErrFenced) {
+				m.fenced.Store(true)
+				return
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+	}
+}
+
+// redactorFailed is how prepare reports what record must turn into a failed run.
+type redactorFailed struct{ err error }
+
+func (e *redactorFailed) Error() string { return e.err.Error() }
+
+// unprepared handles a prepare error: a redactor failure ends the run, anything
+// else stops the worker.
+func (m *machine) unprepared(ctx context.Context, err error) error {
+	var rf *redactorFailed
+	if errors.As(err, &rf) {
+		return m.fail(ctx, rf.err)
+	}
+	return err
+}
+
+func (m *machine) appendFailed(id string, err error) error {
+	if errors.Is(err, ErrConflict) || errors.Is(err, ErrFenced) {
+		return ErrFenced
+	}
+	return fmt.Errorf("harness: append %s: %w: %w", id, ErrDrained, err)
+}
+
+// adopt makes what was appended the fold, and tells the sinks.
+func (m *machine) adopt(ctx context.Context, probe Run, stored []Event) {
+	m.run = probe
+	for _, ev := range stored {
+		Emit(ctx, ev)
+	}
+}
+
+// prepare is record up to the append: it stamps, redacts and folds evs on a copy
+// of the run, and returns the copy with the events to store.
+func (m *machine) prepare(ctx context.Context, evs []Event) (Run, []Event, error) {
 	probe := m.run
 	probe.batch = slices.Clone(probe.batch)
 	now := time.Now()
@@ -330,25 +530,19 @@ func (m *machine) record(ctx context.Context, evs ...Event) error {
 			}
 		}
 		if err := m.scrub(ctx, &ev); err != nil {
-			return m.fail(ctx, err)
+			return Run{}, nil, &redactorFailed{err}
 		}
 		if err := probe.apply(ev); err != nil {
-			return err
+			return Run{}, nil, err
 		}
 	}
 	stored := probe.Events[first:]
-	stored[len(stored)-1].Wake = probe.wake(now.Add(cmp.Or(m.a.Lease, DefaultLease)))
-	if err := m.journal.Append(context.WithoutCancel(ctx), probe.ID, stored); err != nil {
-		if errors.Is(err, ErrConflict) {
-			return ErrFenced
-		}
-		return fmt.Errorf("harness: append %s: %w: %w", probe.ID, ErrDrained, err)
+	lease := now.Add(cmp.Or(m.a.Lease, DefaultLease))
+	if m.idle {
+		lease = now
 	}
-	m.run = probe
-	for _, ev := range stored {
-		Emit(ctx, ev)
-	}
-	return nil
+	stored[len(stored)-1].Wake = probe.wake(lease)
+	return probe, stored, nil
 }
 
 // fail ends the run as a failure. A hook's Stop ends it on purpose instead. A run
@@ -538,6 +732,8 @@ func (m *machine) ringTool() ToolFunc {
 func (m *machine) view() Run {
 	v := m.run
 	v.Messages = slices.Clone(v.Messages)
+	v.Pinned = slices.Clone(v.Pinned)
+	v.Meta = maps.Clone(v.Meta)
 	v.Waits = slices.Clone(v.Waits)
 	v.batch = slices.Clone(v.batch)
 	v.Events = v.Events[:len(v.Events):len(v.Events)]
@@ -567,7 +763,7 @@ func (m *machine) compose(ctx context.Context) error {
 		if e.zero() {
 			continue
 		}
-		if err := checkEdit(m.run.Messages, e); err != nil {
+		if err := checkEdit(&m.run, e); err != nil {
 			return m.fail(ctx, fmt.Errorf("hook %s: %w", h.Name(), err))
 		}
 		if err := m.record(ctx, Event{Kind: KindHistoryEdited, Hook: h.Name(), Edit: &e}); err != nil {
@@ -594,9 +790,13 @@ func (m *machine) compose(ctx context.Context) error {
 }
 
 // checkEdit validates hook output at the boundary, so the fold can trust it.
-func checkEdit(msgs []model.Message, e Edit) error {
+func checkEdit(r *Run, e Edit) error {
+	msgs := r.Messages
 	if e.From < 0 || e.To < e.From || e.To > len(msgs) {
 		return fmt.Errorf("edit range [%d:%d] outside %d messages", e.From, e.To, len(msgs))
+	}
+	if len(r.Pinned) > 0 && e.From < r.Inherited && e.To > r.Inherited {
+		return fmt.Errorf("edit range [%d:%d] crosses the pinned context at %d", e.From, e.To, r.Inherited)
 	}
 	if !balanced(slices.Concat(msgs[:e.From:e.From], e.With, msgs[e.To:])) {
 		return errors.New("edit separates a tool call from its result")
@@ -629,11 +829,13 @@ func balanced(msgs []model.Message) bool {
 // request is pure over the fold and the live tool specs.
 func (m *machine) request() model.Request {
 	r := &m.run
-	msgs := make([]model.Message, 0, len(r.Messages)+1)
+	msgs := make([]model.Message, 0, len(r.Messages)+len(r.Pinned)+1)
 	if r.Pin.Instructions != "" {
 		msgs = append(msgs, model.System(r.Pin.Instructions))
 	}
-	msgs = append(msgs, r.Messages...)
+	msgs = append(msgs, r.Messages[:r.Inherited]...)
+	msgs = append(msgs, r.Pinned...)
+	msgs = append(msgs, r.Messages[r.Inherited:]...)
 	var specs []model.ToolSpec
 	for _, s := range m.a.Tools.Specs() {
 		specs = append(specs, s.ModelSpec())
@@ -667,7 +869,19 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 		p = m.hooks.wrapModel[i].WrapModel(v, p)
 	}
 	start := time.Now()
-	resp, err := model.Collect(p.Complete(ctx, req), m.deltaSink(ctx))
+	var first time.Duration
+	sink := m.deltaSink(ctx, attempt)
+	stop := m.renewing(ctx)
+	resp, err := model.Collect(p.Complete(ctx, req), func(ev model.Event) {
+		switch ev.(type) {
+		case model.TextDelta, model.ToolCallDelta:
+			if first == 0 {
+				first = time.Since(start)
+			}
+		}
+		sink(ev)
+	})
+	stop()
 	if err != nil {
 		return m.modelFailed(ctx, req.Model, err, attempt, time.Since(start))
 	}
@@ -686,7 +900,8 @@ func (m *machine) callModel(ctx context.Context, req model.Request) error {
 		}
 	}
 	resp.Usage = billed
-	return m.record(ctx, Event{Kind: KindModelDone, Model: req.Model, Attempt: attempt, Reply: &resp, Duration: time.Since(start)})
+	return m.record(ctx, Event{Kind: KindModelDone, Model: req.Model, Attempt: attempt, Reply: &resp,
+		Duration: time.Since(start), FirstToken: first})
 }
 
 // checkReply validates hook output at the boundary, so the journal can store it.
@@ -700,12 +915,13 @@ func checkReply(h Hook, resp model.Response) error {
 }
 
 // deltaSink streams text to sinks. It sits outside the ring, so a delta is
-// redacted before it exists here.
-func (m *machine) deltaSink(ctx context.Context) func(model.Event) {
+// redacted before it exists here. A delta names its turn and attempt, so a sink can
+// drop the text of an attempt that a retry replaced.
+func (m *machine) deltaSink(ctx context.Context, attempt int) func(model.Event) {
 	turn := m.run.Turn
 	return func(ev model.Event) {
 		if d, ok := ev.(model.TextDelta); ok {
-			m.ephemeral(ctx, Event{Kind: KindDelta, Text: d.Text, Turn: turn})
+			m.ephemeral(ctx, Event{Kind: KindDelta, Text: d.Text, Turn: turn, Attempt: attempt})
 		}
 	}
 }
@@ -772,7 +988,7 @@ func (m *machine) body(ctx context.Context) error {
 // nest is the context a run hands to what it starts: a child takes its parent, its
 // journal and its redactors from here.
 func (m *machine) nest(ctx context.Context, v Run) context.Context {
-	ctx = context.WithValue(ctx, keyParent, parentInfo{runID: v.ID, root: v.RootRun, depth: v.Depth})
+	ctx = context.WithValue(ctx, keyParent, parentInfo{runID: v.ID, root: v.RootRun, depth: v.Depth, meta: v.Meta})
 	if m.durable {
 		ctx = context.WithValue(ctx, keyJournal, m.journal)
 	}
@@ -817,6 +1033,9 @@ func (m *machine) gate(ctx context.Context, calls []Call) error {
 // each result as it arrives. Tools only send on a channel: this goroutine stays
 // the only writer, so a parallel group needs no locking around the fold.
 func (m *machine) execute(ctx context.Context, calls []Call) error {
+	if calls[0].effect == tool.EffectAtomic {
+		return m.executeAtomic(ctx, calls[0])
+	}
 	started := make([]Event, len(calls))
 	for i, c := range calls {
 		started[i] = Event{Kind: KindToolStarted, Index: c.Index, Tool: c.Name, Attempt: c.attempt + 1}
@@ -832,6 +1051,7 @@ func (m *machine) execute(ctx context.Context, calls []Call) error {
 		err error
 	}
 	results := make(chan outcome, len(calls))
+	defer m.renewing(ctx)()
 	v := m.view()
 	for _, c := range calls {
 		go func() {
@@ -858,17 +1078,81 @@ func (m *machine) execute(ctx context.Context, calls []Call) error {
 	return first
 }
 
+// executeAtomic records the intent alone, then runs the call and records its result
+// in one unit of the journal, so the tool's writes and the result commit together.
+func (m *machine) executeAtomic(ctx context.Context, c Call) error {
+	if err := m.record(ctx, Event{Kind: KindToolStarted, Index: c.Index, Tool: c.Name, Attempt: c.attempt + 1}); err != nil {
+		return err
+	}
+	if stopped, err := m.cancelledAbove(ctx); stopped || err != nil {
+		return err
+	}
+	v := m.view()
+	var (
+		probe  Run
+		stored []Event
+		locked bool
+	)
+	stop := m.renewing(ctx)
+	err := m.journal.(AtomicJournal).Atomically(ctx, v.ID, func(ctx context.Context) ([]Event, error) {
+		if locked {
+			return nil, errors.New("harness: Atomically called fn twice")
+		}
+		ev, err := m.invoke1(ctx, v, c)
+		switch {
+		case err != nil && !isStop(err):
+			return nil, err
+		case m.durable && ctx.Err() != nil && ev.Outcome == "error":
+			return nil, ErrDrained // stopped under the tool: the unit says nothing about the effect
+		}
+		var perr error
+		if probe, stored, perr = m.prepare(ctx, m.outcome(ctx, ev, err)); perr != nil {
+			return nil, perr
+		}
+		m.appending.Lock() // held until the unit commits: see appending
+		locked = true
+		if m.fenced.Load() {
+			return nil, ErrFenced
+		}
+		return stored, nil
+	})
+	if err == nil {
+		m.head.Store(probe.seq)
+	}
+	if locked {
+		m.appending.Unlock()
+	}
+	stop()
+	switch {
+	case err == nil:
+		m.adopt(ctx, probe, stored)
+		return nil
+	case errors.Is(err, ErrFenced) || errors.Is(err, ErrDrained):
+		return err
+	}
+	var rf *redactorFailed
+	if errors.As(err, &rf) {
+		return m.unprepared(ctx, err)
+	}
+	return m.appendFailed(v.ID, err)
+}
+
 func isStop(err error) bool {
 	_, ok := AsStop(err)
 	return ok
 }
 
-// report records a finished call, revised by AfterTool hooks. The effect happened,
-// so a call is recorded even when its result cannot be, and a stop lands in the same
-// append as the call, so no crash can keep the fact and lose the decision.
+// report records a finished call, revised by AfterTool hooks.
 func (m *machine) report(ctx context.Context, ev Event, stop error) error {
+	return m.record(ctx, m.outcome(ctx, ev, stop)...)
+}
+
+// outcome is what a finished call records. The effect happened, so a call is recorded
+// even when its result cannot be, and a stop goes in the same append as the call, so
+// no crash can keep the fact and lose the decision.
+func (m *machine) outcome(ctx context.Context, ev Event, stop error) []Event {
 	if m.sealed.Load() {
-		return m.record(ctx, ev, m.stopEvent(errSealed))
+		return []Event{ev, m.stopEvent(errSealed)}
 	}
 	if ev.Outcome == "ok" || ev.Outcome == "error" {
 		c := m.run.batch[ev.Index]
@@ -888,9 +1172,9 @@ func (m *machine) report(ctx context.Context, ev Event, stop error) error {
 		}
 	}
 	if stop != nil {
-		return m.record(ctx, ev, m.stopEvent(stop))
+		return []Event{ev, m.stopEvent(stop)}
 	}
-	return m.record(ctx, ev)
+	return []Event{ev}
 }
 
 // invoke1 runs one call through its middleware. A fenced or drained child means

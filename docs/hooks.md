@@ -21,9 +21,23 @@ One rule makes hooks safe across a crash: **a hook only ever returns a value.** 
 
 `Redact` is special. It is a ring, not a step: it wraps the provider and the tools directly, inside `WrapModel` and `WrapTool`, and every durable event passes through it again. A redactor that fails ends the run with the text discarded. Children inherit it. While one is attached, a reply reaches sinks only when complete, unless the redactor also implements `ModelMiddleware` to filter the stream.
 
+A `BeforeTool` decision can carry `Tags`, free-form facts such as a risk class or a reason code. They are recorded on `tool.gated` and redacted, so a later fold or a page reads them from the journal without the hook. The model never sees them.
+
 Retries belong in `Recover`, not `WrapModel`: an attempt inside middleware isn't journaled, so a crash forgets it.
 
 [examples/hooks](../examples/hooks/README.md) has a small runnable program for every point and every package below.
+
+## Answering a run without working on it
+
+`Agent.Deliver(ctx, in)` records `in.Signals` and `in.Cancel` and returns. It claims nothing, runs no hook except the redactors, and calls no model or tool. An HTTP handler that takes a decision, or an OAuth callback, uses it and leaves the work to a worker. A signal for no open wait, or an expired one, is `ErrStaleSignal`, and a repeat is ignored. When it resolves the waits of a parked run, or records a cancel, the last event's `Wake` is now, so a projection of `Wake` hands it to a worker at once. A signal to a run that is not parked leaves `Wake` a lease away, because its worker may still be in a step. A cancel of a running run fences its worker. If the worker appended first, `Deliver` returns `ErrFenced`, and sending it again is safe.
+
+## A tool's writes in the journal's transaction
+
+A tool with `Effect: tool.EffectAtomic` needs an `AtomicJournal`, or `Run` returns `ErrNotAtomic`. The machine records `tool.started` alone, then calls `Atomically(ctx, runID, fn)`. Inside `fn` run the `WrapTool` chain, the redactors, the tool and the `AfterTool` hooks, and `fn` returns the call's `tool.done`. The store appends it in the same unit as the tool's writes. A tool error is still a result: the store undoes the writes and records the error text. A tool whose statement fails must return the error, because on PostgreSQL the transaction is aborted and an "ok" result could not be appended. `WrapTool` and `AfterTool` hooks of an atomic call therefore run inside the unit, so keep them short.
+
+## Long steps
+
+A model call or a tool that may take longer than `Agent.Lease` would be swept as a crash. Renewal covers those two steps only, so a slow hook, such as a summariser in `Context`, still needs a lease above its duration. A journal that implements `Renewer` avoids that: every `Lease/3` during a step the worker calls `Renew(ctx, runID, headSeq, until)`, and the store moves the run's wake only while `headSeq` is still its last position. A refused renewal returns `ErrFenced`, and the worker stops at its next append. `journal/postgres` keeps `head_seq` on its run row for this.
 
 ## Sinks
 
