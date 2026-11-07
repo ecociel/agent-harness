@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -168,5 +169,53 @@ func TestModelDoneRecordsTheTimeToTheFirstToken(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A store that projects open waits from events finds a lost call's wait on its tool.lost.
+func TestALostCallsWaitIsOnItsEvent(t *testing.T) {
+	ctx := context.Background()
+	inner := harness.NewMemJournal()
+	w := newWorld()
+	build := func(j harness.Journal) *harness.Agent {
+		return &harness.Agent{Journal: j, Provider: w.provider("pay", "ship"),
+			Tools: tool.NewRegistry(w.tool("pay", tool.EffectOnce), w.tool("ship", tool.EffectOnce))}
+	}
+	in := harness.Prompt("go")
+	in.RunID = "lost"
+	// The seventh append is ship's tool.started, after pay is done.
+	if _, err := build(&crashJournal{Journal: inner, at: 7, after: true}).Run(ctx, in); !errors.Is(err, harness.ErrDrained) {
+		t.Fatalf("want a crash, got %v", err)
+	}
+	var mu sync.Mutex
+	var sunk []harness.Wait
+	sink := harness.WithEvents(ctx, func(e harness.Event) {
+		if e.Kind == harness.KindToolLost {
+			mu.Lock()
+			sunk = append(sunk, e.Waits...)
+			mu.Unlock()
+		}
+	})
+	res, err := build(inner).Run(sink, harness.Resume("lost"))
+	if err != nil || res.State != harness.StateSuspended || len(res.Waits) != 1 {
+		t.Fatalf("%v %+v", err, res)
+	}
+	want := harness.Wait{ID: res.Waits[0].ID, Run: "lost", Call: 1, Kind: harness.WaitUnknownOutcome,
+		Detail: "the outcome of ship is unknown"}
+	if res.Waits[0] != want || !strings.HasPrefix(want.ID, "w_") {
+		t.Fatalf("wait %+v, want %+v", res.Waits[0], want)
+	}
+	evs := mustLoad(t, inner, "lost")
+	lost := slices.IndexFunc(evs, func(e harness.Event) bool { return e.Kind == harness.KindToolLost })
+	if lost < 0 || !slices.Equal(evs[lost].Waits, []harness.Wait{want}) {
+		t.Fatalf("tool.lost carries %+v", evs[lost].Waits)
+	}
+	if !slices.Equal(sunk, []harness.Wait{want}) {
+		t.Fatalf("the sink saw %+v", sunk)
+	}
+	evs[lost].Waits = nil
+	old, err := harness.Fold(evs)
+	if err != nil || !slices.Equal(old.Waits, []harness.Wait{want}) {
+		t.Fatalf("a journal without the field folds to %v %+v", err, old)
 	}
 }

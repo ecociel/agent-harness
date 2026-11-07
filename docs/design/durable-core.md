@@ -221,7 +221,7 @@ A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `Check
 | `model.started` | No call happened, `compose` repeats | `model.lost`, new attempt, may have been billed |
 | `model.done` | Billed and lost, same as the cell above | Usage folded once, routing continues |
 | `tool.gated` | Hooks rerun | The claim voids `allow`, hooks rerun, `await` waits stand |
-| `tool.started` | No effect, decisions redone | `tool.lost`: `EffectOnce` suspends on an unknown outcome. Others return to `gate`, so `BeforeTool` hooks and approvals run again, then the tool reruns under the same key |
+| `tool.started` | No effect, decisions redone | `tool.lost`: `EffectOnce` suspends on an unknown outcome, and the event carries that wait like every event that opens one. Others return to `gate`, so `BeforeTool` hooks and approvals run again, then the tool reruns under the same key |
 | `tool.done` | Effect happened, result lost, same as the cell above | The result stands |
 | `wait.resolved` | The sender retries | A duplicate is ignored |
 | `body.done` | The body reruns, and finished children answer from their journals | The outcome stands, and the body doesn't run again |

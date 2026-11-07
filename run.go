@@ -365,6 +365,9 @@ func (m *machine) loop(ctx context.Context) (*Run, error) {
 			evs := make([]Event, len(s.calls))
 			for i, c := range s.calls {
 				evs[i] = Event{Kind: KindToolLost, Index: c.Index, Tool: c.Name}
+				if c.effect == tool.EffectOnce {
+					evs[i].Waits = []Wait{lostWait(c)}
+				}
 			}
 			err = m.record(ctx, evs...)
 		case stepVerify:
@@ -523,7 +526,11 @@ func (m *machine) prepare(ctx context.Context, evs []Event) (Run, []Event, error
 		for i := range ev.Waits {
 			w := &ev.Waits[i]
 			if w.ID == "" {
-				w.ID, w.Run = waitID(ev.RunID, ev.Seq, i), ev.RunID
+				n := i
+				if ev.Kind == KindToolLost {
+					n = ev.Index // the ID Fold derives for a tool.lost that carries no wait
+				}
+				w.ID, w.Run = waitID(ev.RunID, ev.Seq, n), ev.RunID
 				if w.TTL > 0 {
 					w.Expires = now.Add(w.TTL)
 				}

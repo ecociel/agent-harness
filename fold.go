@@ -343,8 +343,13 @@ func (r *Run) apply(ev Event) error {
 		c := &r.batch[ev.Index]
 		if c.effect == tool.EffectOnce {
 			c.status = callAwaiting
-			r.addWaits([]Wait{{ID: waitID(r.ID, ev.Seq, ev.Index), Run: r.ID, Call: ev.Index,
-				Kind: WaitUnknownOutcome, Detail: "the outcome of " + c.Name + " is unknown"}})
+			waits := ev.Waits
+			if len(waits) == 0 { // a journal from before tool.lost carried its wait
+				w := lostWait(*c)
+				w.ID, w.Run = waitID(r.ID, ev.Seq, ev.Index), r.ID
+				waits = []Wait{w}
+			}
+			r.addWaits(waits)
 		} else {
 			r.redecide(c, "the tool changed while this call was in flight, so its outcome is unknown")
 		}
@@ -756,6 +761,11 @@ func (r *Run) nextGroup() []Call {
 // call id, which can repeat across turns, plays no part.
 func callKey(runID string, turn, index int) string {
 	return hash(fmt.Sprintf("%s\x00%d\x00%d", runID, turn, index))
+}
+
+// lostWait is the wait a lost once-only call opens, so a person says what happened.
+func lostWait(c Call) Wait {
+	return Wait{Call: c.Index, Kind: WaitUnknownOutcome, Detail: "the outcome of " + c.Name + " is unknown"}
 }
 
 // waitID is unique per opening: a wait opened again gets a new ID, so an answer to

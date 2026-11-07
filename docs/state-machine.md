@@ -58,7 +58,7 @@ A crash can land between any two events, and each case has one answer, because t
 |---|---|---|
 | `model.started` | the call may have been billed, and its reply is gone | records `model.lost`, counts it in `LostCalls` and calls again |
 | `tool.started` on `EffectRead` or `EffectIdempotent` | the effect is safe to repeat | records `tool.lost` and runs the call again, with the same idempotency key |
-| `tool.started` on `EffectOnce` | nobody can know whether it happened | records `tool.lost` and opens a `WaitUnknownOutcome` wait, so a person answers |
+| `tool.started` on `EffectOnce` | nobody can know whether it happened | records `tool.lost` carrying a `WaitUnknownOutcome` wait in `Waits`, so a person answers |
 | `tool.done` | the effect happened and the result is safe | carries on |
 
 Spend is a bound, not exact: `ModelCalls <= billed <= ModelCalls + LostCalls`.
