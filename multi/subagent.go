@@ -25,11 +25,12 @@ import (
 // lead (guard, approval, budget) applies to it too. Depth is capped so
 // delegation cannot recurse forever.
 //
-// The child's run ID is the call's idempotency key, so a repeated call reaches the
-// same child and a finished child answers from its journal. That is why the tool is
-// EffectIdempotent whatever the child does: the child's own tools carry their own
-// classes. A child's waits surface at the root, and a signal sent there comes back
-// down through this tool.
+// The child's run ID is the lead's run ID, "/" and the call's idempotency key, so a
+// repeated call reaches the same child, a finished child answers from its journal,
+// and a store that routes runs by a prefix of the ID keeps the child with its lead.
+// That is why the tool is EffectIdempotent whatever the child does: the child's own
+// tools carry their own classes. A child's waits surface at the root, and a signal
+// sent there comes back down through this tool.
 type Subagent struct {
 	Name        string
 	Description string
@@ -65,7 +66,7 @@ func (sa Subagent) Tool() tool.Tool {
 	}), child: sa.Agent}
 }
 
-// childTool is a tool that starts a run named by its prefix and the call's key.
+// childTool is a tool that starts the run childID names.
 type childTool struct {
 	tool.Tool
 	child  harness.Runner
@@ -74,7 +75,17 @@ type childTool struct {
 
 // CancelChild implements harness.ChildTool.
 func (t childTool) CancelChild(ctx context.Context, reason string) error {
-	return cancelChild(ctx, t.child, t.prefix+tool.IdempotencyKey(ctx), reason)
+	return cancelChild(ctx, t.child, childID(ctx, t.prefix), reason)
+}
+
+// childID names the run a tool call starts: the calling run's ID, "/", prefix and the
+// call's key. It derives from the call, so a retry or a resume reaches the same child.
+func childID(ctx context.Context, prefix string) string {
+	id := prefix + tool.IdempotencyKey(ctx)
+	if parent := harness.ParentRun(ctx); parent != "" {
+		return parent + "/" + id
+	}
+	return id
 }
 
 func (sa Subagent) delegate(ctx context.Context, task string) (string, error) {
@@ -82,7 +93,7 @@ func (sa Subagent) delegate(ctx context.Context, task string) (string, error) {
 		return "", fmt.Errorf("delegation depth %d exceeds limit %d", d, sa.maxDepth())
 	}
 	in := harness.Prompt(task)
-	in.RunID, in.Signals = tool.IdempotencyKey(ctx), harness.Signals(ctx)
+	in.RunID, in.Signals = childID(ctx, ""), harness.Signals(ctx)
 	harness.Emit(ctx, harness.Event{Kind: harness.KindPattern, Agent: sa.Name, Hook: "subagent", Outcome: "delegate"})
 	res, err := deliver(ctx, sa.Agent, in)
 	return sa.result(res, err)
@@ -206,7 +217,7 @@ func (b *Background) launch(ctx context.Context, sa Subagent, in harness.Input) 
 
 func (b *Background) start(ctx context.Context, sa Subagent, task string) string {
 	in := harness.Prompt(task)
-	in.RunID = jobPrefix(sa) + tool.IdempotencyKey(ctx)
+	in.RunID = childID(ctx, jobPrefix(sa))
 	durable := make(chan struct{})
 	var once sync.Once
 	ctx = harness.WithEvents(ctx, func(e harness.Event) {
@@ -224,9 +235,17 @@ func (b *Background) start(ctx context.Context, sa Subagent, task string) string
 
 func jobPrefix(sa Subagent) string { return sa.Name + "/" }
 
+// jobName reads the sub-agent's name from a job id, the segment before the key.
+func jobName(id string) string {
+	i := strings.LastIndex(id, "/")
+	if i < 0 {
+		return ""
+	}
+	return id[strings.LastIndex(id[:i], "/")+1 : i]
+}
+
 func (b *Background) collect(ctx context.Context, id string, wait bool) (string, error) {
-	name, _, _ := strings.Cut(id, "/")
-	i := slices.IndexFunc(b.subs, func(sa Subagent) bool { return sa.Name == name })
+	i := slices.IndexFunc(b.subs, func(sa Subagent) bool { return jobName(id) == sa.Name })
 	if i < 0 {
 		return "", fmt.Errorf("no job %q", id)
 	}

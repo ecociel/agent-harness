@@ -69,6 +69,6 @@ Feedback can come from UX design (implicit signals) or from **online evaluators*
 ### Where the design changed because of the video
 
 - The plugin points were renamed and regrouped around the video's four middleware moments (*before agent*, *before model*, *wrap model*, *wrap tool*). Wrapping is real middleware (`next` chains), not before/after pairs, so retry, tracing and offloading compose naturally.
-- Summarisation is a `BeforeModel` hook, as in the talk, not a step of its own (corporate-admin compacts inside `CallModel`). The compose state stays generic.
+- Summarisation is a `BeforeModel` hook, as in the talk, not a step of its own. The compose state stays generic.
 - Model profiles became a built-in hook.
 - Trajectories became a hook of their own, separate from traces, because the talk treats them as different views.

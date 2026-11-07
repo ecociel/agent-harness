@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
+
+	"github.com/ecociel/agent-harness/model"
 )
 
 // Journal is the one durable thing: an append-only log of events per run. It is
@@ -19,7 +22,7 @@ import (
 // One projection replaces a third method. The last event of every append carries
 // Wake: when this run next needs someone to call Run, or zero if nobody needs to,
 // because it ended or only a signal can move it. A running run's Wake is its Lease
-// past that append, so a crashed worker and a drained one look the same. A parked
+// past that append, or past its last renewal (see Renewer), so a crashed worker and a drained one look the same. A parked
 // run's Wake is its earliest expiry. Project Wake and the event's To into a row per
 // run and one query finds everything that needs a worker:
 //
@@ -46,6 +49,44 @@ type Journal interface {
 	Load(ctx context.Context, runID string) ([]Event, error)
 }
 
+// AtomicJournal is a Journal that can commit a tool's writes with the record of the
+// call. It is optional, and only a run with an EffectAtomic tool needs it.
+//
+// Atomically opens the store's own unit of work, such as a transaction, calls fn once with
+// a context that carries it, appends the events fn returns in the same unit, and
+// commits. A store that retries a unit must not call fn again: fn runs the tool.
+// If fn fails, nothing is stored and its error is returned. If a position is
+// taken, the unit rolls back with the tool's writes and Atomically returns
+// ErrConflict, which the run reports as ErrFenced. The store gives the tool its unit
+// through an accessor of its own, so the harness never sees its type.
+//
+// The run records tool.started alone first, then calls Atomically with an fn that
+// runs the WrapTool chain, the redactors and the tool, then AfterTool, and returns
+// the call's tool.done. A tool error is not an fn error. When tool.done says Outcome
+// "error", the store undoes what fn wrote and still appends the events, so the error
+// text is the recorded result. A crash leaves tool.started with nothing committed,
+// and the call is decided again and runs under the same key. Sinks hear the events
+// after the commit.
+type AtomicJournal interface {
+	Journal
+	Atomically(ctx context.Context, runID string, fn func(ctx context.Context) ([]Event, error)) error
+}
+
+// Renewer is a Journal that can extend a working run's Wake without an event. It
+// is optional. While a model call or a tool execution (not a hook) runs longer than a third of
+// Agent.Lease, the worker calls Renew every Lease/3 from its own goroutine, with
+// headSeq the highest Seq it has appended. A store renews only while that is still
+// the run's head, so a fenced worker cannot keep a run alive:
+//
+//	UPDATE runs SET wake = $until WHERE run_id = $1 AND head_seq = $2
+//
+// and returns ErrFenced when the head has moved. The worker then stops at its next
+// append. Without a Renewer, Wake is the last append plus Lease, and a step slower
+// than the lease is swept.
+type Renewer interface {
+	Renew(ctx context.Context, runID string, headSeq int64, until time.Time) error
+}
+
 // Lineage is what a run needs from a run above it, before its next step.
 type Lineage struct {
 	Parent    string // the run above this one, empty at the root
@@ -62,6 +103,54 @@ type Lineage struct {
 // runs then fall back to Load. An unknown run has the zero Lineage.
 type LineageReader interface {
 	Lineage(ctx context.Context, runID string) (Lineage, error)
+}
+
+// HistoryReader is a Journal that can answer for a finished run's final history
+// without its caller walking the run's After chain one Load at a time. It is
+// optional: without it, Prior folds each predecessor in turn. History returns what
+// Prior would, and ErrNoSuchRun for a run that is unknown or not finished.
+type HistoryReader interface {
+	History(ctx context.Context, runID string) ([]model.Message, error)
+}
+
+// Prior returns the final history of a finished run: what a run started with After
+// set to runID inherits. It never holds that run's Pinned context. A run that is
+// unknown or not finished is ErrNoSuchRun.
+func Prior(ctx context.Context, j Journal, runID string) ([]model.Message, error) {
+	if h, ok := j.(HistoryReader); ok {
+		return h.History(ctx, runID)
+	}
+	return prior(ctx, j, runID, map[string]bool{})
+}
+
+// prior walks the chain through Load. A chain that returns to a run it passed can
+// only come from a damaged journal.
+func prior(ctx context.Context, j Journal, runID string, seen map[string]bool) ([]model.Message, error) {
+	if seen[runID] {
+		return nil, fmt.Errorf("%w: the history of %s leads back to it", ErrIllegalTransition, runID)
+	}
+	seen[runID] = true
+	evs, err := j.Load(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if len(evs) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoSuchRun, runID)
+	}
+	var base []model.Message
+	if after := evs[0].After; after != "" {
+		if base, err = prior(ctx, j, after, seen); err != nil {
+			return nil, err
+		}
+	}
+	r, err := FoldOn(base, evs)
+	switch {
+	case err != nil:
+		return nil, err
+	case !r.State.Terminal():
+		return nil, fmt.Errorf("%w: %s has not finished", ErrNoSuchRun, runID)
+	}
+	return append([]model.Message{}, r.Messages...), nil
 }
 
 // lineage asks j for one run, through Load if j has no faster way.
@@ -98,11 +187,15 @@ var (
 	// names no wait of this run or arrives after the wait expired.
 	ErrStaleSignal = errors.New("harness: signal does not match an open wait")
 	// ErrNoSuchRun is what Run returns, writing nothing, when asked to continue a
-	// run that has no journal and was given no Messages to start from.
+	// run that has no journal and was given no Messages to start from, or to start
+	// one whose After names no finished run.
 	ErrNoSuchRun = errors.New("harness: no such run")
 	// ErrNotDurable ends a run that must suspend but has no Journal to resume
 	// from.
 	ErrNotDurable = errors.New("harness: suspending needs Agent.Journal")
+	// ErrNotAtomic is what Run returns, writing nothing, when the agent has an
+	// EffectAtomic tool and its Journal is not an AtomicJournal.
+	ErrNotAtomic = errors.New("harness: an EffectAtomic tool needs an AtomicJournal")
 )
 
 type memJournal struct {
@@ -124,6 +217,26 @@ func (j *memJournal) Append(_ context.Context, runID string, evs []Event) error 
 		return fmt.Errorf("%w: %s at %d", ErrConflict, runID, evs[0].Seq)
 	}
 	j.runs[runID] = append(j.runs[runID], evs...)
+	return nil
+}
+
+// Atomically has no transaction to offer: it runs fn and appends what it returns.
+// A tool's writes outside the journal are not undone.
+func (j *memJournal) Atomically(ctx context.Context, runID string, fn func(context.Context) ([]Event, error)) error {
+	evs, err := fn(ctx)
+	if err != nil {
+		return err
+	}
+	return j.Append(ctx, runID, evs)
+}
+
+// Renew has no Wake to extend, and only checks the head.
+func (j *memJournal) Renew(_ context.Context, runID string, headSeq int64, _ time.Time) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if int64(len(j.runs[runID])) != headSeq {
+		return fmt.Errorf("%w: %s moved past %d", ErrFenced, runID, headSeq)
+	}
 	return nil
 }
 

@@ -68,7 +68,6 @@
 //
 // # Providers
 //
-// A model.Provider streams events (iter.Seq2), the same shape as
-// corporate-admin's llm.Provider. provider/fake is deterministic for tests;
-// provider/openai and provider/anthropic talk to real APIs.
+// A model.Provider streams events (iter.Seq2). provider/fake is deterministic
+// for tests; provider/openai and provider/anthropic talk to real APIs.
 package harness

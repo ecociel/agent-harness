@@ -1,6 +1,10 @@
 // Package openai is a model.Provider for any OpenAI-compatible
 // /chat/completions endpoint, with streaming and tool calls.
 //
+// Parts go before the text of a user message: an image as an image_url data URL,
+// WAV or MP3 audio as input_audio, and a document as a file where the endpoint
+// takes files. Any other part goes as its text alternative.
+//
 // The endpoint is stateless and returns nothing that must go back on the next call, so
 // this adapter never fills Opaque and ignores what another provider left there.
 package openai
@@ -8,6 +12,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +38,9 @@ type Provider struct {
 	Client *http.Client
 	// Headers are added to every request (e.g. OpenRouter attribution).
 	Headers map[string]string
+	// Files says the endpoint takes documents as file parts. Without it a document
+	// goes as its text alternative.
+	Files bool
 }
 
 // FromEnv builds a provider from OPENAI_BASE_URL (default
@@ -57,12 +65,36 @@ type wireToolCall struct {
 	Function wireFunc `json:"function"`
 }
 
+// wireMessage.Content is a *string, nil for an assistant message of only tool
+// calls, or a []wirePart.
 type wireMessage struct {
 	Role       string         `json:"role"`
-	Content    *string        `json:"content"`
+	Content    any            `json:"content"`
 	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 	Name       string         `json:"name,omitempty"`
+}
+
+type wirePart struct {
+	Type       string     `json:"type"`
+	Text       string     `json:"text,omitempty"`
+	ImageURL   *wireURL   `json:"image_url,omitempty"`
+	InputAudio *wireAudio `json:"input_audio,omitempty"`
+	File       *wireFile  `json:"file,omitempty"`
+}
+
+type wireURL struct {
+	URL string `json:"url"`
+}
+
+type wireAudio struct {
+	Data   string `json:"data"`
+	Format string `json:"format"`
+}
+
+type wireFile struct {
+	Filename string `json:"filename,omitempty"`
+	FileData string `json:"file_data"`
 }
 
 type wireTool struct {
@@ -122,8 +154,9 @@ func (e apiError) kind() string {
 }
 
 // classify reads the error code. A 429 for an empty account is not a rate limit:
-// waiting cannot help, and a person has to fix it.
-func classify(status int, e apiError) model.ErrorClass {
+// waiting cannot help, and a person has to fix it. Compatible servers word a refused
+// part in many ways, so a refusal of a request that carried one is taken as the part's.
+func classify(status int, e apiError, binary bool) model.ErrorClass {
 	switch e.kind() {
 	case "context_length_exceeded", "string_above_max_length":
 		return model.ClassContextLength
@@ -136,6 +169,9 @@ func classify(status int, e apiError) model.ErrorClass {
 	}
 	if strings.Contains(strings.ToLower(e.Message), "maximum context length") {
 		return model.ClassContextLength
+	}
+	if binary && httperr.Refused(status) {
+		return model.ClassContent
 	}
 	if status == 0 && e.Type == "invalid_request_error" {
 		return model.ClassInvalid
@@ -156,7 +192,9 @@ func finishReason(s string) model.FinishReason {
 	return ""
 }
 
-func encode(req model.Request, def string) wireRequest {
+// encode also counts the parts it sends natively, which is what a refusal can be about.
+func encode(req model.Request, def string, files bool) (wireRequest, int, error) {
+	binary := 0
 	w := wireRequest{Model: req.Model, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Stream: true,
 		StreamOptions: map[string]any{"include_usage": true}}
 	if w.Model == "" {
@@ -167,6 +205,26 @@ func encode(req model.Request, def string) wireRequest {
 		wm := wireMessage{Role: string(m.Role), Content: &content, ToolCallID: m.ToolCallID}
 		if m.Role == model.RoleAssistant && len(m.ToolCalls) > 0 && content == "" {
 			wm.Content = nil
+		}
+		if len(m.Parts) > 0 {
+			if m.Role != model.RoleUser {
+				return w, 0, &model.Error{Class: model.ClassInvalid, Err: fmt.Errorf("openai: parts on a %s message", m.Role)}
+			}
+			parts := make([]wirePart, 0, len(m.Parts)+1)
+			for _, p := range m.Parts {
+				wp, native, err := encodePart(p, files)
+				if err != nil {
+					return w, 0, err
+				}
+				if native {
+					binary++
+				}
+				parts = append(parts, wp)
+			}
+			if content != "" {
+				parts = append(parts, wirePart{Type: "text", Text: content})
+			}
+			wm.Content = parts
 		}
 		for _, c := range m.ToolCalls {
 			wm.ToolCalls = append(wm.ToolCalls, wireToolCall{ID: c.ID, Type: "function",
@@ -180,12 +238,41 @@ func encode(req model.Request, def string) wireRequest {
 		wt.Function.Name, wt.Function.Description, wt.Function.Parameters = t.Name, t.Description, t.Parameters
 		w.Tools = append(w.Tools, wt)
 	}
-	return w
+	return w, binary, nil
+}
+
+// audioFormats are the input_audio formats, by media type.
+var audioFormats = map[string]string{"audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/mpeg": "mp3", "audio/mp3": "mp3"}
+
+// encodePart sends p natively where it can, and otherwise as its text.
+func encodePart(p model.Part, files bool) (wirePart, bool, error) {
+	if p.Bytes != nil {
+		switch {
+		case p.Kind == model.PartImage:
+			return wirePart{Type: "image_url", ImageURL: &wireURL{URL: dataURL(p)}}, true, nil
+		case p.Kind == model.PartAudio && audioFormats[p.MediaType] != "":
+			return wirePart{Type: "input_audio", InputAudio: &wireAudio{Data: base64.StdEncoding.EncodeToString(p.Bytes), Format: audioFormats[p.MediaType]}}, true, nil
+		case p.Kind == model.PartDocument && files:
+			return wirePart{Type: "file", File: &wireFile{Filename: p.Name, FileData: dataURL(p)}}, true, nil
+		}
+	}
+	if p.Text == "" {
+		return wirePart{}, false, &model.Error{Class: model.ClassContent, Err: fmt.Errorf("openai: cannot send %s part %s (%s) and it has no text", p.Kind, p.Ref, p.MediaType)}
+	}
+	return wirePart{Type: "text", Text: p.Text}, false, nil
+}
+
+func dataURL(p model.Part) string {
+	return "data:" + p.MediaType + ";base64," + base64.StdEncoding.EncodeToString(p.Bytes)
 }
 
 // send makes one call and returns a 2xx response, or a classified error.
 func (p *Provider) send(ctx context.Context, req model.Request) (*http.Response, error) {
-	body, err := json.Marshal(encode(req, p.Model))
+	w, binary, err := encode(req, p.Model, p.Files)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(w)
 	if err != nil {
 		return nil, &model.Error{Class: model.ClassInvalid, Err: err}
 	}
@@ -218,7 +305,7 @@ func (p *Provider) send(ctx context.Context, req model.Request) (*http.Response,
 		Error apiError `json:"error"`
 	}
 	_ = json.Unmarshal(msg, &e) // a body that is not JSON leaves the status to decide
-	return nil, &model.Error{Class: classify(resp.StatusCode, e.Error),
+	return nil, &model.Error{Class: classify(resp.StatusCode, e.Error, binary > 0),
 		RetryAfter: httperr.RetryAfter(resp.Header, time.Now()),
 		Err:        &StatusError{Code: resp.StatusCode, Body: string(msg)}}
 }
@@ -250,7 +337,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request) iter.Seq2[mo
 			if len(ch.Error) > 0 && string(ch.Error) != "null" {
 				e := apiError{Message: string(ch.Error)}
 				_ = json.Unmarshal(ch.Error, &e)
-				ierr = &model.Error{Class: classify(0, e), Err: fmt.Errorf("openai: %s", e.Message)}
+				ierr = &model.Error{Class: classify(0, e, false), Err: fmt.Errorf("openai: %s", e.Message)}
 				return false
 			}
 			if ch.Usage != nil {

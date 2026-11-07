@@ -37,6 +37,12 @@ func fill(v reflect.Value, path string, visited *[]string) {
 		}
 		v.Set(reflect.MakeSlice(v.Type(), 1, 1))
 		fill(v.Index(0), path+"[]", visited)
+	case reflect.Map:
+		if v.Type().Elem().Kind() == reflect.String {
+			v.Set(reflect.MakeMap(v.Type()))
+			v.SetMapIndex(reflect.ValueOf("key"), reflect.ValueOf(secret))
+			*visited = append(*visited, path+"{}")
+		}
 	case reflect.String:
 		if v.Type() == reflect.TypeOf("") {
 			v.SetString(secret)
@@ -48,7 +54,11 @@ func fill(v reflect.Value, path string, visited *[]string) {
 // identifiers lists the strings a redactor deliberately does not see: run and
 // call identity, tool and model names, and hook names. A new string field fails
 // this test until someone decides which side it is on.
-var identifiers = regexp.MustCompile(`\.(RunID|RootRun|ParentRun|Agent|Hook|Tool|Offered\[\]|Name|ID|ToolCallID|Source|Target|Key|Run|Kind|Wait|By|Model|Outcome)$|\.Tools\[\]$|\.Decision\.Wait\.`)
+var identifiers = regexp.MustCompile(`\.(RunID|RootRun|ParentRun|Agent|Hook|Tool|Offered\[\]|Name|ID|ToolCallID|Source|Target|Key|Run|Kind|Wait|By|Model|Outcome|After|Ref|MediaType)$|\.Tools(\[\]|\{\})$|\.Decision\.Wait\.`)
+
+// consumerText overrides identifiers: a part's name is a file name the consumer
+// chose, so it is text, not identity.
+var consumerText = regexp.MustCompile(`\.Parts\[\]\.Name$`)
 
 func TestRedactionCoversEveryString(t *testing.T) {
 	var ev Event
@@ -62,7 +72,7 @@ func TestRedactionCoversEveryString(t *testing.T) {
 	})
 	got := reflect.ValueOf(ev)
 	for _, p := range paths {
-		if identifiers.MatchString(p) {
+		if identifiers.MatchString(p) && !consumerText.MatchString(p) {
 			continue
 		}
 		if s := lookup(got, strings.TrimPrefix(p, "Event.")); strings.Contains(s, secret) {
@@ -73,14 +83,17 @@ func TestRedactionCoversEveryString(t *testing.T) {
 
 func lookup(v reflect.Value, path string) string {
 	for _, part := range strings.Split(path, ".") {
-		idx := strings.HasSuffix(part, "[]")
-		part = strings.TrimSuffix(part, "[]")
+		idx, key := strings.HasSuffix(part, "[]"), strings.HasSuffix(part, "{}")
+		part = strings.TrimSuffix(strings.TrimSuffix(part, "[]"), "{}")
 		for v.Kind() == reflect.Pointer {
 			v = v.Elem()
 		}
 		v = v.FieldByName(part)
 		if idx {
 			v = v.Index(0)
+		}
+		if key {
+			v = v.MapIndex(reflect.ValueOf("key"))
 		}
 	}
 	for v.Kind() == reflect.Pointer {

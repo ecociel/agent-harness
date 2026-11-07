@@ -11,7 +11,7 @@ p := &multi.Sequential{Name: "pipeline", Steps: []harness.Runner{planner, writer
 res, err := p.Run(ctx, harness.Prompt("Explain the inner loop"))
 ```
 
-- **Input to step i+1.** By default this is a new user prompt quoting the *original request* and the previous step's output. Override it with `Next func(original harness.Input, prev *harness.Result) harness.Input`.
+- **Input to step i+1.** By default this is a new user prompt quoting the *original request* and the previous step's output. Override it with `Next func(original harness.Input, prev *harness.Run) harness.Input`.
 - **Stop rule.** The pipeline stops at the first step that doesn't complete and returns that step's stop reason (`Detail` names the step).
 - **Events.** `pattern` with `step` (`"2/3 writer"`) before each step.
 

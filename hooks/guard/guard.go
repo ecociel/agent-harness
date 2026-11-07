@@ -36,25 +36,34 @@ type Rule struct {
 func R(name, pattern string) Rule { return Rule{Name: name, Pattern: regexp.MustCompile(pattern)} }
 
 // PII returns rules for common personal data: e-mail addresses, payment card
-// numbers, IBANs and Swiss AHV numbers.
+// numbers, IBANs, Swiss AHV numbers and Swiss phone numbers. Every rule has an
+// upper bound on a match (an e-mail local part up to 64 characters, a domain up to
+// 255), so the set works with Stream and a Pseudonymizer window.
 func PII() []Rule {
 	return []Rule{
-		R("email", `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`),
+		R("email", `[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}`),
 		// IBAN and AHV come before card so their digits are not taken for a
 		// card number (rules are applied in order).
 		R("iban", `\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b`),
 		R("ahv", `\b756\.\d{4}\.\d{4}\.\d{2}\b`),
+		// Swiss numbers only, in their grouped forms (+41 79 123 45 67, 079 123 45 67),
+		// so an ordinary digit string is not taken for a phone number. Before card.
+		R("phone", `(?:\+41|\b0041) ?\(?0?\)?\d{2} ?\d{3} ?\d{2} ?\d{2}\b|\b0\d{2} \d{3} \d{2} \d{2}\b`),
 		R("card", `\b(?:\d[ -]?){13,16}\b`),
 	}
 }
 
 // Secrets returns rules for credentials that must never reach a model or a
-// user: API keys, private keys and password assignments.
+// user: API keys, private keys and password assignments. Every rule has an upper
+// bound on a match, so the set works with Stream. A key may run to 256 characters,
+// because a project key can be longer than 128. A password value is cut at 128. The
+// private key rule matches the BEGIN header line only, because a key body has no
+// sensible bound; the header is what marks the block.
 func Secrets() []Rule {
 	return []Rule{
-		R("api_key", `\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}\b`),
-		R("private_key", `-----BEGIN [A-Z ]*PRIVATE KEY-----`),
-		R("password", `(?i)\b(?:password|passwort|pwd)\s*(?:[:=]|\bis\b)\s*\S+`),
+		R("api_key", `\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,256}\b`),
+		R("private_key", `-----BEGIN [A-Z ]{0,32}PRIVATE KEY-----`),
+		R("password", `(?i)\b(?:password|passwort|pwd)\s{0,16}(?:[:=]|\bis\b)\s{0,16}\S{1,128}`),
 	}
 }
 

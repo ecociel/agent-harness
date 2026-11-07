@@ -787,14 +787,15 @@ func TestSessionRepeatedSendAfterCrashDoesNotPayTwice(t *testing.T) {
 	if w.paid != paid {
 		t.Fatalf("paid again: %d -> %d", paid, w.paid)
 	}
-	if restored.Turn != 1 || len(restored.History) != 2 {
+	if restored.Turn != 1 {
 		t.Fatalf("session did not catch up: %+v", restored)
 	}
-	if _, err := restored.Send(ctx, "two"); err != nil {
+	res, err := restored.Send(ctx, "two")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(restored.History) != 4 {
-		t.Fatalf("history: %+v", restored.History)
+	if len(res.Messages) != 4 {
+		t.Fatalf("history: %+v", res.Messages)
 	}
 }
 

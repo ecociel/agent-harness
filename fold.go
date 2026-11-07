@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -138,9 +139,19 @@ type Run struct {
 	// closes. So every tool call here has a result at each model call and at the
 	// end of the run, and a finished run's Messages can start the next run.
 	Messages []model.Message `json:"messages"`
-	Usage    model.Usage     `json:"usage"`
-	Turn     int             `json:"turns"` // model turns begun
-	Repairs  int             `json:"repairs"`
+	// After is the run this one continues, or "".
+	After string `json:"after,omitempty"`
+	// Inherited is how many leading Messages came from After. A Context hook may
+	// edit them, and every successor inherits the edited history.
+	Inherited int `json:"inherited,omitempty"`
+	// Pinned is Input.Pinned as recorded at start. It is in every request and never
+	// in Messages.
+	Pinned []model.Message `json:"pinned,omitempty"`
+	// Meta is Input.Meta as recorded at start.
+	Meta    map[string]string `json:"meta,omitempty"`
+	Usage   model.Usage       `json:"usage"`
+	Turn    int               `json:"turns"` // model turns begun
+	Repairs int               `json:"repairs"`
 	// ModelCalls and ToolCalls count this run only, so a sum over the runs of a tree
 	// counts each call once. LostCalls are model calls a crash or a cancel cut off,
 	// billed or not, so what the provider charged lies between ModelCalls and
@@ -161,6 +172,7 @@ type Run struct {
 	Events []Event `json:"-"`
 
 	seq       int64
+	base      []model.Message // what run.started.After inherits, until it is folded
 	attempt   int
 	last      model.Response
 	batch     []Call
@@ -194,13 +206,21 @@ func (r *Run) Spent() Spend {
 //
 // The journal is a boundary: a damaged log is an error here, and nothing past
 // this function needs to doubt an event.
-func Fold(events []Event) (r *Run, err error) {
+//
+// Fold(events) is FoldOn(nil, events).
+func Fold(events []Event) (*Run, error) { return FoldOn(nil, events) }
+
+// FoldOn is Fold for a run that continues another: base is the final history of
+// the run its run.started names in After, as Prior returns it. A chained run folded
+// without its base is ErrIllegalTransition, so no reader drops a conversation
+// silently. An unchained run ignores base.
+func FoldOn(base []model.Message, events []Event) (r *Run, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			r, err = nil, fmt.Errorf("%w: damaged journal: %v", ErrIllegalTransition, p)
 		}
 	}()
-	r = &Run{State: StateStart, Path: []State{StateStart}}
+	r = &Run{State: StateStart, Path: []State{StateStart}, base: base}
 	for _, ev := range events {
 		if err := r.apply(ev); err != nil {
 			return nil, err
@@ -222,7 +242,17 @@ func (r *Run) apply(ev Event) error {
 		}
 		r.ID, r.RootRun, r.ParentRun, r.Agent, r.Depth = ev.RunID, ev.RootRun, ev.ParentRun, ev.Agent, ev.Depth
 		r.Pin, r.Started = *ev.Pin, ev.Time
+		if ev.After != "" && r.base == nil {
+			return fmt.Errorf("%w: run %s continues %s, folded without its history", ErrIllegalTransition, ev.RunID, ev.After)
+		}
 		r.Messages = slices.Clone(ev.Messages)
+		if ev.After != "" {
+			r.After, r.Inherited = ev.After, len(r.base)
+			r.Messages = slices.Concat(r.base, ev.Messages)
+		}
+		r.base = nil
+		r.Pinned = slices.Clone(ev.Pinned)
+		r.Meta = maps.Clone(ev.Meta)
 		r.State = StateCompose
 		if r.composite() {
 			r.State = StateBody
@@ -313,8 +343,13 @@ func (r *Run) apply(ev Event) error {
 		c := &r.batch[ev.Index]
 		if c.effect == tool.EffectOnce {
 			c.status = callAwaiting
-			r.addWaits([]Wait{{ID: waitID(r.ID, ev.Seq, ev.Index), Run: r.ID, Call: ev.Index,
-				Kind: WaitUnknownOutcome, Detail: "the outcome of " + c.Name + " is unknown"}})
+			waits := ev.Waits
+			if len(waits) == 0 { // a journal from before tool.lost carried its wait
+				w := lostWait(*c)
+				w.ID, w.Run = waitID(r.ID, ev.Seq, ev.Index), r.ID
+				waits = []Wait{w}
+			}
+			r.addWaits(waits)
 		} else {
 			r.redecide(c, "the tool changed while this call was in flight, so its outcome is unknown")
 		}
@@ -444,6 +479,9 @@ func (r *Run) edit(e Edit) {
 		tail[i].Opaque = nil
 	}
 	r.Messages = slices.Concat(r.Messages[:e.From:e.From], with, tail)
+	if e.From < r.Inherited {
+		r.Inherited = e.From + len(with) + max(0, r.Inherited-e.To)
+	}
 }
 
 // route turns a reply into the next state. It is the whole of what the finish
@@ -550,8 +588,9 @@ func (r *Run) open(waits []Wait, now time.Time) {
 func (r *Run) addWaits(waits []Wait) { r.Waits = append(r.Waits, waits...) }
 
 // resolve closes one wait. The unknown-outcome wait is the one kind whose signal
-// IS the result, because the call must not run again. Any other wait sends its
-// call back to be decided, with the signal visible to the hooks.
+// IS the result, because the call must not run again, unless the answer says to
+// run it. Any other wait sends its call back to be decided, with the signal
+// visible to the hooks.
 func (r *Run) resolve(s Signal, now time.Time) {
 	i := slices.IndexFunc(r.Waits, func(w Wait) bool { return w.ID == s.Wait })
 	if i < 0 {
@@ -564,7 +603,7 @@ func (r *Run) resolve(s Signal, now time.Time) {
 	} else if w.Call >= 0 && w.Call < len(r.batch) {
 		c := &r.batch[w.Call]
 		c.Signals = append(c.Signals, s)
-		if w.Kind == WaitUnknownOutcome && w.Run == r.ID {
+		if w.Kind == WaitUnknownOutcome && w.Run == r.ID && !s.Rerun {
 			c.finish(s.Value)
 		} else {
 			r.redecide(c, plannedOnOldTool)
@@ -660,8 +699,8 @@ func (stepClose) isStep()     {}
 func (stepPark) isStep()      {}
 func (stepEnd) isStep()       {}
 
-// next is the decider: a pure function from a fold to the next step. It mirrors
-// corporate-admin's agent.Next(limits, turn), with the limits pinned in the run.
+// next is the decider: a pure function from a fold to the next step, with the
+// limits pinned in the run.
 func next(r *Run) step {
 	if r.Drift.Shape && r.State.Loop() == "inner" {
 		return stepLimit{StopFailed, "the parts of this run changed after it started"}
@@ -722,6 +761,11 @@ func (r *Run) nextGroup() []Call {
 // call id, which can repeat across turns, plays no part.
 func callKey(runID string, turn, index int) string {
 	return hash(fmt.Sprintf("%s\x00%d\x00%d", runID, turn, index))
+}
+
+// lostWait is the wait a lost once-only call opens, so a person says what happened.
+func lostWait(c Call) Wait {
+	return Wait{Call: c.Index, Kind: WaitUnknownOutcome, Detail: "the outcome of " + c.Name + " is unknown"}
 }
 
 // waitID is unique per opening: a wait opened again gets a new ID, so an answer to

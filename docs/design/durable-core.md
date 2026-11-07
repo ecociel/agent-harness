@@ -1,6 +1,6 @@
 # Durable core
 
-**Status: design agreed, 2026-10-30. Units 1, 2 and 3 of the plan are done on the `durable-core` branch.** Patterns and hooks that aren't ported yet sit in `_unported/`, which Go ignores. The earlier evidence comes from the working sketch at `.audit/durable-core/spike-sketch/`.
+**Status: design agreed, 2026-10-30. Units 1 to 8 of the plan are done, and so are the eleven units L1 to L11.** The earlier evidence comes from a working sketch that was never committed to this repository.
 
 ## Problem
 
@@ -88,9 +88,9 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 |---|---|
 | `Event` | The only record. The journal stores it, sinks receive it, `Fold` reads it. |
 | `Journal` | `Append` and `Load`. The unique index is both the ownership fence and the outbox. |
-| `Run` | The fold. No mutex, no `Agent` pointer, no scratch map. Hooks get it by value, as a shallow copy (see Agreed decisions not yet built). It replaces `Result`. |
+| `Run` | The fold. No mutex, no `Agent` pointer, no scratch map. Hooks get it by value, as a shallow copy (see Known limits). It replaces `Result`. |
 | `Composite` | A run whose work is to run others. Every pattern is one. It has a body and no model. |
-| `Input` | `RunID`, `Messages`, `Signals`, `Cancel`. |
+| `Input` | `RunID`, `Messages`, `After`, `Pinned`, `Meta`, `Signals`, `Cancel`. `After` chains a run to a finished one, `Pinned` is sent on every request of this run only, `Meta` is identity for hooks and tools. All three are recorded on `run.started`. |
 | `Pin` | Recorded at start: instructions, model, limits, schema, tool fingerprints. Wiring stays live. |
 | `Wait`, `Signal` | What a suspended run needs, and the answer. |
 | `Edit` | The only durable way to change history. It stamps `Source` for provenance. |
@@ -101,11 +101,11 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 2. **Hooks return values.** The shell records the value. No hook runs on the replay path, so a decision can't come out differently later. A hook runs at least once, so anything it does outside the run must tolerate a repeat.
 3. **Intent before effect**, for tools and for paid calls. On resume, an open `model` state or a `started` call can only mean the outcome was lost.
 4. **Redaction is the innermost ring.** It wraps the provider and the tool call directly, inside `WrapModel` and `WrapTool`, and `record` is the backstop. With a redactor configured, no hook sees raw data, and a redactor error fails closed. With none configured, the ring does nothing. A redactor that can't filter a stream buffers the reply, so live streaming is lost while it is attached.
-5. **The index is the fence.** A worker taking a run appends `run.claimed`, and the previous worker's next append fails with `ErrFenced`. There is no lease code and no heartbeat in the core. Candidate 1 had a heartbeat, and it produced a real data race.
+5. **The index is the fence.** A worker taking a run appends `run.claimed`, and the previous worker's next append fails with `ErrFenced`. The core keeps no lease state. A journal may add `Renewer`: while a step runs longer than `Lease/3`, the worker renews its `Wake` on its own goroutine, only while the head is still the position it wrote, and holds one mutex across its appends and renewals so a renewal never names a head it is replacing. Candidate 1 had an unconditioned heartbeat on shared state, and it produced a real data race. This one writes no event and touches the fold through nothing but an atomic.
 6. **Contexts stop workers, not runs.** Cancelling a context acts like a crash and returns `ErrDrained`. Only `Input.Cancel` ends a durable run.
 7. **`Event.Wake`** is on the last event of every append. Projected into a row inside the `Append` transaction, it gives one sweep query for crashed workers, due timers and drained runs, with no third `Journal` method.
 8. **Every tool call gets exactly one result.** `closeBatch` answers each call in call order, whatever ended the batch. A call that never ran gets a synthetic `{"skipped":true}` result. An unanswered tool call can't reach history.
-9. **Child identity is derived.** A sub-agent's run ID is the parent's idempotency key. A parallel branch is `<parent>/<index>`, taken from the loop that starts the goroutine, never from the scheduler.
+9. **Child identity is derived, and it keeps its parent's prefix.** A child's run ID is always `<parent run ID>/<rest>`, so a store that routes runs by a prefix of the ID, such as a tenant, keeps a whole tree together. A sub-agent's rest is the call's idempotency key, `<parent>/<key>`, and a background job's is `<parent>/<name>/<key>`. A pattern's child is `<parent>/<position>`, taken from the loop that starts the goroutine, never from the scheduler. A retry or a resume derives the same ID.
 10. **A composite run spends nothing.** It writes no `model.*` or `tool.*` event, and `Fold` gives it no spend, so a sum over a tree's runs needs no exceptions. What its children spent reaches its caller through `Run.Spent`, as a report on `body.done`.
 11. **Cancel has two paths, because a worker and its absence need different things.** A running branch reads its ancestors after recording each intent, so it needs no child ID. A parked or crashed branch has no worker to read anything, so its parent ends it through the child's own `Runner`, the way a signal travels.
 12. **The ancestor check has an optional fast path.** Loading a parent's journal on every step makes each child step cost the parent's whole history. A `Journal` may also implement `LineageReader`, one projected row per run. It stays optional so that `Journal` stays two methods, and a store without it is slower, not wrong. A cache was rejected, because it would let a child pay after a cancel it could have seen.
@@ -113,7 +113,8 @@ refund := tool.Func(tool.Spec{Name: "refund", Risk: tool.RiskDangerous, Effect: 
 14. **A refused signature costs one more request, not the run.** A history edit such as compaction invalidates later signatures, and the same body fails forever. The Anthropic adapter sends that call again with all thinking stripped, which needs no beta header and works on every platform. It's a recovery, not a steady state: the model loses that reasoning, and each later turn pays one refused request.
 15. **A recorded history edit drops `Opaque` on the messages after it.** Provider state can depend on everything before it, so an edit leaves it stale, and the first request afterwards would be refused. This sits in `Fold` and not in a hook, so every `Context` hook gets it. Messages before the edit keep theirs.
 16. **A pattern's tree is a pure function of its input and its children's journals.** A child's ID comes from its position, and a decision comes from what a child recorded, so a resume walks the same tree. `Team` lost its `Board`: tasks go to members by number in rounds, because a race to claim tasks can't be replayed. `Handoff` puts the agent in each child's ID, and its sticky owner is `Message.Source` on the reply, so it lives in the session's history. `harness.Attribute` sets it.
-17. **What must not repeat or must see every call is a sink or a recorded decision, not hook state.** `metrics` and `logging` are sinks like `trace`, `retry` is a `RecoverHook`, `compact` is a `ContextHook`, and `trajectory` is a pure view of the events. A fallback on another provider is a `model.Provider`, because a hook-level fallback would run outside the redaction ring.
+17. **Part bytes never enter an event.** A message part keeps a `Ref` and an optional text alternative, and `Bytes` is never marshalled. `Agent.Resolve` fills the bytes on the copy of the request the provider gets, inside the redaction ring, and `record` drops any bytes an event would carry, with or without a redactor. So a resume sends the same parts, and a journal row stays the size of its text. A redactor sees a part's name and text, never its bytes, because a text rule cannot judge an image.
+18. **What must not repeat or must see every call is a sink or a recorded decision, not hook state.** `metrics` and `logging` are sinks like `trace`, `retry` is a `RecoverHook`, `compact` is a `ContextHook`, and `trajectory` is a pure view of the events. A fallback on another provider is a `model.Provider`, because a hook-level fallback would run outside the redaction ring.
 
 ### State machine
 
@@ -192,23 +193,23 @@ A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `Check
 
 | # | Concern | The package owns | The consumer supplies |
 |---|---|---|---|
-| 1 | Durability | `Journal`, `Fold`, idempotent `Run`, record before acting | The store, two methods |
-| 2 | Side-effect safety | `tool.started` before the effect, `IdempotencyKey`, `Effect`, `WaitUnknownOutcome` | Each tool's `Effect`, a ledger if wanted |
-| 3 | Suspension | `suspended`, `Wait`, `Signal`, `Await`, expiry, re-decide on resolve | Approval UI, who may approve, a sweeper |
+| 1 | Durability | `Journal`, `Fold`, idempotent `Run`, record before acting, `Renewer` for long steps | The store, two methods |
+| 2 | Side-effect safety | `tool.started` before the effect, `IdempotencyKey`, `Effect`, `WaitUnknownOutcome`, `EffectAtomic` committed through `AtomicJournal` | Each tool's `Effect`, a ledger if wanted, a transaction for atomic tools |
+| 3 | Suspension | `suspended`, `Wait`, `Signal`, `Await`, expiry, re-decide on resolve, `Agent.Deliver` for an answer without a worker | Approval UI, who may approve, a sweeper |
 | 4 | Context, compaction | `Context` returns a recorded `Edit`, `BeforeModel` edits are per call | Summariser, retrieval, token counting |
-| 5 | Memory | Load in `Context` with `Edit.Source`, save in `AfterRun` | Memory store and policy |
-| 6 | Token spend | Usage in `model.done`, folded once, `LostCalls` as the honest bound. A tree is a plain sum over its runs | Price table, limits, tenant totals inside `Append` |
-| 7 | Tracing | Stable `RunID`, `RootRun`, `ParentRun`, `Seq`. Span IDs hash run and step | Exporter, as a sink |
+| 5 | Memory | Load in `Context` with `Edit.Source` or pin at start with `Input.Pinned`, save in `AfterRun` | Memory store and policy |
+| 6 | Token spend | Usage in `model.done`, folded once, `LostCalls` as the honest bound. A tree is a plain sum over its runs. `model.Prices` per model and token kind | Prices, limits, tenant totals inside `Append` |
+| 7 | Tracing | Stable `RunID`, `RootRun`, `ParentRun`, `Seq`. Span IDs hash run and step. `FirstToken` on `model.done`, and deltas that name their `Turn` and `Attempt` | Exporter, as a sink |
 | 8 | Metrics | The event vocabulary | Backend, as a sink |
 | 9 | Guardrails | `BeforeRun`, `BeforeTool`, `AfterModel`, `AfterTool`, `CheckOutput`, `WrapModel` for streams | Rules |
-| 10 | Redaction | The ring, the `record` backstop, inheritance by child runs, fail closed | Patterns |
+| 10 | Redaction | The ring, the `record` backstop, inheritance by child runs, fail closed. `guard.Stream` live, `guard.Pseudonymizer` with reveal in `WrapTool` | Patterns, a `Vault`, the paths a tool may see in clear |
 | 11 | Permissions | `Risk`, `Scope`, `Effect`, per-turn `Offered` enforced in the fold | Policy, principal |
 | 12 | Retry, fallback | `model.Error` classes, `Recover`, recorded decisions, durable backoff | Policy, classification in adapters |
 | 13 | Timeouts, shutdown | `Spec.Timeout`, `WithDrain`, `ErrDrained`, tree-wide `Input.Cancel`, the fence | Deadlines, when to call `Run` |
 | 14 | Tool execution | Batch order, adjacent reads in parallel, single writer, `closeBatch` | Tools |
 | 15 | Multi-agent | `Composite`, derived child IDs, finished children answer from their journals, wait forwarding | Which patterns, `ChildTool` on a tool that starts runs |
-| 16 | Sessions | A run is workflow state. `Session{ID, Turn, History}` is conversation only | Where to save those fields |
-| 17 | Evaluation | `Fold` needs no provider, tool or hook. A what-if copies an event prefix | Eval suites |
+| 16 | Sessions | A conversation is a chain of runs (`Input.After`, `Prior`, `FoldOn`). `Session{ID, Turn}` names the next one | Where to save those fields, a `HistoryReader` for long chains |
+| 17 | Evaluation | `Fold` needs no provider, tool or hook. A what-if copies an event prefix. `eval` plays multi-turn scenarios through a `Target` and proves its checks with `SelfTest` | The `Target`, its own check kinds, scenarios |
 | 18 | Versioning | `Pin`, `Drift`, calls to a changed tool denied and replanned | Migrations in `Journal.Load` |
 | 19 | Operability | `Fold` exposes `State`, `Waits`, `Updated`, `Claims`, `Class`. `Wake` for sweeps | Dashboards, the sweep |
 
@@ -220,7 +221,7 @@ A composite run has no model and no tools, so only `Redact`, `BeforeRun`, `Check
 | `model.started` | No call happened, `compose` repeats | `model.lost`, new attempt, may have been billed |
 | `model.done` | Billed and lost, same as the cell above | Usage folded once, routing continues |
 | `tool.gated` | Hooks rerun | The claim voids `allow`, hooks rerun, `await` waits stand |
-| `tool.started` | No effect, decisions redone | `tool.lost`: `EffectOnce` suspends on an unknown outcome. Others return to `gate`, so `BeforeTool` hooks and approvals run again, then the tool reruns under the same key |
+| `tool.started` | No effect, decisions redone | `tool.lost`: `EffectOnce` suspends on an unknown outcome, and the event carries that wait like every event that opens one. Others return to `gate`, so `BeforeTool` hooks and approvals run again, then the tool reruns under the same key |
 | `tool.done` | Effect happened, result lost, same as the cell above | The result stands |
 | `wait.resolved` | The sender retries | A duplicate is ignored |
 | `body.done` | The body reruns, and finished children answer from their journals | The outcome stands, and the body doesn't run again |
@@ -250,6 +251,13 @@ Measured on real PostgreSQL 17.6 through `journal/postgres`, at the end of unit 
 - `TestKillTheWorkerAtRandomPoints` SIGKILLs a real worker process at random points, restarts it from the run ID alone and audits a five-run tree against the outside world, in the same database. Over 800 rounds: 1,068 kills, 922 of them mid-run, 128 runs reached an unknown outcome, 333 model calls were lost. No once-only tool repeated, the billing bound held, and every output matched the uncrashed run. It fails if a once-only tool is repeated or a lost call goes uncounted. CI runs 40 rounds, under the race detector.
 - One ancestor read, averaged over 50, on a run of 2 KB events: `Load` takes 0.9 ms at 100 events, 6.2 ms at 1,000 and 54.7 ms at 10,000. `Lineage` takes 0.24 to 0.29 ms at all three.
 
+Measured at the end of the integration units L1 to L11:
+
+- `go test -race ./...` exits 0 at the root, across all 24 tested packages, at the commit that added this paragraph.
+- `journal/postgres` ran against PostgreSQL 17 after L1 to L6 were merged, and all its tests passed, `Atomically`, `Renew` and the kill test included. After L10 it showed one unexplained intermittent failure in two separate runs, with no failing test named either time. Three consecutive reruns on fresh databases did not reproduce it, and the cause is not known. It was not run again for this page.
+- Mutants ran against four mechanisms of L1 to L5: the redaction of `Meta`, the atomic crash sweep, the compaction clamp under `Pinned`, and the memory journal's `Renew`. Nothing else in L1 to L5, such as `Deliver`, `Rerun`, `Tags` or the chain fold, and nothing in L6 to L11 was mutation-checked. Their own tests are the only check.
+- An independent review of L1 to L5 found three defects that the tests had passed. With `Pinned` set, compaction could never cut a chained run's own messages again. `Deliver` set `Wake` to now for a run a worker was still stepping. A store that retried an atomic unit deadlocked the worker. All three are fixed in `4038c1c`, and only the compaction fix came with a new test.
+
 Measured on real PostgreSQL at unit 1, and not rerun: all 7 mutants of the Postgres journal itself are caught.
 
 Reported by the spike in `.audit/durable-core/spike-report.md`, and not rerun:
@@ -257,15 +265,15 @@ Reported by the spike in `.audit/durable-core/spike-report.md`, and not rerun:
 - Nine defects were found, six of them on the untouched base. The worst left a child suspended forever. All nine are fixed and have tests.
 - `go test -race -count=10` failed 6 times in 10 on its first run, which is how the mutual fence below was found. A single pass would have missed it.
 
-**Not verified.** No call to a real provider: the adapters run through the ring against a scripted HTTP server that follows the published API, and `TestLiveToolLoop` has not been run. Two live workers are covered by racing writers in the conformance suite, not by killing processes: the kill test runs one worker at a time. A cancel recorded after a worker's check and before its provider call starts is not tested as an interleaving: by reading the code, it is the same as a call already in flight, which counts as lost.
+**Not verified.** No call went to a real provider. The adapters run through the ring against a scripted HTTP server that follows the published API, and `TestLiveToolLoop` has not been run. Two live workers are covered by racing writers in the conformance suite, not by killing processes. The kill test runs one worker at a time. A cancel recorded after a worker's check and before its provider call starts is not tested as an interleaving. By reading the code, it is the same as a call already in flight, which counts as lost. The part encodings have met only the scripted servers. The hold-back windows are computed from the rules, not measured on a live stream.
 
 ## Synthesis decision
 
-Three working sketches competed. Scores are from one separate judge reading the code. All three sketches and the judge ran on Claude models, so there was no second model family, and corporate-admin fit was one of six scoring criteria, chosen by the design's author:
+Three working sketches competed. Scores are from one separate judge reading the code. All three sketches and the judge ran on Claude models, so there was no second model family, and fit with one caller outside this repository was one of six scoring criteria, chosen by the design's author:
 
 | Candidate | Score (of 30) | Why it lost or won |
 |---|---|---|
-| Event-sourced decider | 24 | **Base.** The machine is the truth, and the shape stops hooks skipping redaction, ordering and fencing. Matches corporate-admin's `agent.Next` |
+| Event-sourced decider | 24 | **Base.** The machine is the truth, and the shape stops hooks skipping redaction, ordering and fencing |
 | Replayed effects | 21 | Best multi-agent story. But custom `Runner`s must be deterministic, hooks that don't rerun silently break after resume, and any change to step order diverges suspended runs |
 | Snapshot machine | 20 | Simplest mental model. But it rewrites the whole body at every commit, hooks can write any snapshot field, and its heartbeat had a real data race |
 
@@ -301,25 +309,50 @@ Each of these was left on purpose.
 - **Metrics can miss the last event before a crash.** They are sinks, so nothing counts twice, and the journal is the source to reconcile a total from.
 - **A retry after a cut stream repeats text to sinks.** Deltas already streamed stay streamed, so a live UI shows the partial reply and then the whole one. By reading the code.
 - **The Anthropic adapter stays on API version `2023-06-01`, with a default `max_tokens` of 4096.** Thinking counts against that limit, so set `MaxTokens` on current models. Version `2026-10-21` refuses `temperature` on every model, so moving to it is a separate change.
+- **A chained run reads its whole chain at every `Run`.** Without a `HistoryReader`, `Prior` loads and folds each predecessor, so a conversation of n turns costs O(n) reads per step. A store that keeps many turns implements `HistoryReader`. A wrapper hides it like `Lineage`.
+- **An edit cannot cross the pinned context.** A `Context` edit over both inherited and own messages fails the run when `Pinned` is set, so `hooks/compact` then summarises the inherited part first and the run's own messages once that is one summary.
+- **Renewal covers model calls and tool executions, not hooks.** A slow `Context` summariser or gate hook still needs a `Lease` above its duration.
+- **A store must call an atomic unit's fn once.** fn runs the tool, so a store that retries a serialization failure must give up instead and let the run be taken again.
+- **A composite's body sees the inherited history but not `Pinned`.** A pattern passes `Messages` to its children, and `Pinned` stays with the composite's run.
+- **A `Session` over a runner with no journal chains in memory.** The journal lives in the `Session` value, so a restart forgets the conversation, and such a run now parks on a wait instead of failing with `ErrNotDurable`.
+- **The memory journal's unit undoes nothing.** `NewMemJournal().Atomically` runs the tool and appends, so an `EffectAtomic` tool on it is only as safe as an idempotent one. A crash test of atomic tools needs a store with a real transaction, or a stand-in like the suite's.
+- **Journals written before child IDs took their parent's prefix name children differently.** A sub-agent was named by its bare call key and a background job by `<name>/<key>`, so a resume over such a journal starts a new child under the new name, which repeats the work, once-only effects included. There was no production journal, so nothing migrates them.
+- **A signal does not move a run a worker may still be stepping.** `Deliver` stamps `Wake` with the present only for a parked run or a cancel. A signal to any other run leaves `Wake` a lease away, so the answer waits for that worker's next step or for the sweep.
+- **A failure of class `internal` is never retried.** A hook, the journal, the harness or a redactor that failed, a vault included, fails the run without asking `Recover`. Calling the model again cannot repair a local fault and must not undo a refusal, so a transient fault in one of them costs the run.
+- **`Meta` and `Tags` keys are not redacted.** Their values are. A key is a name, so it must not carry data. `Meta` holds at most 32 keys.
+- **A part's bytes are read again for every request.** `Agent.Resolve` runs on each provider call, retries and resumes included. A blob deleted since the run started fails the call, with the class the resolver gives it.
+- **A refused part is recognised by its status code.** A request that carried a native part and comes back 400, 413, 415 or 422, and not for a full context, is `ClassContent`. So a 400 for another reason on such a request is also read as a refused part, and withholding the part costs one more request.
+- **A token is only as stable as its key.** A `Pseudonymizer` token is an HMAC of the value under its key, so a new key gives the same value a new token, and the old pairs must stay in the vault for old text to reveal. `Reveal` leaves a token it cannot find as it is. `MemVault` loses its pairs with the process.
+- **Live redaction delays the first text of a reply.** With a window of 0, `guard.Stream` holds back 657 bytes for `Secrets()` and 345 for `PII()`, so a shorter reply streams nothing until it ends. Tool-call arguments are held until the reply ends, whatever the window.
+- **A lost call's wait has two shapes in old journals.** A `tool.lost` written before the event carried its wait has no `Waits`, so a store that projects open waits from the events it appends misses that one. `Fold` still derives the same wait from it.
 - **A wrapper can hide the fast path.** A journal wrapped for tracing or fault injection has no `Lineage` unless the wrapper forwards it. Runs then fall back to `Load`, which is correct and slower. Nothing reports the fallback.
 
 ## Tradeoffs accepted
 
-- We accept 336 exported names against 204, and 2,240 code lines against 974 in the root package, in exchange for covering all 19 concerns. Unit 3 added 25 names, counted by hand, and 173 lines, and took 35 lines out of the four ported `multi` files.
+- We accept 336 exported names against 204, and 2,240 code lines against 974 in the root package, in exchange for covering all 19 concerns. Unit 3 added 25 names, counted by hand, and 173 lines, and took 35 lines out of the four ported `multi` files. The eleven integration units added 3,409 lines of non-test Go and removed 233, of which 677 and 103 are in the root package (`git diff --numstat 884f0a8..8e4b5bb`). Names were not recounted.
 - We accept a journal write per step, about 15 appends for a 2-turn run with 4 tools, in exchange for a crash point at every step.
-- We accept that the model and tools work from redacted text, in exchange for a guarantee with no exceptions. A tool that needs the real value detokenises in `WrapTool`.
+- We accept that the model and tools work from redacted text, in exchange for a guarantee with no exceptions. A tool that needs the real value gets it from `guard.Reveal` or `guard.RevealPaths` in `WrapTool`, outside the ring.
 - We accept at-least-once hooks in exchange for one recovery rule.
 - We accept no lease in the core. A sweep that fires early costs a needless unknown-outcome wait, never a repeated effect.
 - We accept that a nested run reads each ancestor once per model call and tool start, in exchange for a cancel that needs no child ID. Measured on a two-branch `Parallel` with one tool each and a plain `Journal`: 24 appends, 9 loads, 6 of them for this check. With `LineageReader` those 6 become one-row reads. Depth still multiplies them, and a root reads nothing extra.
 - We accept that a root's `Wake` is a floor and not a sign of life. A tree is due at the latest of its root's `Wake` and the `Wake` of whatever below it is working. A pattern only waits, so its `Lease` says how soon to look and need not outlast its slowest branch. A nested pattern has no `Wake`, so its lease can't hide a crash below it.
 - We accept that thinking text is stored in the journal, redacted, in exchange for replaying it after a crash. With the default `display: "omitted"` that text is empty and only the signature is kept.
 - We accept a flat `Event` struct, in exchange for one vocabulary and no decode registry.
+- We accept that a chained run reads its chain on every `Run`, one fold per predecessor without a `HistoryReader`, in exchange for storing each message once. A `Session` copied its whole history into every turn before, which grew quadratically.
+- We accept that an atomic tool and its `WrapTool` and `AfterTool` hooks run inside the store's transaction, holding a connection for as long as the tool takes, in exchange for an effect that commits with its record or not at all.
+- We accept a renewal write every `Lease/3` of a long step, from a goroutine of the worker, in exchange for a lease short enough to recover a real crash quickly.
+- We accept a second way into a run, `Deliver`, in exchange for an answer that is in the journal when the request returns, with no worker on the request path.
+- We accept a hold-back window of up to 657 bytes on a redacted stream, in exchange for a match that never splits across two deltas.
+- We accept a vault write for every new value a `Pseudonymizer` sees, and a failed run when the vault fails, in exchange for a model, a journal and sinks that hold tokens only.
+- We accept reading part bytes again on every request, in exchange for a journal row the size of its text.
+- We accept that spans carry no conversation content unless a consumer asks for it, so a reply is read from the journal, not from a trace.
+- We accept child IDs that grow with depth, `<root>/<key>/<key>`, in exchange for a tree that a store routing by prefix keeps together.
 
 ## Settled questions
 
 1. **The model and tools work from redacted text only.** A resume must reproduce what the model saw, so raw text lives nowhere a run reads.
 2. **The break is total.** `Result` disappears, every hook signature changes, and `Run` is no longer a pointer. There is no compatibility layer.
-3. **corporate-admin is designed for and adapted later.** `Journal` stays generic. The mapping from its turn log looks one-to-one on paper, and it stays unproven until that integration.
+3. **`Journal` stays generic.** A caller outside this repository brought its own SQL journal, which passes `journaltest.Run`, and its engine runs on the library. Every change it needed was a general unit, L1 to L11, and none names that caller.
 
 ## Implementation plan
 
@@ -333,5 +366,21 @@ Each unit lands on its own and ends in a check. Unit 2 ran first, because the su
 | 4 | Done. Provider adapters: error classes, `Opaque`, cut streams | Both adapters pass the redaction and retry tests through the machine, against a scripted server. `TestLiveToolLoop` checks a real API and has not been run |
 | 5 | Done. Port 8 hooks: `metrics` and `logging` as sinks, a fallback as a provider | Each uses only exported API, proven from an external test package |
 | 6 | Done. Port 7 patterns, `Handoff` and `Team` last | A crash sweep through each pattern: 1,168 cases over the seven |
-| 7 | Web chat, README, docs | `docs/state-machine.md` is generated from the table or checked against it |
+| 7 | Done. Web chat, README, docs | `docs/state-machine.md` is generated from the table or checked against it, and `TestTheDocsNameRealIdentifiers` fails on a name the code does not export |
 | 8 | Done. Real process kill test | `SIGKILL` at random points on the real journal, no once-only tool repeats |
+
+A later integration added eleven units. Each is general and names no consumer.
+
+| # | Unit | Done when |
+|---|---|---|
+| L1 | Done. `Input.Meta`, `Input.Pinned`, `Input.After` with `FoldOn`, `Prior` and `HistoryReader`. `Session` chains runs | `CrashSweepAChain` passes on both journals. `TestASessionStoresEachMessageOnce`, and `TestRedactionCoversEveryString` covers the new strings |
+| L2 | Done. `Agent.Deliver` | `TestADecisionDeliveredByOneProcessIsSeenByAWorkerInAnother`, and a stale signal or a cancel that lost a race says so |
+| L3 | Done. `tool.EffectAtomic`, `AtomicJournal`, `postgres.TxFrom` | `CrashSweepAtomic`: the effect and its `tool.done` agree at every crash point. `TestAFencedUnitStopsTheWorker` |
+| L4 | Done. `Signal.Rerun`, `Decision.Tags`, `Attempt` on deltas, `FirstToken` | One test each in `facts_test.go` |
+| L5 | Done. `Renewer` | `RenewalBehindTheHeadIsRefused` on both journals, and `TestARefusedRenewalStopsTheWorkerAtItsNextAppend` |
+| L6 | Done. `model.Part`, `Agent.Resolve`, `ClassContent`, parts in both adapters | `TestResolvedBytesReachOnlyTheProvider`, and `TestARefusedPartIsWithheldOnTheRetryAndNeverJournaled` against both scripted servers |
+| L7 | Done. `guard.Stream`, `guard.Pseudonymizer`, `guard.Vault`, `guard.Reveal`, `guard.RevealPaths`, bounded shipped rules | `TestStreamNeverEmitsAPartialMatch`, `TestPseudonymizerShowsEveryoneTokensOnly`, `TestRevealPathsRevealsOnlyWhereDeclared`, `TestEveryShippedRuleIsBounded` |
+| L8 | Done. `model.Prices`, `trace.FromEvents`, content-free spans | `TestCostIsPricedPerModelWithCachedAndReasoningTokens`, `TestFromEventsEqualsTheLiveSink`, `TestContentStaysOutOfSpansUnlessAsked` |
+| L9 | Done. Multi-turn `eval`: `Scenario`, `Target`, `Observe`, `Generic`, `RunScenarios`, `SelfTest` | `TestAScenarioPlaysThroughARealAgentAndAnswersItsWait`, and `SelfTest` refuses a check that a bad script fails for the wrong reason |
+| L10 | Done. Child IDs under their parent, the wait on `tool.lost` | `TestAChildStartedFromAToolKeepsItsParentsPrefix`, `TestALostCallsWaitIsOnItsEvent` |
+| L11 | Done. Argument bytes kept through redaction, a smaller window for `Secrets()`, no `Recover` for `internal` | `TestRedactionKeepsTheArgumentBytes`, `TestShippedRuleWindowsStaySmall`, `TestStreamHoldsTheWidestFold` |

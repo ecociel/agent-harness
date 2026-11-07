@@ -46,6 +46,27 @@ type Input struct {
 	RunID string
 	// Messages starts the run. They are ignored once the run exists.
 	Messages []model.Message
+	// After names a finished run of the same journal whose final history this run
+	// continues. That history comes before Messages in every request and in
+	// Run.Messages without being copied: run.started records only the name, so a
+	// conversation is a chain of runs and storage grows with what is new. Like
+	// Messages, it is ignored once the run exists. A run whose After names no
+	// finished run is ErrNoSuchRun, and nothing is written.
+	After string
+	// Pinned is context the model sees on every request of this run, after the
+	// inherited history and before this run's own messages, and that no other run inherits: a
+	// snapshot, retrieved memory, a reminder. It is recorded at start, so a resume
+	// sends the same request, and it is redacted like any text. A Context hook cannot
+	// edit it. Like Messages, it is ignored once the run exists.
+	Pinned []model.Message
+	// Meta is data about the run for hooks and tools: tenant, principal, labels. At
+	// most MaxMeta keys. It is recorded at start, its values redacted like any text (keys are names and are not), returned in
+	// Run.Meta and never sent to the model. A process that resumes a run reads
+	// identity from here, not from its own context, so a resume by anyone acts as the
+	// run's owner. Like Messages, it is ignored once the run exists: the journal
+	// wins. A run started from a tool or a pattern inherits its parent's Meta unless
+	// its Input sets its own.
+	Meta map[string]string
 	// Signals resolve open waits. A repeat of a delivered signal is ignored.
 	Signals []Signal
 	// Cancel, if set, ends the run and the tree below it with StopCancelled, from any
@@ -86,6 +107,11 @@ type Agent struct {
 	Provider model.Provider
 	// Model is passed through to the provider. Pinned when a run starts.
 	Model string
+	// Resolve supplies the bytes of each message part by its Ref, as the innermost
+	// layer around the provider, on the copy of the request the provider gets. No
+	// hook, redactor, event or journal sees them, and a resume sends the same parts.
+	// Required when a run has parts.
+	Resolve model.Resolver
 	// Tools the model may call. May be nil.
 	Tools *tool.Registry
 	// Hooks attached to every run, in order.

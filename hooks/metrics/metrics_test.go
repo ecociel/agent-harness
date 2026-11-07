@@ -85,3 +85,27 @@ func TestDeniedAndLostCallsAreCounted(t *testing.T) {
 		}
 	}
 }
+
+func TestCachedAndReasoningTokensAreTheirOwnKinds(t *testing.T) {
+	reg := metrics.NewRegistry()
+	sink := metrics.Sink(reg)
+	sink(harness.Event{Kind: harness.KindModelDone, Model: "m", Reply: &model.Response{Usage: model.Usage{Input: 100, Output: 50, Cached: 60, Reasoning: 20}}})
+	sink(harness.Event{Kind: harness.KindModelFailed, Model: "m", Failure: &harness.Failure{Class: model.ClassTransient, Usage: model.Usage{Input: 10, Cached: 4}}})
+	s := reg.Snapshot()
+	for key, want := range map[string]float64{
+		"model_tokens_total{kind=input,model=m}":     110,
+		"model_tokens_total{kind=output,model=m}":    50,
+		"model_tokens_total{kind=cached,model=m}":    64,
+		"model_tokens_total{kind=reasoning,model=m}": 20,
+	} {
+		if s.Counters[key] != want {
+			t.Errorf("%s = %v, want %v", key, s.Counters[key], want)
+		}
+	}
+	// A call with neither creates no empty series.
+	reg = metrics.NewRegistry()
+	metrics.Sink(reg)(harness.Event{Kind: harness.KindModelDone, Model: "m", Reply: &model.Response{Usage: model.Usage{Input: 1}}})
+	if _, ok := reg.Snapshot().Counters["model_tokens_total{kind=cached,model=m}"]; ok {
+		t.Error("cached series created for a call without cached tokens")
+	}
+}

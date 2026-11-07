@@ -1,6 +1,6 @@
 # agent-harness
 
-A small Go library for production agents. A run is a **durable state machine**: an append-only journal of events is the truth, a pure function picks the next step, and a crash anywhere is recovered from the journal. Everything else is a **hook** at a named point, and **multi-agent patterns** are built from the same pieces. The core has no dependencies outside the standard library, and leaves the details to you: persistence, memory, prices, tracing backends, guardrail rules and redaction rules.
+A small Go library for production agents. A run is a **durable state machine**. An append-only journal of events is the truth, a pure function picks the next step, and a crash anywhere is recovered from the journal. Everything else is a **hook** at a named point, and **multi-agent patterns** are built from the same pieces. The core has no dependencies outside the standard library, and leaves the details to you: persistence, memory, prices, tracing backends, guardrail rules and redaction rules.
 
 ```
 go get github.com/ecociel/agent-harness
@@ -17,7 +17,6 @@ go get github.com/ecociel/agent-harness
 - [Learn the hooks: one example each](#learn-the-hooks-one-example-each)
 - [Using it](#using-it)
 - [What has not been verified](#what-has-not-been-verified)
-- [Fit with corporate-admin](#fit-with-corporate-admin)
 - [Sources](#sources)
 - [Open questions](#open-questions)
 
@@ -37,27 +36,27 @@ So this library makes those moments first-class:
 
 ```
 github.com/ecociel/agent-harness
-├── harness (root)      Agent, Run, Fold, the state machine, Journal, hooks, events, Session
-├── model               provider-neutral messages, tool calls, usage, streaming events, Provider
+├── harness (root)      Agent, Run, Fold, the state machine, Journal, hooks, events, Session, the memory journal
+├── model               provider-neutral messages and parts, tool calls, usage, prices, streaming events, Provider
 ├── tool                tool specs (risk, scope, effect), Tool, Registry, Handoff
 ├── hooks/…             one package per concern (see docs/hooks.md)
 ├── hooktest            fails a test if a hook changes its Run
 ├── multi               multi-agent patterns (Runners built from Runners)
-├── eval                tiny eval runner: tasks × checks (code or LLM judge)
+├── eval                single prompts with checks, and multi-turn scenarios played through your Target
 ├── journaltest         conformance suite for a Journal
 ├── journal/postgres    PostgreSQL Journal, in its own module
 ├── provider/fake       deterministic scripted provider for tests and demos
-├── provider/openai     OpenAI-compatible Chat Completions (streaming)
-├── provider/anthropic  Anthropic Messages API (streaming, thinking replay)
+├── provider/openai     OpenAI-compatible Chat Completions (streaming, parts)
+├── provider/anthropic  Anthropic Messages API (streaming, thinking replay, parts)
 ├── examples/webchat    web chat + live diagnostics (go run ./examples/webchat)
 └── examples/hooks      one small program per hook (go run ./examples/hooks/tour)
 ```
 
-Dependencies only point inwards: `hooks/*`, `multi` and `provider/*` depend on the core, and the core depends on nothing but `model` and `tool`.
+Dependencies only point inwards. `hooks/*`, `multi` and `provider/*` depend on the core, and the core depends on nothing but `model` and `tool`.
 
 ## Durability
 
-You implement two methods. A unique index on `(run_id, seq)` is the whole contract: it is the ownership fence, and the outbox if you project anything in the same transaction.
+You implement two methods. A unique index on `(run_id, seq)` is the whole contract. It is the ownership fence, and the outbox if you project anything in the same transaction.
 
 ```go
 type Journal interface {
@@ -66,7 +65,7 @@ type Journal interface {
 }
 ```
 
-`journal/postgres` is a complete one, including a sweep query and the optional `LineageReader`, which makes a cancel check cost one row instead of a parent's whole history. `journaltest.Run` checks any store against the contract, with crash sweeps through real agents.
+A store may add four optional interfaces. `AtomicJournal` commits a tool's writes with its result, `Renewer` keeps a step longer than the lease alive, `HistoryReader` reads a long conversation in one query, and `LineageReader` makes a cancel check cost one row instead of a parent's whole history. `journal/postgres` is a complete store with a sweep query and every optional interface except `HistoryReader`. `journaltest.Run` checks any store against the contract, with crash sweeps through real agents.
 
 ```go
 agent := &harness.Agent{Name: "refunds", Provider: p, Tools: tools, Journal: journal,
@@ -87,7 +86,9 @@ for _, id := range ids {
 }
 ```
 
-A tool's `Effect` says what a crash means for it. `EffectRead` and `EffectIdempotent` are repeated, with the same `tool.IdempotencyKey`. `EffectOnce`, the zero value, is never repeated blindly: an unknown outcome parks the run until a person answers.
+A process that only answers a run, such as a handler that takes an approval, calls `agent.Deliver(ctx, harness.Resume(id, signal))` instead. It records the answer, claims nothing and does no work, and sets `Wake` to now so a worker picks the run up.
+
+A tool's `Effect` says what a crash means for it. `EffectRead` and `EffectIdempotent` are repeated, with the same `tool.IdempotencyKey`. `EffectOnce`, the zero value, is never repeated blindly. An unknown outcome parks the run until a person answers. An operator who knows such a call did not happen answers with `Signal{Rerun: true}`, and the call is decided again and runs under the same key. `EffectAtomic` writes only through the journal's own transaction. A journal that implements `AtomicJournal` commits the tool's writes with its `tool.done` or not at all, so a crash undoes the effect and the call runs again under the same key. `journal/postgres` hands the tool its transaction through `postgres.TxFrom(ctx)`.
 
 The state machine is in [docs/state-machine.md](docs/state-machine.md), and the design, its evidence and its limits are in [docs/design/durable-core.md](docs/design/durable-core.md).
 
@@ -108,7 +109,7 @@ The state machine is in [docs/state-machine.md](docs/state-machine.md), and the 
 | `CheckOutput` | on the candidate answer, recorded | output guardrails, verifiers |
 | `AfterRun` | when the outcome is decided, at least once | saving memory |
 
-Built in: `guard`, `budget`, `approval`, `compact`, `offload`, `retry`, `profile`, `trajectory`, and the sinks `trace`, `metrics` and `logging`. See [docs/hooks.md](docs/hooks.md).
+Built in: `guard`, `budget`, `approval`, `compact`, `offload`, `retry`, `profile`, `trajectory`, and the sinks `trace`, `metrics` and `logging`. Trace spans leave out conversation content unless asked. See [docs/hooks.md](docs/hooks.md).
 
 ## Multi-agent patterns
 
@@ -123,7 +124,7 @@ All patterns are `harness.Runner`s, so they nest. Each is a durable composite ru
 | Subagent | `multi.Subagent` | a lead delegates through a tool, with a fresh context | [doc](docs/patterns/subagent.md) |
 | Background | `multi.Background` | `start_<name>` returns a job, `collect` later | [doc](docs/patterns/background.md) |
 | Planner / worker / judge | `multi.PlannerWorker` | tasks, recursive sub-planners, handoff reports, a fresh start per round | [doc](docs/patterns/planner-worker.md) |
-| Evaluator–optimizer | `multi.EvaluatorOptimizer` | generator ⇄ evaluator | [doc](docs/patterns/evaluator-optimizer.md) |
+| Evaluator-optimizer | `multi.EvaluatorOptimizer` | generator ⇄ evaluator | [doc](docs/patterns/evaluator-optimizer.md) |
 | Handoff | `multi.Handoff` | peers transfer control, with a hop cap | [doc](docs/patterns/handoff.md) |
 | Team | `multi.Team` | peers work through a task list in rounds and add follow-ups | [doc](docs/patterns/team.md) |
 | Debate | `multi.Debate` | independent answers, cross-reading rounds, a judge | [doc](docs/patterns/debate.md) |
@@ -155,7 +156,7 @@ HARNESS_PROVIDER=openai    OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODE
 HARNESS_PROVIDER=anthropic ANTHROPIC_API_KEY=…  [ANTHROPIC_MODEL=claude-opus-5-5]  go run ./examples/webchat
 ```
 
-The journal is in memory, so a restart forgets the runs. Flags: `-addr localhost:8080`, `-v`.
+Each conversation is a `harness.Session`, so every message is its own run, chained to the one before. The journal is in memory, so a restart forgets the runs. Flags: `-addr localhost:8080`, `-v`.
 
 ## Learn the hooks: one example each
 
@@ -193,10 +194,14 @@ res, err := a.Run(ctx, harness.Prompt("Weather in Zurich?"))
 // res.Output, res.Stop, res.Path, res.Usage, res.Spent() …
 ```
 
-- Chat: `harness.NewSession(runner).Send(ctx, text)` keeps history across runs, and is safe to repeat after a crash.
+- Chat: `harness.NewSession(runner).Send(ctx, text)` runs each turn as its own run, chained to the one before with `Input.After`, and is safe to repeat after a crash. A chained run inherits its predecessor's final history without copying it, so storage grows with what is new. `harness.Prior` reads a finished run's history, `harness.FoldOn` folds a chained run, and a journal may answer faster through `HistoryReader`.
+- Identity: `Input.Meta` (tenant, principal, labels) is recorded at start and read back from `Run.Meta`, so a resume by any process acts for the run's owner. A child started from a tool inherits it.
+- Per-run context: `Input.Pinned` (a snapshot, retrieved memory) is recorded at start and sent on every request of that run, after the history and before the run's own messages. No other run inherits it, and a `Context` hook cannot edit it.
+- Live streaming with redaction: `guard.Stream(guard.Secrets(), 0)` redacts the stream as it passes, where `guard.Redactor` holds the reply until it is complete. With a window of 0, `Secrets()` holds back 657 bytes and `PII()` holds back 345 bytes, so a reply shorter than that reaches a sink only when it ends.
+- Attachments: put `model.Part`s with a `Ref` on a user message and set `Agent.Resolve`. The journal keeps the reference and the part's text, and the provider gets the bytes. A provider that refuses a part fails with `model.ClassContent`, which a `Recover` hook can answer by retrying without it.
 - Graceful shutdown: `ctx, drain := harness.WithDrain(ctx)`. Runs finish their step, record it and return `ErrDrained`.
 - Patterns: see the `Example…` functions in `multi/example_test.go`.
-- Evals: `eval.Run(ctx, runner, tasks, parallel)` with `eval.Contains`, `eval.StoppedWith` or `eval.Judge`.
+- Evals: `eval.Run(ctx, runner, tasks, parallel)` with `eval.Contains`, `eval.StoppedWith` or `eval.Judge` for single prompts. For conversations, `eval.RunScenarios(ctx, target, scenarios, kinds, parallel)` plays multi-turn scenarios through your own `eval.Target`, grades them with `eval.Generic()` plus your own check kinds and writes a report, and `eval.SelfTest` proves each check tells a good script from a bad one.
 
 Run the checks:
 
@@ -210,12 +215,10 @@ AGENT_HARNESS_LIVE=1 ANTHROPIC_API_KEY=… go test ./provider -run Live -v
 
 ## What has not been verified
 
-- **No adapter has met a real API.** They run through the machine against a scripted server that follows the published docs. `TestLiveToolLoop` checks a real one and has not been run.
+- **No adapter has met a real API.** They run through the machine against a scripted server that follows the published docs, and that includes how they encode message parts. `TestLiveToolLoop` checks a real one and has not been run.
+- **Most of units L1 to L11 were not mutation-checked.** Mutants ran against four of their mechanisms, listed in [the design](docs/design/durable-core.md#evidence). For the rest, their own tests are the only check.
+- **`journal/postgres` failed once without naming a failing test**, in each of two separate runs. Three consecutive reruns on fresh databases passed. The cause is not known.
 - **The cases and their evidence** are listed in [the design](docs/design/durable-core.md#evidence), with what each one proves and what it doesn't.
-
-## Fit with corporate-admin
-
-The API is shaped so that corporate-admin's hard-coded loop (`cmd/core/agent/turn/worker.go`, `switch agent.Next(limits, turn)`) can later be replaced. That integration is out of scope here. The mapping is in [docs/corporate-admin.md](docs/corporate-admin.md). Both are event-sourced and pure in the same way, which was the point of the redesign.
 
 ## Sources
 

@@ -29,6 +29,18 @@ func Class(status int) model.ErrorClass {
 	return model.ClassUnknown
 }
 
+// Refused reports a status that turns down the request as sent: malformed, too
+// large, of a media type the server does not take, or unprocessable. When the
+// request carried a binary part, such a refusal is the part's, unless the provider
+// says the context is full.
+func Refused(status int) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
+}
+
 // RetryAfter reads how long the server asked for: milliseconds, seconds or a date.
 // Anything unreadable or already past is zero.
 func RetryAfter(h http.Header, now time.Time) time.Duration {

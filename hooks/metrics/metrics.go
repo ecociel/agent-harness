@@ -10,6 +10,10 @@
 // event once. It can still miss the last event before a crash: the journal is the
 // source to reconcile a total from.
 //
+// Cached tokens are a subset of input and reasoning tokens a subset of output, so
+// do not add the four kinds together. The cached and reasoning series appear with
+// the first call that reports any.
+//
 // Metric names (labels in braces):
 //
 //	agent_runs_total{agent,stop}         counter
@@ -19,7 +23,7 @@
 //	model_errors_total{model,class}      counter
 //	model_lost_total{agent}              counter
 //	model_latency_ms{model}              histogram
-//	model_tokens_total{model,kind}       counter (kind = input|output)
+//	model_tokens_total{model,kind}       counter (kind = input|output|cached|reasoning)
 //	tool_calls_total{tool,outcome}       counter (outcome = ok|error|denied|lost|...)
 //	tool_latency_ms{tool}                histogram
 package metrics
@@ -132,6 +136,12 @@ func Sink(r Recorder) harness.EventSink {
 	tokens := func(name string, u model.Usage) {
 		r.Add("model_tokens_total", map[string]string{"model": name, "kind": "input"}, float64(u.Input))
 		r.Add("model_tokens_total", map[string]string{"model": name, "kind": "output"}, float64(u.Output))
+		if u.Cached > 0 {
+			r.Add("model_tokens_total", map[string]string{"model": name, "kind": "cached"}, float64(u.Cached))
+		}
+		if u.Reasoning > 0 {
+			r.Add("model_tokens_total", map[string]string{"model": name, "kind": "reasoning"}, float64(u.Reasoning))
+		}
 	}
 	return func(e harness.Event) {
 		name := modelName(e.Model)

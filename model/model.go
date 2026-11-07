@@ -1,11 +1,6 @@
 // Package model defines the provider-neutral vocabulary the harness speaks to
 // a language model: messages, tool calls, streaming events and token usage.
 //
-// The shape deliberately mirrors corporate-admin's gateways/llm package
-// (Provider.Complete returning an iter.Seq2 of streaming events, with
-// TextDelta, ToolCallDelta and Finish), so an adapter between the two is a
-// thin mapping rather than a redesign.
-//
 // A Provider only has to stream. Collect turns a stream into a Response and is
 // what the harness uses internally; it is exported so providers and tests can
 // reuse the exact same accumulation rules.
@@ -44,15 +39,54 @@ const (
 //
 // Opaque is provider state that must go back verbatim on the next call (thinking
 // signatures, response ids). Only the provider that produced it may read it.
+//
+// Content is the text of the message. Parts carry what is not text, and belong to
+// user messages. A provider sends the parts before the text.
 type Message struct {
 	Role       Role            `json:"role"`
 	Content    string          `json:"content"`
+	Parts      []Part          `json:"parts,omitempty"`
 	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 	Name       string          `json:"name,omitempty"`
 	Source     string          `json:"source,omitempty"`
 	Opaque     json.RawMessage `json:"opaque,omitempty"`
 }
+
+// PartKind is what a Part carries.
+type PartKind string
+
+// Part kinds.
+const (
+	PartImage    PartKind = "image"
+	PartAudio    PartKind = "audio"
+	PartDocument PartKind = "document" // a PDF or the like, sent natively where the provider can
+)
+
+// Part is non-text input attached to a user message.
+//
+// Ref names the content, typically by its hash, and is what the history and the
+// journal keep. Bytes is the content itself and is never marshalled: a Resolver
+// fills it on the request a provider receives, so a resume sends the same request
+// without the journal holding the file. A caller that talks to a provider directly
+// may set Bytes itself.
+//
+// Text is what the part says as text, and is optional. A provider sends it in place
+// of a part whose kind or media type it cannot take, and token estimates count it.
+// A part a provider can send neither way fails with ClassContent. Text and Name pass
+// through redactors. Bytes do not, because a text rule cannot judge an image.
+type Part struct {
+	Kind      PartKind `json:"kind"`
+	MediaType string   `json:"media_type"`
+	Name      string   `json:"name,omitempty"`
+	Ref       string   `json:"ref,omitempty"`
+	Text      string   `json:"text,omitempty"`
+	Bytes     []byte   `json:"-"`
+}
+
+// Resolver returns the bytes a Part's Ref names. It runs at send time, once per
+// part and model call. Return a *Error to classify a failure.
+type Resolver func(ctx context.Context, p Part) ([]byte, error)
 
 // System returns a system message.
 func System(text string) Message { return Message{Role: RoleSystem, Content: text} }
@@ -98,6 +132,9 @@ type Request struct {
 func (r Request) Clone() Request {
 	out := r
 	out.Messages = append([]Message(nil), r.Messages...)
+	for i := range out.Messages {
+		out.Messages[i].Parts = append([]Part(nil), out.Messages[i].Parts...)
+	}
 	out.Tools = append([]ToolSpec(nil), r.Tools...)
 	return out
 }
@@ -147,6 +184,7 @@ const (
 	ClassRateLimit     ErrorClass = "rate_limit"     // 429: retry after RetryAfter
 	ClassContextLength ErrorClass = "context_length" // compact, then retry
 	ClassInvalid       ErrorClass = "invalid"        // 400: retrying cannot help
+	ClassContent       ErrorClass = "content"        // a part refused: retry without it
 	ClassAuth          ErrorClass = "auth"           // 401, 403
 	ClassInternal      ErrorClass = "internal"       // a hook, the journal or the harness itself
 )
@@ -363,6 +401,9 @@ func EstimateTokens(msgs []Message) int {
 	n := 0
 	for _, m := range msgs {
 		n += 4 + len(m.Content)/4
+		for _, p := range m.Parts {
+			n += len(p.Text) / 4
+		}
 		for _, c := range m.ToolCalls {
 			n += (len(c.Name) + len(c.Arguments)) / 4
 		}

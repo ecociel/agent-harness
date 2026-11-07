@@ -1,6 +1,7 @@
 package httperr
 
 import (
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -18,6 +19,18 @@ func TestClass(t *testing.T) {
 		if got := Class(status); got != want {
 			t.Errorf("%d: got %s, want %s", status, got, want)
 		}
+	}
+}
+
+func TestRefused(t *testing.T) {
+	var got []int
+	for status := 100; status < 600; status++ {
+		if Refused(status) {
+			got = append(got, status)
+		}
+	}
+	if fmt.Sprint(got) != "[400 413 415 422]" {
+		t.Fatalf("got %v", got)
 	}
 }
 

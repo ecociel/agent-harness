@@ -22,6 +22,7 @@ package budget
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/ecociel/agent-harness"
@@ -43,6 +44,9 @@ type Limits struct {
 }
 
 // Price converts tokens to dollars (per million tokens).
+//
+// Deprecated: use model.Price and WithPrices, which price cached and reasoning
+// tokens and one rate per model.
 type Price struct {
 	InputPerM  float64
 	OutputPerM float64
@@ -66,17 +70,27 @@ type Pool func(ctx context.Context, r harness.Run) (Spent, error)
 // Budget is the budget hook. Safe for concurrent use: it holds nothing that changes.
 type Budget struct {
 	limits Limits
-	price  Price
+	prices model.Prices
 	pool   Pool
 }
 
 // New returns a budget with the given limits.
 func New(l Limits) *Budget { return &Budget{limits: l} }
 
-// WithPrice sets the price used for CostUSD and returns b.
-func (b *Budget) WithPrice(p Price) *Budget {
-	b.price = p
+// WithPrices sets the table CostUSD is priced from and returns b. Prices are in
+// micro-dollars per million tokens. A model with no entry bills zero, so give the
+// table a "*" default when a run may use a model the table does not name.
+func (b *Budget) WithPrices(p model.Prices) *Budget {
+	b.prices = p
 	return b
+}
+
+// WithPrice prices every model at p and returns b.
+//
+// Deprecated: use WithPrices. Cached tokens are priced as input.
+func (b *Budget) WithPrice(p Price) *Budget {
+	in, out := int64(math.Round(p.InputPerM*1e6)), int64(math.Round(p.OutputPerM*1e6))
+	return b.WithPrices(model.Prices{"*": {InputPerM: in, CachedPerM: in, OutputPerM: out}})
 }
 
 // WithPool makes the limits apply to what pool reports instead of to one run.
@@ -95,8 +109,35 @@ func (b *Budget) Name() string { return "budget" }
 // waiting a week for a signal has used none of its wall-clock limit.
 func (b *Budget) Spent(r harness.Run) Spent {
 	return Spent{Usage: r.Usage, ModelCalls: r.ModelCalls + r.LostCalls, ToolCalls: r.ToolCalls,
-		CostUSD: float64(r.Usage.Input)*b.price.InputPerM/1e6 + float64(r.Usage.Output)*b.price.OutputPerM/1e6,
-		Elapsed: time.Since(r.Started) - r.Waited}
+		CostUSD: b.cost(r), Elapsed: time.Since(r.Started) - r.Waited}
+}
+
+// cost prices each recorded call at its own model's rate. Usage that no event of
+// this run recorded came from children, whose models the run does not know, so it
+// is priced at the default entry.
+func (b *Budget) cost(r harness.Run) float64 {
+	var micros int64
+	var own model.Usage
+	for _, e := range r.Events {
+		var u model.Usage
+		switch {
+		case e.Kind == harness.KindModelDone && e.Reply != nil:
+			u = e.Reply.Usage
+		case e.Kind == harness.KindModelFailed && e.Failure != nil:
+			u = e.Failure.Usage
+		default:
+			continue
+		}
+		own = own.Add(u)
+		m, _ := b.prices.Cost(e.Model, u)
+		micros += m
+	}
+	if rest := (model.Usage{Input: r.Usage.Input - own.Input, Output: r.Usage.Output - own.Output,
+		Cached: r.Usage.Cached - own.Cached, Reasoning: r.Usage.Reasoning - own.Reasoning}); rest.Input > 0 || rest.Output > 0 {
+		m, _ := b.prices.Cost("", rest)
+		micros += m
+	}
+	return float64(micros) / 1e6
 }
 
 func (b *Budget) current(ctx context.Context, r harness.Run) (Spent, error) {

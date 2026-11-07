@@ -1,7 +1,9 @@
 package model_test
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ecociel/agent-harness/model"
@@ -50,5 +52,79 @@ func TestStreamRoundTrip(t *testing.T) {
 	}
 	if out.Text != in.Text || len(out.ToolCalls) != 1 || out.Finish != model.FinishToolCalls {
 		t.Fatalf("got %+v", out)
+	}
+}
+
+func TestPricesCost(t *testing.T) {
+	prices := model.Prices{
+		"gpt-x":   {InputPerM: 2_000_000, CachedPerM: 500_000, OutputPerM: 8_000_000},
+		"think-*": {InputPerM: 1_000_000, CachedPerM: 100_000, OutputPerM: 4_000_000, ReasoningPerM: 6_000_000},
+		"think-2": {InputPerM: 3_000_000, OutputPerM: 5_000_000},
+		"*":       {InputPerM: 1_000_000, OutputPerM: 1_000_000},
+	}
+	u := model.Usage{Input: 1_000_000, Cached: 400_000, Output: 500_000, Reasoning: 100_000}
+	for _, tc := range []struct {
+		name string
+		u    model.Usage
+		want int64
+		ok   bool
+	}{
+		// 600k*2 + 400k*0.5 + 500k*8 = 1.2 + 0.2 + 4.0 million micros
+		{"gpt-x", u, 5_400_000, true},
+		// 600k*1 + 400k*0.1 + 400k*4 + 100k*6 = 0.6+0.04+1.6+0.6
+		{"think-1", u, 2_840_000, true},
+		// the exact name wins over the prefix; zero reasoning price is the output price
+		{"think-2", model.Usage{Output: 1_000_000, Reasoning: 1_000_000}, 5_000_000, true},
+		{"other", model.Usage{Input: 3, Output: 3}, 6, true}, // the "*" default
+		{"", model.Usage{Input: 1_000_000}, 1_000_000, true},
+		{"gpt-x", model.Usage{}, 0, true},
+	} {
+		got, ok := prices.Cost(tc.name, tc.u)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("%s: Cost = %d, %v; want %d, %v", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+	if got, ok := (model.Prices{"a": {}}).Cost("b", u); ok || got != 0 {
+		t.Fatalf("unpriced model: %d, %v", got, ok)
+	}
+	if got, ok := (model.Prices(nil)).Cost("b", u); ok || got != 0 {
+		t.Fatalf("nil table: %d, %v", got, ok)
+	}
+	// Cached above input must not bill negative uncached tokens.
+	if got, _ := prices.Cost("gpt-x", model.Usage{Input: 10, Cached: 20}); got < 0 {
+		t.Fatalf("negative cost %d", got)
+	}
+}
+
+func TestPartBytesNeverReachJSON(t *testing.T) {
+	m := model.Message{Role: model.RoleUser, Content: "see attached", Parts: []model.Part{{
+		Kind: model.PartImage, MediaType: "image/png", Name: "scan.png", Ref: "sha256:ab12", Text: "a scanned invoice", Bytes: []byte("PNGDATA")}}}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"role":"user","content":"see attached","parts":[{"kind":"image","media_type":"image/png","name":"scan.png","ref":"sha256:ab12","text":"a scanned invoice"}]}`
+	if string(b) != want {
+		t.Fatalf("got  %s\nwant %s", b, want)
+	}
+}
+
+func TestCloneCopiesParts(t *testing.T) {
+	orig := model.Request{Messages: []model.Message{{Role: model.RoleUser, Parts: []model.Part{{Kind: model.PartImage, Ref: "a"}}}}}
+	c := orig.Clone()
+	c.Messages[0].Parts[0].Bytes = []byte("x")
+	c.Messages[0].Parts = append(c.Messages[0].Parts, model.Part{Ref: "b"})
+	if orig.Messages[0].Parts[0].Bytes != nil || len(orig.Messages[0].Parts) != 1 {
+		t.Fatalf("clone wrote through: %+v", orig.Messages[0].Parts)
+	}
+}
+
+func TestEstimateTokensCountsPartText(t *testing.T) {
+	msgs := []model.Message{{Role: model.RoleUser, Parts: []model.Part{
+		{Kind: model.PartDocument, Ref: "a", Text: strings.Repeat("x", 400)},
+		{Kind: model.PartImage, Ref: "b"},
+	}}}
+	if got := model.EstimateTokens(msgs); got != 104 {
+		t.Fatalf("got %d, want 104", got)
 	}
 }
