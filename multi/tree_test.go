@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -713,4 +716,35 @@ func (j *sweepJournal) due(now time.Time) []string {
 		}
 	}
 	return out
+}
+
+func TestAChildStartedFromAToolKeepsItsParentsPrefix(t *testing.T) {
+	j := newJournal()
+	b := multi.NewBackground(multi.Subagent{Name: "crawler", Agent: bot("crawler", "crawled")})
+	lead, err := multi.WithSubagents(&harness.Agent{Name: "lead", Journal: j, Tools: tool.NewRegistry(b.Tools()...),
+		Provider: fake.Script(fake.Call("researcher", map[string]string{"task": "look"}),
+			fake.Call("start_crawler", map[string]string{"task": "crawl"}), fake.Text("done"))},
+		multi.Subagent{Name: "researcher", Agent: bot("researcher", "found")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := harness.Prompt("go")
+	in.RunID = "tenant-7/turn-3"
+	if res, err := lead.Run(context.Background(), in); err != nil || !res.OK() {
+		t.Fatalf("%v %+v", err, res)
+	}
+	b.Wait()
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	seen := map[string]string{}
+	for id := range j.runs {
+		for _, re := range []string{`^tenant-7/turn-3$`, `^tenant-7/turn-3/[0-9a-f]{24}$`, `^tenant-7/turn-3/crawler/[0-9a-f]{24}$`} {
+			if regexp.MustCompile(re).MatchString(id) {
+				seen[re] = id
+			}
+		}
+	}
+	if len(j.runs) != 3 || len(seen) != 3 {
+		t.Fatalf("runs %v, matched %v", slices.Collect(maps.Keys(j.runs)), seen)
+	}
 }
