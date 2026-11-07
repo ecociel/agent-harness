@@ -24,7 +24,7 @@ One rule makes hooks safe across a crash: **a hook only ever returns a value.** 
 A `BeforeTool` decision can carry `Tags`, free-form facts such as a risk class or a reason code. They are recorded on `tool.gated` and redacted, so a later fold or a page reads them from the journal without the hook. The model never sees them.
 A message part passes the ring by its name and its text. Its bytes never do: `Agent.Resolve` adds them inside the ring, after every redactor, on the request the provider gets.
 
-Retries belong in `Recover`, not `WrapModel`: an attempt inside middleware isn't journaled, so a crash forgets it.
+Retries belong in `Recover`, not `WrapModel`: an attempt inside middleware isn't journaled, so a crash forgets it. A failure of class `internal` (a hook, the journal or the harness itself failed, including a redactor that failed closed) is never offered to `Recover` and fails the run, because calling the model again cannot repair a local fault and must not undo a redactor's refusal.
 
 [examples/hooks](../examples/hooks/README.md) has a small runnable program for every point and every package below.
 
