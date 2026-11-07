@@ -699,8 +699,8 @@ func (stepClose) isStep()     {}
 func (stepPark) isStep()      {}
 func (stepEnd) isStep()       {}
 
-// next is the decider: a pure function from a fold to the next step. It mirrors
-// corporate-admin's agent.Next(limits, turn), with the limits pinned in the run.
+// next is the decider: a pure function from a fold to the next step, with the
+// limits pinned in the run.
 func next(r *Run) step {
 	if r.Drift.Shape && r.State.Loop() == "inner" {
 		return stepLimit{StopFailed, "the parts of this run changed after it started"}

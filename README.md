@@ -17,7 +17,6 @@ go get github.com/ecociel/agent-harness
 - [Learn the hooks: one example each](#learn-the-hooks-one-example-each)
 - [Using it](#using-it)
 - [What has not been verified](#what-has-not-been-verified)
-- [corporate-admin as a consumer](#corporate-admin-as-a-consumer)
 - [Sources](#sources)
 - [Open questions](#open-questions)
 
@@ -217,13 +216,9 @@ AGENT_HARNESS_LIVE=1 ANTHROPIC_API_KEY=… go test ./provider -run Live -v
 ## What has not been verified
 
 - **No adapter has met a real API.** They run through the machine against a scripted server that follows the published docs, and that includes how they encode message parts. `TestLiveToolLoop` checks a real one and has not been run.
-- **Most units of the corporate-admin integration were not mutation-checked.** Mutants ran against four of their mechanisms, listed in [the design](docs/design/durable-core.md#evidence). For the rest, their own tests are the only check.
+- **Most of units L1 to L11 were not mutation-checked.** Mutants ran against four of their mechanisms, listed in [the design](docs/design/durable-core.md#evidence). For the rest, their own tests are the only check.
 - **`journal/postgres` failed once without naming a failing test**, in each of two separate runs. Three consecutive reruns on fresh databases passed. The cause is not known.
 - **The cases and their evidence** are listed in [the design](docs/design/durable-core.md#evidence), with what each one proves and what it doesn't.
-
-## corporate-admin as a consumer
-
-corporate-admin runs its chat agents on this library, beside its old turn loop and behind a per-org flag. It brings its own SQL journal, which writes every projection in the transaction of the append, and its own hooks for approvals, compaction and retries. [docs/corporate-admin.md](docs/corporate-admin.md) shows what it supplies for each concern, where it departs from these docs, and the library units the integration produced.
 
 ## Sources
 

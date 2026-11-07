@@ -135,8 +135,8 @@ var (
 // The docs name the API by its real identifiers, so a rename or a removal that
 // leaves a doc behind fails here. A name the docs qualify with a package must be
 // exported by it, and Type.Member or Type{Field} must name a field or method of a
-// type of that name in some package. Names of other programs, such as
-// corporate-admin's, use package names this map does not know and are skipped.
+// type of that name in some package. A name qualified with a package this map
+// does not know is skipped.
 func TestTheDocsNameRealIdentifiers(t *testing.T) {
 	apis := map[string]apiOf{}
 	for name, dir := range docPackages {
@@ -155,7 +155,7 @@ func TestTheDocsNameRealIdentifiers(t *testing.T) {
 		}
 		return known, false
 	}
-	docs := []string{"README.md", "docs/hooks.md", "docs/state-machine.md", "docs/corporate-admin.md",
+	docs := []string{"README.md", "docs/hooks.md", "docs/state-machine.md",
 		"docs/design/durable-core.md", "examples/hooks/README.md"}
 	patterns, _ := filepath.Glob("docs/patterns/*.md")
 	for _, path := range append(docs, patterns...) {

@@ -1,11 +1,6 @@
 // Package model defines the provider-neutral vocabulary the harness speaks to
 // a language model: messages, tool calls, streaming events and token usage.
 //
-// The shape deliberately mirrors corporate-admin's gateways/llm package
-// (Provider.Complete returning an iter.Seq2 of streaming events, with
-// TextDelta, ToolCallDelta and Finish), so an adapter between the two is a
-// thin mapping rather than a redesign.
-//
 // A Provider only has to stream. Collect turns a stream into a Response and is
 // what the harness uses internally; it is exported so providers and tests can
 // reuse the exact same accumulation rules.

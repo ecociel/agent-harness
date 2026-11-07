@@ -1,6 +1,6 @@
 # Durable core
 
-**Status: design agreed, 2026-10-30. Units 1 to 8 of the plan are done, and so are the eleven units L1 to L11 of the corporate-admin integration, on the `corporate-admin-integration` branch.** The earlier evidence comes from a working sketch that was never committed to this repository.
+**Status: design agreed, 2026-10-30. Units 1 to 8 of the plan are done, and so are the eleven units L1 to L11.** The earlier evidence comes from a working sketch that was never committed to this repository.
 
 ## Problem
 
@@ -269,11 +269,11 @@ Reported by the spike in `.audit/durable-core/spike-report.md`, and not rerun:
 
 ## Synthesis decision
 
-Three working sketches competed. Scores are from one separate judge reading the code. All three sketches and the judge ran on Claude models, so there was no second model family, and corporate-admin fit was one of six scoring criteria, chosen by the design's author:
+Three working sketches competed. Scores are from one separate judge reading the code. All three sketches and the judge ran on Claude models, so there was no second model family, and fit with one caller outside this repository was one of six scoring criteria, chosen by the design's author:
 
 | Candidate | Score (of 30) | Why it lost or won |
 |---|---|---|
-| Event-sourced decider | 24 | **Base.** The machine is the truth, and the shape stops hooks skipping redaction, ordering and fencing. Matches corporate-admin's `agent.Next` |
+| Event-sourced decider | 24 | **Base.** The machine is the truth, and the shape stops hooks skipping redaction, ordering and fencing |
 | Replayed effects | 21 | Best multi-agent story. But custom `Runner`s must be deterministic, hooks that don't rerun silently break after resume, and any change to step order diverges suspended runs |
 | Snapshot machine | 20 | Simplest mental model. But it rewrites the whole body at every commit, hooks can write any snapshot field, and its heartbeat had a real data race |
 
@@ -352,7 +352,7 @@ Each of these was left on purpose.
 
 1. **The model and tools work from redacted text only.** A resume must reproduce what the model saw, so raw text lives nowhere a run reads.
 2. **The break is total.** `Result` disappears, every hook signature changes, and `Run` is no longer a pointer. There is no compatibility layer.
-3. **`Journal` stays generic.** corporate-admin brought its own SQL journal, which passes `journaltest.Run`, and its engine runs on the library. Every change it needed was a general unit, L1 to L11, and none names it. [docs/corporate-admin.md](../corporate-admin.md) has the details.
+3. **`Journal` stays generic.** A caller outside this repository brought its own SQL journal, which passes `journaltest.Run`, and its engine runs on the library. Every change it needed was a general unit, L1 to L11, and none names that caller.
 
 ## Implementation plan
 
@@ -369,7 +369,7 @@ Each unit lands on its own and ends in a check. Unit 2 ran first, because the su
 | 7 | Done. Web chat, README, docs | `docs/state-machine.md` is generated from the table or checked against it, and `TestTheDocsNameRealIdentifiers` fails on a name the code does not export |
 | 8 | Done. Real process kill test | `SIGKILL` at random points on the real journal, no once-only tool repeats |
 
-The integration with corporate-admin added eleven units. Each is general and names no consumer.
+A later integration added eleven units. Each is general and names no consumer.
 
 | # | Unit | Done when |
 |---|---|---|
