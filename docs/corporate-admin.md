@@ -1,6 +1,6 @@
 # corporate-admin as a consumer
 
-corporate-admin runs its chat agents on this library. This page is the worked example of a production consumer: what the application supplies for each concern of [the concern matrix](design/durable-core.md#concern-matrix), where that code lives, and which library units the integration produced. It describes corporate-admin at `8315a1cf` on its branch `agent-harness-integration`, where the harness engine is the only engine: the old turn loop, its tables and the flag `chat-tab-v2` are gone (cutover migration `0006_agent_harness_cutover`). The application's own design and progress are in its `docs/agent-harness-integration.md`. Paths below are relative to its `cmd/core`.
+corporate-admin runs its chat agents on this library. This page is the worked example of a production consumer: what the application supplies for each concern of [the concern matrix](design/durable-core.md#concern-matrix), where that code lives, and which library units the integration produced. It describes corporate-admin at `68b52e0b` on its branch `agent-harness-integration`, where the harness engine is the only engine: the old turn loop, its tables and the flag `chat-tab-v2` are gone (cutover migration `0006_agent_harness_cutover`). The application's own design and progress are in its `docs/agent-harness-integration.md`. Paths below are relative to its `cmd/core`.
 
 ## The shape
 
