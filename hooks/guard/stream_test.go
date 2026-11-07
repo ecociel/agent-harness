@@ -10,6 +10,7 @@ import (
 	"github.com/ecociel/agent-harness"
 	"github.com/ecociel/agent-harness/hooks/guard"
 	"github.com/ecociel/agent-harness/model"
+	"github.com/ecociel/agent-harness/tool"
 )
 
 // mail is bounded (at most 48 bytes), so a window of 64 holds any match.
@@ -138,7 +139,7 @@ func TestStreamRedactsToolCallArguments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(resp.ToolCalls[0].Arguments); got != `{"n":3,"to":"[redacted:email]"}` {
+	if got := string(resp.ToolCalls[0].Arguments); got != `{"to":"[redacted:email]","n":3}` {
 		t.Fatal(got)
 	}
 }
@@ -183,5 +184,67 @@ func TestEveryShippedRuleIsBounded(t *testing.T) {
 	p := guard.Pseudonymizer{Rules: guard.PII(), Key: []byte("k"), Vault: guard.NewMemVault()}
 	if err := p.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// argsRaw has a duplicate key, a case-folded duplicate, unusual whitespace, a kept
+// escape, an unusual number and a secret inside a nested array.
+const argsRaw = "{\"a\":1,\"a\":2,\"A\" :\t3,\n  \"list\": [ \"plain\\u00e9\" , [\"key sk-abcdefghijklmnop1234 end\"] ],\"n\":1.50e+2 }"
+
+const argsSecret = "key sk-abcdefghijklmnop1234 end"
+
+// toolOnce asks for one call to send with raw, streamed in pieces of three bytes,
+// then answers.
+func toolOnce(raw string) model.Provider {
+	var calls int
+	return model.ProviderFunc(func(context.Context, model.Request) iter.Seq2[model.Event, error] {
+		calls++
+		first := calls == 1
+		return func(yield func(model.Event, error) bool) {
+			if !first {
+				yield(model.TextDelta{Text: "done"}, nil)
+				yield(model.Finish{Reason: model.FinishStop}, nil)
+				return
+			}
+			for i := 0; i < len(raw); i += 3 {
+				d := model.ToolCallDelta{Index: 0, Arguments: raw[i:min(i+3, len(raw))]}
+				if i == 0 {
+					d.ID, d.Name = "c1", "send"
+				}
+				if !yield(d, nil) {
+					return
+				}
+			}
+			yield(model.Finish{Reason: model.FinishToolCalls}, nil)
+		}
+	})
+}
+
+func TestRedactionKeepsTheArgumentBytes(t *testing.T) {
+	ctx := context.Background()
+	stream, err := guard.Stream(guard.Secrets(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := guard.Pseudonymizer{Rules: guard.Secrets(), Key: []byte("k"), Vault: guard.NewMemVault()}
+	tok, _ := p.Redact(ctx, harness.KindDelta, argsSecret)
+	for name, c := range map[string]struct {
+		hook harness.Hook
+		with string
+	}{
+		"stream":       {stream, "key [redacted:api_key] end"},
+		"pseudonymize": {p, tok},
+		"buffered":     {guard.Redactor(guard.Secrets()), "key [redacted:api_key] end"},
+	} {
+		var got string
+		a := &harness.Agent{Provider: toolOnce(argsRaw), Tools: tool.NewRegistry(recorder(&got)), Hooks: []harness.Hook{c.hook}}
+		res, err := a.Run(ctx, harness.Prompt("x"))
+		if err != nil || res.Stop != harness.StopCompleted {
+			t.Fatalf("%s: %v %+v", name, err, res)
+		}
+		want := strings.Replace(argsRaw, argsSecret, c.with, 1)
+		if c.with == argsSecret || want == argsRaw || got != want {
+			t.Errorf("%s\ngot  %q\nwant %q", name, got, want)
+		}
 	}
 }

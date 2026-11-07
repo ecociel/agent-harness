@@ -299,53 +299,63 @@ func tail(text string) string {
 	return text[len(text)-n:]
 }
 
-// json redacts the strings of a tool call's arguments and leaves valid JSON valid.
-// Arguments that are not JSON pass through, for the collector to reject.
+// json redacts the string values of a tool call's arguments in place. Every other
+// byte stays as the model sent it, keys included, because keys are names and a
+// consumer may judge the exact bytes: a duplicate key, the key order, whitespace,
+// escapes and number formatting survive. Arguments that are not JSON pass through,
+// for the collector to reject.
 func (s streamer) json(ctx context.Context, raw string) (string, error) {
 	if strings.TrimSpace(raw) == "" || !json.Valid([]byte(raw)) {
 		return raw, nil
 	}
-	dec := json.NewDecoder(strings.NewReader(raw))
-	dec.UseNumber()
-	var v any
-	if err := dec.Decode(&v); err != nil {
-		return "", err
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '"' {
+			continue
+		}
+		j := i + 1
+		for raw[j] != '"' {
+			if raw[j] == '\\' {
+				j++
+			}
+			j++
+		}
+		j++
+		if isKey(raw[j:]) {
+			i = j - 1
+			continue
+		}
+		var v string
+		if err := json.Unmarshal([]byte(raw[i:j]), &v); err != nil {
+			return "", err
+		}
+		out, err := s.apply(ctx, "", v)
+		if err != nil {
+			return "", err
+		}
+		if out != v {
+			b.WriteString(raw[last:i])
+			b.WriteString(quote(out))
+			last = j
+		}
+		i = j - 1
 	}
-	v, err := mapStrings(v, func(x string) (string, error) { return s.apply(ctx, "", x) })
-	if err != nil {
-		return "", err
-	}
+	b.WriteString(raw[last:])
+	return b.String(), nil
+}
+
+// isKey reports whether the string that ends where rest begins is an object key.
+func isKey(rest string) bool {
+	return strings.HasPrefix(strings.TrimLeft(rest, " \t\n\r"), ":")
+}
+
+func quote(s string) string {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(buf.String()), nil
-}
-
-func mapStrings(v any, f func(string) (string, error)) (any, error) {
-	switch x := v.(type) {
-	case string:
-		return f(x)
-	case []any:
-		for i := range x {
-			r, err := mapStrings(x[i], f)
-			if err != nil {
-				return nil, err
-			}
-			x[i] = r
-		}
-	case map[string]any:
-		for k, e := range x {
-			r, err := mapStrings(e, f)
-			if err != nil {
-				return nil, err
-			}
-			x[k] = r
-		}
-	}
-	return v, nil
+	_ = enc.Encode(s)
+	return strings.TrimSuffix(buf.String(), "\n")
 }
 
 // ruleRedactor is what Stream returns: Redactor over the same rules, and the stream
