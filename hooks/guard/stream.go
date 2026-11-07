@@ -8,6 +8,7 @@ import (
 	"iter"
 	"regexp/syntax"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/ecociel/agent-harness"
@@ -64,12 +65,13 @@ func maxLen(r Rule) (int, error) {
 func reMax(re *syntax.Regexp) int {
 	switch re.Op {
 	case syntax.OpLiteral:
-		if re.Flags&syntax.FoldCase != 0 {
-			return 4 * len(re.Rune)
-		}
 		n := 0
 		for _, r := range re.Rune {
-			n += utf8.RuneLen(r)
+			if re.Flags&syntax.FoldCase != 0 {
+				n += foldLen(r)
+			} else {
+				n += utf8.RuneLen(r)
+			}
 		}
 		return n
 	case syntax.OpCharClass:
@@ -118,6 +120,16 @@ func reMax(re *syntax.Regexp) int {
 		return n
 	}
 	return 0
+}
+
+// foldLen is the widest encoding among the runes r matches case-insensitively. Most
+// ASCII letters take one byte either way, but k also matches the Kelvin sign.
+func foldLen(r rune) int {
+	n := utf8.RuneLen(r)
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		n = max(n, utf8.RuneLen(f))
+	}
+	return n
 }
 
 func b2i(b bool) int {

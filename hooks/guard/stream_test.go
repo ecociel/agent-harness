@@ -248,3 +248,32 @@ func TestRedactionKeepsTheArgumentBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestShippedRuleWindowsStaySmall(t *testing.T) {
+	for name, c := range map[string]struct {
+		rules   []guard.Rule
+		ceiling int
+	}{
+		"Secrets": {guard.Secrets(), 700},
+		"PII":     {guard.PII(), 360},
+	} {
+		if _, err := guard.Stream(c.rules, c.ceiling); err != nil {
+			t.Errorf("%s: the default window grew past %d: %v", name, c.ceiling, err)
+		}
+	}
+}
+
+// A case-insensitive k also matches the Kelvin sign, which takes three bytes, so a
+// window must hold the widest fold of every rune, not one byte per ASCII letter.
+func TestStreamHoldsTheWidestFold(t *testing.T) {
+	red, err := guard.Stream([]guard.Rule{guard.R("kw", `(?i)kkkk`)}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{1, 2, 3, 4, 5} {
+		streamed, out := deltas(t, chunked("some text \u212a\u212a\u212a\u212a and more text after it", n), red)
+		if want := "some text [redacted:kw] and more text after it"; streamed != want || out != want {
+			t.Fatalf("chunk %d: streamed %q out %q", n, streamed, out)
+		}
+	}
+}

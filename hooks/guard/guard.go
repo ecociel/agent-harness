@@ -55,14 +55,15 @@ func PII() []Rule {
 
 // Secrets returns rules for credentials that must never reach a model or a
 // user: API keys, private keys and password assignments. Every rule has an upper
-// bound on a match (a key or password value up to 256 characters), so the set works
-// with Stream. The private key rule matches the BEGIN header line only, because a
-// key body has no sensible bound; the header is what marks the block.
+// bound on a match, so the set works with Stream. A key may run to 256 characters,
+// because a project key can be longer than 128. A password value is cut at 128. The
+// private key rule matches the BEGIN header line only, because a key body has no
+// sensible bound; the header is what marks the block.
 func Secrets() []Rule {
 	return []Rule{
 		R("api_key", `\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,256}\b`),
 		R("private_key", `-----BEGIN [A-Z ]{0,32}PRIVATE KEY-----`),
-		R("password", `(?i)\b(?:password|passwort|pwd)\s{0,16}(?:[:=]|\bis\b)\s{0,16}\S{1,256}`),
+		R("password", `(?i)\b(?:password|passwort|pwd)\s{0,16}(?:[:=]|\bis\b)\s{0,16}\S{1,128}`),
 	}
 }
 
