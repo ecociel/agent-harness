@@ -157,7 +157,7 @@ HARNESS_PROVIDER=openai    OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODE
 HARNESS_PROVIDER=anthropic ANTHROPIC_API_KEY=…  [ANTHROPIC_MODEL=claude-opus-5-5]  go run ./examples/webchat
 ```
 
-The journal is in memory, so a restart forgets the runs. Flags: `-addr localhost:8080`, `-v`.
+Each conversation is a `harness.Session`, so every message is its own run, chained to the one before. The journal is in memory, so a restart forgets the runs. Flags: `-addr localhost:8080`, `-v`.
 
 ## Learn the hooks: one example each
 

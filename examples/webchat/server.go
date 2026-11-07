@@ -47,7 +47,9 @@ var Price = budget.Price{InputPerM: 0.40, OutputPerM: 1.60}
 //
 // An approval is a durable wait: the run suspends and the turn's stream ends with
 // the wait in it. Nothing is held open for the person, and the answer is a signal.
-// The journal lives in memory, so a restart forgets the runs.
+// Each conversation is a harness.Session, so every message is its own run, chained
+// to the one before, and the journal holds each message once. The journal lives in
+// memory, so a restart forgets the runs.
 type Server struct {
 	Provider model.Provider
 	Model    string
