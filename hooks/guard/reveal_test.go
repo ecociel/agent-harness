@@ -146,3 +146,46 @@ func TestRevealText(t *testing.T) {
 		t.Fatal("a vault failure was swallowed")
 	}
 }
+
+func TestRevealStreamEqualsRevealingTheWhole(t *testing.T) {
+	ctx := context.Background()
+	v := guard.NewMemVault()
+	p := guard.Pseudonymizer{Key: []byte("k"), Vault: v}
+	anna, _ := p.Tokenize(ctx, "person", "party/1", "Anna Müller")
+	long, _ := p.Tokenize(ctx, "person/a-long:attribute", "party/2", "Jürg")
+	text := anna + " met " + long + anna + ", not ⟦person:000000000000⟧ or ⟦x or ⟦ or ⟦a:12⟧ " + anna
+	want := "Anna Müller met JürgAnna Müller, not ⟦person:000000000000⟧ or ⟦x or ⟦ or ⟦a:12⟧ Anna Müller"
+	if whole, err := guard.RevealText(ctx, v, text); err != nil || whole != want {
+		t.Fatalf("%v %q", err, whole)
+	}
+	stream := func(parts ...string) string {
+		r := guard.RevealStream{Vault: v}
+		var b strings.Builder
+		for _, part := range parts {
+			out, err := r.Reveal(ctx, part)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b.WriteString(out)
+		}
+		out, err := r.Flush(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b.String() + out
+	}
+	for i := 0; i <= len(text); i++ {
+		if got := stream(text[:i], text[i:]); got != want {
+			t.Fatalf("split at %d\ngot  %q\nwant %q", i, got, want)
+		}
+	}
+	for n := 1; n <= 8; n++ {
+		var parts []string
+		for i := 0; i < len(text); i += n {
+			parts = append(parts, text[i:min(i+n, len(text))])
+		}
+		if got := stream(parts...); got != want {
+			t.Fatalf("chunk %d: %q", n, got)
+		}
+	}
+}

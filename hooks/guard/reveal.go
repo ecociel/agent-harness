@@ -51,6 +51,31 @@ func RevealText(ctx context.Context, v Vault, text string) (string, error) {
 	return revealString(ctx, v, text)
 }
 
+// RevealStream reveals the tokens in a stream of text chunks, such as the deltas
+// of a reply on their way to a trusted reader, as RevealText does for a whole text.
+// A token split across chunks is held back until it is complete, so what comes out
+// equals RevealText of the whole. Set Vault; the zero value is otherwise ready. It
+// is not safe for concurrent use.
+type RevealStream struct {
+	Vault Vault
+	held  string
+}
+
+// Reveal takes the next chunk and returns the revealed text that can go out now.
+func (r *RevealStream) Reveal(ctx context.Context, chunk string) (string, error) {
+	s := r.held + chunk
+	i := partialToken(s)
+	r.held = s[i:]
+	return revealString(ctx, r.Vault, s[:i])
+}
+
+// Flush returns the revealed rest at the end of the stream.
+func (r *RevealStream) Flush(ctx context.Context) (string, error) {
+	s := r.held
+	r.held = ""
+	return revealString(ctx, r.Vault, s)
+}
+
 type revealer struct {
 	v     Vault
 	paths map[string][]string // nil reveals everywhere
