@@ -56,27 +56,35 @@ func (v *MemVault) Get(_ context.Context, token string) (string, bool, error) {
 // puts the pair in Vault. The same value always becomes the same token under one
 // Key, so a model can still tell two addresses apart and a resume sees the same text.
 //
+// Finders add spans a pattern cannot describe, such as names from a Dictionary. A
+// span's token is "⟦<Class>:<hash>⟧" with the hash taken of its Key, so two
+// spellings of one entity share a token, and the vault keeps its Value. Rules and
+// finders run on the same text: of overlapping spans the longest wins, then the
+// earlier source, rules before finders in declared order. A span that touches a
+// token already in the text is left alone, so redacting twice changes nothing.
+//
 // It is a harness.Redactor: everything durable, every hook, the model and the
 // tools' output see tokens. Reveal and RevealPaths put values back in a tool's
 // arguments where the consumer decides an original is needed.
 //
 // Window is how many bytes of a reply are held back to keep a match whole, as in
-// Stream. Zero means the longest match any rule can make, or, when a rule has no
-// upper bound, the whole reply, which keeps the ring buffering as Redactor does.
+// Stream. Zero means the longest span any rule or finder can make, or, when one has
+// no upper bound, the whole reply, which keeps the ring buffering as Redactor does.
 // A vault failure fails closed, as any redactor error does, and its text is
 // dropped, because it may hold the value.
 type Pseudonymizer struct {
-	Rules  []Rule
-	Key    []byte
-	Vault  Vault
-	Window int
+	Rules   []Rule
+	Finders []Finder
+	Key     []byte
+	Vault   Vault
+	Window  int
 }
 
 // Name implements harness.Hook.
 func (p Pseudonymizer) Name() string { return "pseudonymize" }
 
 // Validate reports a configuration the stream cannot honour: no key or vault, or a
-// Window smaller than a rule's longest match. Run it at start-up. An invalid
+// Window smaller than the longest span of a rule or finder. Run it at start-up. An invalid
 // Pseudonymizer fails every model call.
 func (p Pseudonymizer) Validate() error {
 	_, err := p.streamer()
@@ -84,9 +92,9 @@ func (p Pseudonymizer) Validate() error {
 }
 
 func (p Pseudonymizer) engine() engine {
-	return engine{rules: p.Rules, replace: func(ctx context.Context, class, match string) (string, error) {
-		tok := token(p.Key, class, match)
-		if err := p.Vault.Put(ctx, tok, match); err != nil {
+	return engine{rules: p.Rules, finders: p.Finders, replace: func(ctx context.Context, s Span, match string) (string, error) {
+		tok := token(p.Key, s.Class, cmp(s.Key, match))
+		if err := p.Vault.Put(ctx, tok, cmp(s.Value, match)); err != nil {
 			return "", errVault
 		}
 		return tok, nil
@@ -103,7 +111,7 @@ func (p Pseudonymizer) streamer() (streamer, error) {
 	if p.Window > 0 {
 		return newStreamer(p.engine(), p.Window)
 	}
-	n, err := longest(p.Rules)
+	n, err := longest(p.Rules, p.Finders)
 	if err != nil {
 		return streamer{}, err
 	}

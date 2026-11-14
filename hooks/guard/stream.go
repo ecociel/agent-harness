@@ -15,26 +15,42 @@ import (
 	"github.com/ecociel/agent-harness/model"
 )
 
-// engine finds the spans of every rule on the original text, settles overlaps
-// with resolve, and replaces the winners once. It can work on the part of a text
-// that follows an already released prefix. replace turns one span into its
+// engine finds the spans of every rule and finder on the original text, settles
+// overlaps with resolve, and replaces the winners once. It can work on the part of
+// a text that follows an already released prefix. replace turns one span into its
 // replacement and may fail, which fails the whole text.
 type engine struct {
 	rules   []Rule
-	replace func(ctx context.Context, class, match string) (string, error)
+	finders []Finder
+	replace func(ctx context.Context, s Span, match string) (string, error)
 }
 
 // scan collects the candidate spans of full that start at or after from.
-func (e engine) scan(full string, from int) []hit {
+func (e engine) scan(ctx context.Context, full string, from int) ([]hit, error) {
 	var hits []hit
 	for i, r := range e.rules {
 		for _, m := range r.Pattern.FindAllStringIndex(full, -1) {
 			if m[0] >= from {
-				hits = append(hits, hit{m[0], m[1], r.Name, i})
+				hits = append(hits, hit{Span{Start: m[0], End: m[1], Class: r.Name}, i})
 			}
 		}
 	}
-	return hits
+	for i, f := range e.finders {
+		spans, err := f.Find(ctx, full)
+		if err != nil {
+			return nil, err
+		}
+		for _, s := range spans {
+			if s.Start < 0 || s.End > len(full) || s.Start > s.End ||
+				s.Start < len(full) && !utf8.RuneStart(full[s.Start]) || s.End < len(full) && !utf8.RuneStart(full[s.End]) {
+				return nil, fmt.Errorf("guard: finder %d returned a span that is not a piece of the text", i)
+			}
+			if s.Start >= from {
+				hits = append(hits, hit{s, len(e.rules) + i})
+			}
+		}
+	}
+	return hits, nil
 }
 
 // render writes full[from:to] with every winner inside it replaced.
@@ -42,16 +58,16 @@ func (e engine) render(ctx context.Context, full string, from, to int, won []hit
 	var b strings.Builder
 	last := from
 	for _, h := range won {
-		if h.end > to {
+		if h.End > to {
 			break
 		}
-		rep, err := e.replace(ctx, h.class, full[h.start:h.end])
+		rep, err := e.replace(ctx, h.Span, full[h.Start:h.End])
 		if err != nil {
 			return "", err
 		}
-		b.WriteString(full[last:h.start])
+		b.WriteString(full[last:h.Start])
 		b.WriteString(rep)
-		last = h.end
+		last = h.End
 	}
 	b.WriteString(full[last:to])
 	return b.String(), nil
@@ -61,7 +77,10 @@ func (e engine) render(ctx context.Context, full string, from, to int, won []hit
 // already: it is context for assertions such as \b and is never rewritten.
 func (e engine) apply(ctx context.Context, lead, text string) (string, error) {
 	full := lead + text
-	hits := e.scan(full, len(lead))
+	hits, err := e.scan(ctx, full, len(lead))
+	if err != nil {
+		return "", err
+	}
 	if len(hits) == 0 {
 		return text, nil
 	}
@@ -158,8 +177,10 @@ func b2i(b bool) int {
 	return 0
 }
 
-// longest is the largest match any rule can make, or -1 if a rule has no bound.
-func longest(rules []Rule) (int, error) {
+// longest is the largest span any rule or finder can make, or -1 if one has no
+// bound. A finder's bound grows by one rune, because whether a span is a whole
+// word depends on the rune after it, and that rune must be in the window too.
+func longest(rules []Rule, finders []Finder) (int, error) {
 	n := 0
 	for _, r := range rules {
 		m, err := maxLen(r)
@@ -174,6 +195,15 @@ func longest(rules []Rule) (int, error) {
 			n = max(n, m)
 		}
 	}
+	for _, f := range finders {
+		m := f.MaxLen()
+		if m < 0 {
+			n = -1
+		}
+		if n >= 0 {
+			n = max(n, m+utf8.UTFMax)
+		}
+	}
 	return n, nil
 }
 
@@ -184,12 +214,12 @@ type streamer struct {
 }
 
 func newStreamer(e engine, window int) (streamer, error) {
-	n, err := longest(e.rules)
+	n, err := longest(e.rules, e.finders)
 	if err != nil {
 		return streamer{}, err
 	}
 	if n < 0 {
-		return streamer{}, fmt.Errorf("guard: a rule has no upper bound on a match; bound it with {m,n} so a window can hold it")
+		return streamer{}, fmt.Errorf("guard: a rule or finder has no upper bound on a match; bound it so a window can hold it")
 	}
 	if window == 0 {
 		window = max(n, 1)
@@ -217,14 +247,17 @@ func (s streamer) release(ctx context.Context, lead, pending string) (string, in
 		c--
 	}
 	full := lead + pending
-	hits := s.scan(full, len(lead))
+	hits, err := s.scan(ctx, full, len(lead))
+	if err != nil {
+		return "", 0, err
+	}
 	tokens := tokenRanges(full)
 	cut := len(lead) + min(c, partialToken(pending))
 	for moved := true; moved; {
 		moved = false
 		for _, h := range hits {
-			if h.start < cut && cut < h.end {
-				cut, moved = h.end, true
+			if h.Start < cut && cut < h.End {
+				cut, moved = h.End, true
 			}
 		}
 		for _, t := range tokens {
@@ -434,7 +467,7 @@ func Stream(rules []Rule, window int) (harness.Redactor, error) {
 
 // redactEngine replaces a span with "[redacted:<class>]".
 func redactEngine(rules []Rule) engine {
-	return engine{rules: rules, replace: func(_ context.Context, class, _ string) (string, error) {
-		return "[redacted:" + class + "]", nil
+	return engine{rules: rules, replace: func(_ context.Context, s Span, _ string) (string, error) {
+		return "[redacted:" + s.Class + "]", nil
 	}}
 }

@@ -1,17 +1,34 @@
 package guard
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"unicode/utf8"
 )
 
-// hit is one candidate span of a text and the source that found it: the index of a
-// rule, or of a finder after the rules. A lower source wins a tie.
+// Span is one piece of a text a Finder wants replaced by a token.
+type Span struct {
+	Start, End int    // byte offsets in the text given to Find
+	Class      string // goes into the token, e.g. "person"
+	Key        string // what the token is keyed on, e.g. "party/4711"; empty means the matched text
+	Value      string // what reveal returns; empty means the matched text
+}
+
+// Finder finds spans in a text, as a Rule does with a pattern. It must be safe
+// for concurrent use. Spans may overlap; the Pseudonymizer settles overlaps.
+type Finder interface {
+	Find(ctx context.Context, text string) ([]Span, error)
+	// MaxLen is the longest span in bytes, which bounds a stream's window; -1
+	// means no bound, and the stream holds the whole reply.
+	MaxLen() int
+}
+
+// hit is one candidate span and the source that found it: the index of a rule,
+// or of a finder after the rules. A lower source wins a tie.
 type hit struct {
-	start, end int
-	class      string
-	src        int
+	Span
+	src int
 }
 
 // resolve settles which hits are replaced, and is the only place overlap policy
@@ -22,23 +39,23 @@ type hit struct {
 func resolve(hits []hit, tokens [][]int) []hit {
 	cands := make([]hit, 0, len(hits))
 	for _, h := range hits {
-		if h.end > h.start && !touchesToken(h, tokens) {
+		if h.End > h.Start && !touchesToken(h, tokens) {
 			cands = append(cands, h)
 		}
 	}
 	slices.SortStableFunc(cands, func(a, b hit) int {
-		if d := (b.end - b.start) - (a.end - a.start); d != 0 {
+		if d := (b.End - b.Start) - (a.End - a.Start); d != 0 {
 			return d
 		}
 		if a.src != b.src {
 			return a.src - b.src
 		}
-		return a.start - b.start
+		return a.Start - b.Start
 	})
 	var won []hit
 	for _, h := range cands {
-		i, _ := slices.BinarySearchFunc(won, h.start, func(w hit, start int) int { return w.start - start })
-		if i > 0 && won[i-1].end > h.start || i < len(won) && won[i].start < h.end {
+		i, _ := slices.BinarySearchFunc(won, h.Start, func(w hit, start int) int { return w.Start - start })
+		if i > 0 && won[i-1].End > h.Start || i < len(won) && won[i].Start < h.End {
 			continue
 		}
 		won = slices.Insert(won, i, h)
@@ -47,8 +64,8 @@ func resolve(hits []hit, tokens [][]int) []hit {
 }
 
 func touchesToken(h hit, tokens [][]int) bool {
-	i, _ := slices.BinarySearchFunc(tokens, h.start, func(t []int, start int) int { return t[1] - start - 1 })
-	return i < len(tokens) && tokens[i][0] < h.end
+	i, _ := slices.BinarySearchFunc(tokens, h.Start, func(t []int, start int) int { return t[1] - start - 1 })
+	return i < len(tokens) && tokens[i][0] < h.End
 }
 
 // tokenRanges are the byte ranges of the tokens in s, in order.
