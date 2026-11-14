@@ -87,9 +87,18 @@ Streamed text reaches sinks as delta events, which are not journaled. Each names
 
 Tool-call arguments are held until the end of the reply, and only their string values are rewritten, in place. Keys, key order, duplicate keys, white space and number formatting reach the tools as the model sent them, so a registry can still refuse an ambiguous call and an approval can hash the bytes that run.
 
+Every rule runs on the original text, and overlaps are settled once: the longest match wins, and on a tie the earlier rule. A match that touches a token already in the text is left alone, so redacting redacted text changes nothing.
+
 `guard.Pseudonymizer` replaces each match with a stable token `⟦rule:hash⟧`, an HMAC of the value, and keeps the pair in a `guard.Vault`. The model, the journal and the sinks hold tokens only, and the same value gets the same token in every run. It streams and treats arguments like `Stream`. A vault failure fails the run closed. `guard.NewMemVault` is for tests and demos and is not durable.
 
-`guard.Reveal(vault)` and `guard.RevealPaths(vault, paths)` are `WrapTool` middleware. They put real values back in a call's arguments just before the tool runs, everywhere or only in named JSON paths of named tools. They sit outside the ring, so the journal keeps the tokens and the ring tokenises the tool's output again. `guard.RevealText` is for a trusted reader outside a run.
+`Pseudonymizer.Finders` adds spans that a pattern cannot describe. A `guard.Finder` returns `guard.Span` values: byte offsets, a `Class`, and an optional `Key` and `Value`. The token is `⟦Class:hash⟧` with the hash taken of the `Key`, so two spellings of one entity share a token, and the vault keeps the `Value`. Rules and finders share one resolution: the longest span wins, then the earlier source, with rules before finders. `Finder.MaxLen` bounds the stream window, and -1 holds the whole reply. The package ships two finders, both built from `guard.Term` values:
+
+- `guard.NewDictionary` matches terms exactly, as whole words. It ignores case unless a term sets `CaseSensitive`, takes ü and ue, ä and ae, ö and oe, ß and ss for the same, and takes a run of up to 16 bytes of whitespace for one space. `TermOptions.MinLen` drops short terms. With 10,000 terms it matches about 13 µs per KB of text.
+- `guard.NewFuzzy` also matches a misspelt term: one edit for a term of 5 to 8 runes, two for a longer one. The OCR confusions rn and m, ü and ii, 0 and O, l and 1 cost nothing.
+
+`Pseudonymizer.Tokenize(ctx, class, key, value)` mints the token a finder span with that key would get, and puts the value in the vault. A tool that tokenises the fields it returns uses it, so its tokens and the ring's agree. A token keyed on an entity keeps its token when the entity is renamed, so a `Vault` keeps the value of the latest `Put`.
+
+`guard.Reveal(vault)` and `guard.RevealPaths(vault, paths)` are `WrapTool` middleware. They put real values back in a call's arguments just before the tool runs, everywhere or only in named JSON paths of named tools. They sit outside the ring, so the journal keeps the tokens and the ring tokenises the tool's output again. `guard.RevealText` is for a trusted reader outside a run, and `guard.RevealStream` does the same for streamed text: `RevealStream.Reveal` takes one chunk at a time and holds back a token that has not ended, and `RevealStream.Flush` returns the rest.
 
 ## Writing one
 
