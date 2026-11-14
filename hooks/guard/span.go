@@ -2,6 +2,7 @@ package guard
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -92,36 +93,57 @@ func partialToken(s string) int {
 }
 
 // tokenPrefix reports whether "⟦"+rest is the front of a token, not all of one, as
-// tokenRe defines it.
+// tokenRe defines it: a class of 1 to 64 runes, which may hold a colon, then a
+// colon, 12 hex digits and "⟧".
 func tokenPrefix(rest string) bool {
-	class := 0
-	for rest != "" && rest[0] != ':' {
-		if !utf8.FullRuneInString(rest) {
+	runes := 0
+	for i := 0; i < len(rest); {
+		if !utf8.FullRuneInString(rest[i:]) {
+			return runes < 64
+		}
+		r, n := utf8.DecodeRuneInString(rest[i:])
+		if r == ':' && runes > 0 && hexPrefix(rest[i+1:]) {
 			return true
 		}
-		r, n := utf8.DecodeRuneInString(rest)
-		if r == '⟦' || r == '⟧' || strings.ContainsRune(" \t\n\f\r", r) {
+		if !classRune(r) {
 			return false
 		}
-		if class++; class > 64 {
+		if runes++; runes > 64 {
 			return false
 		}
-		rest = rest[n:]
+		i += n
 	}
-	if rest == "" {
-		return true
-	}
-	if class == 0 {
-		return false
-	}
-	rest = rest[1:]
+	return true
+}
+
+// hexPrefix reports whether s is the front of 12 hex digits and "⟧", not all of it.
+func hexPrefix(s string) bool {
 	hex := 0
-	for hex < len(rest) && hex < 12 && (rest[hex] >= '0' && rest[hex] <= '9' || rest[hex] >= 'a' && rest[hex] <= 'f') {
+	for hex < len(s) && hex < 12 && (s[hex] >= '0' && s[hex] <= '9' || s[hex] >= 'a' && s[hex] <= 'f') {
 		hex++
 	}
 	if hex < 12 {
-		return hex == len(rest)
+		return hex == len(s)
 	}
-	tail := rest[12:]
-	return len(tail) < len("⟧") && strings.HasPrefix("⟧", tail)
+	return len(s)-12 < len("⟧") && strings.HasPrefix("⟧", s[12:])
+}
+
+func classRune(r rune) bool {
+	return r != '⟦' && r != '⟧' && r != utf8.RuneError && !strings.ContainsRune(" \t\n\f\r", r)
+}
+
+// checkClass reports a class that cannot stand in a token, because reveal would
+// not find the token.
+func checkClass(class string) error {
+	n := 0
+	for _, r := range class {
+		if !classRune(r) {
+			return fmt.Errorf("class %q holds %q, which a token cannot", class, r)
+		}
+		n++
+	}
+	if n == 0 || n > 64 {
+		return fmt.Errorf("class %q must have 1 to 64 runes", class)
+	}
+	return nil
 }

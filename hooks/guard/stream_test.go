@@ -277,3 +277,17 @@ func TestStreamHoldsTheWidestFold(t *testing.T) {
 		}
 	}
 }
+
+// pieces streams the given parts as text deltas.
+func pieces(parts ...string) model.Provider {
+	return model.ProviderFunc(func(context.Context, model.Request) iter.Seq2[model.Event, error] {
+		return func(yield func(model.Event, error) bool) {
+			for _, p := range parts {
+				if p != "" && !yield(model.TextDelta{Text: p}, nil) {
+					return
+				}
+			}
+			yield(model.Finish{Reason: model.FinishStop}, nil)
+		}
+	})
+}
