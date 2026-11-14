@@ -14,9 +14,11 @@ import (
 	"github.com/ecociel/agent-harness/model"
 )
 
-// Vault keeps the values behind tokens. Put is idempotent: the same token always
-// names the same value. It may be called concurrently. A durable run needs a durable
-// vault, because a resumed run holds tokens whose values only the vault knows.
+// Vault keeps the values behind tokens. A later Put of a token replaces its value:
+// the latest Put wins. A token keyed on an entity (Tokenize, a Span with a Key)
+// keeps its token when the entity is renamed, and reveal must return the new name.
+// Put may be called concurrently. A durable run needs a durable vault, because a
+// resumed run holds tokens whose values only the vault knows.
 type Vault interface {
 	Put(ctx context.Context, token, value string) error
 	Get(ctx context.Context, token string) (value string, ok bool, err error)
@@ -32,13 +34,10 @@ type MemVault struct {
 // NewMemVault returns an empty MemVault.
 func NewMemVault() *MemVault { return &MemVault{m: map[string]string{}} }
 
-// Put binds token to value. Binding a token to a second value is an error.
+// Put binds token to value, replacing what it named before.
 func (v *MemVault) Put(_ context.Context, token, value string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if old, ok := v.m[token]; ok && old != value {
-		return errors.New("guard: token already names another value")
-	}
 	v.m[token] = value
 	return nil
 }
@@ -83,8 +82,9 @@ type Pseudonymizer struct {
 // Name implements harness.Hook.
 func (p Pseudonymizer) Name() string { return "pseudonymize" }
 
-// Validate reports a configuration the stream cannot honour: no key or vault, or a
-// Window smaller than the longest span of a rule or finder. Run it at start-up. An invalid
+// Validate reports a configuration the stream cannot honour: no key or vault, a
+// rule name that cannot stand in a token, or a Window smaller than the longest span
+// of a rule or finder. Run it at start-up. An invalid
 // Pseudonymizer fails every model call.
 func (p Pseudonymizer) Validate() error {
 	_, err := p.streamer()
@@ -93,17 +93,39 @@ func (p Pseudonymizer) Validate() error {
 
 func (p Pseudonymizer) engine() engine {
 	return engine{rules: p.Rules, finders: p.Finders, replace: func(ctx context.Context, s Span, match string) (string, error) {
-		tok := token(p.Key, s.Class, cmp(s.Key, match))
-		if err := p.Vault.Put(ctx, tok, cmp(s.Value, match)); err != nil {
-			return "", errVault
-		}
-		return tok, nil
+		return p.Tokenize(ctx, s.Class, cmp(s.Key, match), cmp(s.Value, match))
 	}}
+}
+
+var errNoKey = errors.New("guard: a Pseudonymizer needs a Key and a Vault")
+
+// Tokenize returns the token "⟦<class>:<hash>⟧" of key, the hash taken under Key,
+// and puts value in the vault behind it. A span a finder returns becomes the same
+// token, so code outside the ring, such as a tool that tokenises the fields it
+// returns, names an entity as the ring does. A class that cannot stand in a token
+// (empty, over 64 runes, or holding whitespace, ⟦ or ⟧) is an error.
+func (p Pseudonymizer) Tokenize(ctx context.Context, class, key, value string) (string, error) {
+	if len(p.Key) == 0 || p.Vault == nil {
+		return "", errNoKey
+	}
+	if err := checkClass(class); err != nil {
+		return "", fmt.Errorf("guard: %w", err)
+	}
+	tok := token(p.Key, class, key)
+	if err := p.Vault.Put(ctx, tok, value); err != nil {
+		return "", errVault
+	}
+	return tok, nil
 }
 
 func (p Pseudonymizer) streamer() (streamer, error) {
 	if len(p.Key) == 0 || p.Vault == nil {
-		return streamer{}, errors.New("guard: a Pseudonymizer needs a Key and a Vault")
+		return streamer{}, errNoKey
+	}
+	for _, r := range p.Rules {
+		if err := checkClass(r.Name); err != nil {
+			return streamer{}, fmt.Errorf("guard: rule: %w", err)
+		}
 	}
 	if p.Window < 0 {
 		return streamer{}, fmt.Errorf("guard: window %d is negative", p.Window)
@@ -121,16 +143,16 @@ func (p Pseudonymizer) streamer() (streamer, error) {
 	return streamer{p.engine(), max(n, 1)}, nil
 }
 
-func token(key []byte, rule, value string) string {
-	m := hmac.New(sha256.New, key)
-	m.Write([]byte(value))
-	return "⟦" + rule + ":" + hex.EncodeToString(m.Sum(nil))[:12] + "⟧"
+func token(secret []byte, class, key string) string {
+	m := hmac.New(sha256.New, secret)
+	m.Write([]byte(key))
+	return "⟦" + class + ":" + hex.EncodeToString(m.Sum(nil))[:12] + "⟧"
 }
 
 // Redact implements harness.Redactor.
 func (p Pseudonymizer) Redact(ctx context.Context, _ harness.Kind, text string) (string, error) {
 	if len(p.Key) == 0 || p.Vault == nil {
-		return "", errors.New("guard: a Pseudonymizer needs a Key and a Vault")
+		return "", errNoKey
 	}
 	return p.engine().apply(ctx, "", text)
 }

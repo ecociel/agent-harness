@@ -151,20 +151,68 @@ func TestPseudonymizerWithoutAWindowHoldsTheReplyForUnboundedRules(t *testing.T)
 	}
 }
 
-func TestMemVaultPutIsIdempotent(t *testing.T) {
+func TestMemVaultKeepsTheLatestValue(t *testing.T) {
 	v := guard.NewMemVault()
 	ctx := context.Background()
-	if err := v.Put(ctx, "t", "a"); err != nil {
-		t.Fatal(err)
+	for _, value := range []string{"a", "a", "b"} {
+		if err := v.Put(ctx, "t", value); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := v.Put(ctx, "t", "a"); err != nil {
-		t.Fatal(err)
-	}
-	if err := v.Put(ctx, "t", "b"); err == nil {
-		t.Fatal("a token was bound to two values")
+	if got, ok, _ := v.Get(ctx, "t"); !ok || got != "b" {
+		t.Fatalf("%q %v", got, ok)
 	}
 	if _, ok, _ := v.Get(ctx, "nope"); ok {
 		t.Fatal("found an unknown token")
+	}
+}
+
+func TestTokenizeMintsTheTokenTheRingDoes(t *testing.T) {
+	ctx := context.Background()
+	v := guard.NewMemVault()
+	d, err := guard.NewDictionary([]guard.Term{{Text: "Anna Müller", Class: "person", Key: "party/4711", Value: "Anna Müller"}}, guard.TermOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := guard.Pseudonymizer{Finders: []guard.Finder{d}, Key: []byte("k"), Vault: v}
+	tok, err := p.Tokenize(ctx, "person", "party/4711", "Anna Müller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := p.Redact(ctx, harness.KindToolDone, "Dear Anna Mueller"); out != "Dear "+tok {
+		t.Fatalf("ring %q, Tokenize %q", out, tok)
+	}
+	if out, _ := p.Redact(ctx, harness.KindToolDone, "Dear "+tok); out != "Dear "+tok {
+		t.Fatalf("a minted token was redacted again: %q", out)
+	}
+	renamed, err := p.Tokenize(ctx, "person", "party/4711", "Anna Keller")
+	if err != nil || renamed != tok {
+		t.Fatalf("a rename changed the token: %q %v", renamed, err)
+	}
+	if got, _ := guard.RevealText(ctx, v, "Dear "+tok); got != "Dear Anna Keller" {
+		t.Fatalf("revealed %q", got)
+	}
+	if other, _ := p.Tokenize(ctx, "person", "party/4712", "Anna Keller"); other == tok {
+		t.Fatal("two keys share a token")
+	}
+}
+
+func TestTokenizeRefusesWhatCannotBeAToken(t *testing.T) {
+	ctx := context.Background()
+	p := guard.Pseudonymizer{Key: []byte("k"), Vault: guard.NewMemVault()}
+	for _, class := range []string{"", "a b", "a⟧", strings.Repeat("x", 65)} {
+		if tok, err := p.Tokenize(ctx, class, "k", "v"); err == nil {
+			t.Errorf("class %q gave %q", class, tok)
+		}
+	}
+	if _, err := (guard.Pseudonymizer{Vault: guard.NewMemVault()}).Tokenize(ctx, "person", "k", "v"); err == nil {
+		t.Error("no key")
+	}
+	if _, err := (guard.Pseudonymizer{Key: []byte("k"), Vault: brokenVault{guard.NewMemVault()}}).Tokenize(ctx, "person", "k", "v"); err == nil || strings.Contains(err.Error(), addr) {
+		t.Errorf("vault failure: %v", err)
+	}
+	if err := (guard.Pseudonymizer{Rules: []guard.Rule{guard.R("a b", `x`)}, Key: []byte("k"), Vault: guard.NewMemVault()}).Validate(); err == nil {
+		t.Error("a rule name with a space was accepted")
 	}
 }
 
