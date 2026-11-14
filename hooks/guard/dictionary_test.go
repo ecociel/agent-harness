@@ -211,3 +211,12 @@ func BenchmarkNewDictionary(b *testing.B) {
 		}
 	}
 }
+
+func TestDictionaryRedactsANameNextToInvalidUTF8(t *testing.T) {
+	d := dict(t, guard.TermOptions{}, guard.Term{Text: "Anna", Class: "person"})
+	p := guard.Pseudonymizer{Finders: []guard.Finder{d}, Key: []byte("k"), Vault: guard.NewMemVault()}
+	out, err := p.Redact(context.Background(), harness.KindToolDone, "Anna\x80 and \xffAnna")
+	if err != nil || strings.Contains(out, "Anna") {
+		t.Fatalf("%v %q", err, out)
+	}
+}

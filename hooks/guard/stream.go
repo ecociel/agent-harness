@@ -41,8 +41,7 @@ func (e engine) scan(ctx context.Context, full string, from int) ([]hit, error) 
 			return nil, err
 		}
 		for _, s := range spans {
-			if s.Start < 0 || s.End > len(full) || s.Start > s.End ||
-				s.Start < len(full) && !utf8.RuneStart(full[s.Start]) || s.End < len(full) && !utf8.RuneStart(full[s.End]) {
+			if s.Start < 0 || s.End > len(full) || s.Start > s.End || splitsRune(full, s.Start) || splitsRune(full, s.End) {
 				return nil, fmt.Errorf("guard: finder %d returned a span that is not a piece of the text", i)
 			}
 			if s.Start >= from {
@@ -51,6 +50,17 @@ func (e engine) scan(ctx context.Context, full string, from int) ([]hit, error) 
 		}
 	}
 	return hits, nil
+}
+
+// splitsRune reports whether offset i falls inside a valid multi-byte rune of s.
+func splitsRune(s string, i int) bool {
+	for j := i - 1; j >= max(0, i-utf8.UTFMax+1); j-- {
+		if utf8.RuneStart(s[j]) {
+			_, n := utf8.DecodeRuneInString(s[j:])
+			return j+n > i
+		}
+	}
+	return false
 }
 
 // render writes full[from:to] with every winner inside it replaced.
