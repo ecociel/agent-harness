@@ -167,3 +167,45 @@ func TestMemVaultPutIsIdempotent(t *testing.T) {
 		t.Fatal("found an unknown token")
 	}
 }
+
+// ids matches a bare run of digits, as a token's hex can be.
+var ids = guard.R("id", `\b\d{6,12}\b`)
+
+const tokenised = "⟦person:123456789012⟧"
+
+// longToken is longer than the window of the rules it streams with.
+const longToken = "⟦person/a-long-attribute-name:210987654321⟧"
+
+func TestRedactingRedactedTextChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	p := guard.Pseudonymizer{Rules: append(guard.PII(), ids), Key: []byte("k"), Vault: guard.NewMemVault()}
+	in := "Anna " + tokenised + " has id 4711123, mail " + addr + ", phone +41 79 123 45 67, " +
+		"IBAN CH93 0076 2011 6238 5295 7, card 4111 1111 1111 1111 and AHV 756.1234.5678.97."
+	once, err := p.Redact(ctx, harness.KindToolDone, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(once, tokenised) || strings.Contains(once, "4711123") || strings.Contains(once, "anna.meier") {
+		t.Fatalf("once: %q", once)
+	}
+	twice, err := p.Redact(ctx, harness.KindToolDone, once)
+	if err != nil || twice != once {
+		t.Fatalf("twice: %q\nonce:  %q", twice, once)
+	}
+}
+
+func TestPseudonymizerStreamsTokensAndMatchesWhole(t *testing.T) {
+	p := guard.Pseudonymizer{Rules: []guard.Rule{guard.PII()[len(guard.PII())-1], ids}, Key: []byte("k"), Vault: guard.NewMemVault()}
+	text := "Start " + strings.Repeat("filler text ", 3) + tokenised + " then 4711123 and " + tokenised +
+		tokenised + " " + longToken + " card 4111 1111 1111 1111 " + strings.Repeat("more ", 8) + "⟦not a token " + tokenised + " end 987654"
+	want, err := p.Redact(context.Background(), harness.KindDelta, text)
+	if err != nil || strings.Count(want, tokenised) != 4 || !strings.Contains(want, longToken) || strings.Contains(want, "4711123") {
+		t.Fatalf("%v %q", err, want)
+	}
+	for n := 1; n <= 40; n++ {
+		streamed, out := deltas(t, chunked(text, n), p)
+		if streamed != want || out != want {
+			t.Fatalf("chunk %d\nstreamed %q\nwant     %q", n, streamed, want)
+		}
+	}
+}

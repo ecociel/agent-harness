@@ -42,14 +42,15 @@ func R(name, pattern string) Rule { return Rule{Name: name, Pattern: regexp.Must
 func PII() []Rule {
 	return []Rule{
 		R("email", `[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}`),
-		// IBAN and AHV come before card so their digits are not taken for a
-		// card number (rules are applied in order).
+		// Of overlapping matches the longest wins and on a tie the earlier rule,
+		// so IBAN, AHV and phone come before card: their digits are not taken for a
+		// card number.
 		R("iban", `\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b`),
 		R("ahv", `\b756\.\d{4}\.\d{4}\.\d{2}\b`),
 		// Swiss numbers only, in their grouped forms (+41 79 123 45 67, 079 123 45 67),
-		// so an ordinary digit string is not taken for a phone number. Before card.
+		// so an ordinary digit string is not taken for a phone number.
 		R("phone", `(?:\+41|\b0041) ?\(?0?\)?\d{2} ?\d{3} ?\d{2} ?\d{2}\b|\b0\d{2} \d{3} \d{2} \d{2}\b`),
-		R("card", `\b(?:\d[ -]?){13,16}\b`),
+		R("card", `\b\d(?:[ -]?\d){12,15}\b`),
 	}
 }
 
@@ -106,10 +107,8 @@ func (rules Redactor) Redact(_ context.Context, _ harness.Kind, text string) (st
 }
 
 func redact(rules []Rule, s string) string {
-	for _, r := range rules {
-		s = r.Pattern.ReplaceAllLiteralString(s, "[redacted:"+r.Name+"]")
-	}
-	return s
+	out, _ := redactEngine(rules).apply(context.Background(), "", s)
+	return out
 }
 
 // BeforeRun checks the input.

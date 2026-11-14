@@ -15,38 +15,57 @@ import (
 	"github.com/ecociel/agent-harness/model"
 )
 
-// engine applies rules in order, like Redactor does, and can do it on the part of a
-// text that follows an already released prefix. replace turns one match into its
+// engine finds the spans of every rule on the original text, settles overlaps
+// with resolve, and replaces the winners once. It can work on the part of a text
+// that follows an already released prefix. replace turns one span into its
 // replacement and may fail, which fails the whole text.
 type engine struct {
 	rules   []Rule
-	replace func(ctx context.Context, r Rule, match string) (string, error)
+	replace func(ctx context.Context, class, match string) (string, error)
+}
+
+// scan collects the candidate spans of full that start at or after from.
+func (e engine) scan(full string, from int) []hit {
+	var hits []hit
+	for i, r := range e.rules {
+		for _, m := range r.Pattern.FindAllStringIndex(full, -1) {
+			if m[0] >= from {
+				hits = append(hits, hit{m[0], m[1], r.Name, i})
+			}
+		}
+	}
+	return hits
+}
+
+// render writes full[from:to] with every winner inside it replaced.
+func (e engine) render(ctx context.Context, full string, from, to int, won []hit) (string, error) {
+	var b strings.Builder
+	last := from
+	for _, h := range won {
+		if h.end > to {
+			break
+		}
+		rep, err := e.replace(ctx, h.class, full[h.start:h.end])
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(full[last:h.start])
+		b.WriteString(rep)
+		last = h.end
+	}
+	b.WriteString(full[last:to])
+	return b.String(), nil
 }
 
 // apply rewrites text. lead is the raw text that precedes it and was released
 // already: it is context for assertions such as \b and is never rewritten.
 func (e engine) apply(ctx context.Context, lead, text string) (string, error) {
-	for _, r := range e.rules {
-		full := lead + text
-		var b strings.Builder
-		b.WriteString(lead)
-		last := len(lead)
-		for _, m := range r.Pattern.FindAllStringIndex(full, -1) {
-			if m[0] < len(lead) {
-				continue
-			}
-			rep, err := e.replace(ctx, r, full[m[0]:m[1]])
-			if err != nil {
-				return "", err
-			}
-			b.WriteString(full[last:m[0]])
-			b.WriteString(rep)
-			last = m[1]
-		}
-		b.WriteString(full[last:])
-		text = b.String()[len(lead):]
+	full := lead + text
+	hits := e.scan(full, len(lead))
+	if len(hits) == 0 {
+		return text, nil
 	}
-	return text, nil
+	return e.render(ctx, full, len(lead), len(full), resolve(hits, tokenRanges(full)))
 }
 
 // maxLen is the longest match of a pattern in bytes, or -1 if it has none.
@@ -181,31 +200,47 @@ func newStreamer(e engine, window int) (streamer, error) {
 	return streamer{e, window}, nil
 }
 
-// cut is how much of pending can be released: all but the last window bytes, moved
-// forward past any match that straddles that point so no match is split.
-func (s streamer) cut(lead, pending string) int {
+// release redacts and returns the part of pending that can go out now, and its
+// length in pending. That is all but the last window bytes, moved back to the start
+// of a token that has not ended and forward past any span or token that straddles
+// the cut, so no span is split. A span that ends where pending ends could still
+// grow, so then nothing is released.
+func (s streamer) release(ctx context.Context, lead, pending string) (string, int, error) {
 	if s.window < 0 {
-		return 0
+		return "", 0, nil
 	}
 	c := len(pending) - s.window
 	if c <= 0 {
-		return 0
+		return "", 0, nil
 	}
 	for c > 0 && !utf8.RuneStart(pending[c]) {
 		c--
 	}
 	full := lead + pending
+	hits := s.scan(full, len(lead))
+	tokens := tokenRanges(full)
+	cut := len(lead) + min(c, partialToken(pending))
 	for moved := true; moved; {
 		moved = false
-		for _, r := range s.rules {
-			for _, m := range r.Pattern.FindAllStringIndex(full, -1) {
-				if s0, e0 := m[0]-len(lead), m[1]-len(lead); s0 < c && c < e0 {
-					c, moved = e0, true
-				}
+		for _, h := range hits {
+			if h.start < cut && cut < h.end {
+				cut, moved = h.end, true
+			}
+		}
+		for _, t := range tokens {
+			if t[0] < cut && cut < t[1] {
+				cut, moved = t[1], true
 			}
 		}
 	}
-	return min(c, len(pending))
+	if cut <= len(lead) || cut >= len(full) {
+		return "", 0, nil
+	}
+	out, err := s.render(ctx, full, len(lead), cut, resolve(hits, tokens))
+	if err != nil {
+		return "", 0, err
+	}
+	return out, cut - len(lead), nil
 }
 
 type heldCall struct {
@@ -253,14 +288,13 @@ func (s streamer) WrapModel(_ harness.Run, next model.Provider) model.Provider {
 				switch e := ev.(type) {
 				case model.TextDelta:
 					pending += e.Text
-					c := s.cut(lead, pending)
-					if c == 0 {
-						continue
-					}
-					out, err := s.apply(ctx, lead, pending[:c])
+					out, c, err := s.release(ctx, lead, pending)
 					if err != nil {
 						yield(nil, err)
 						return
+					}
+					if c == 0 {
+						continue
 					}
 					lead = tail(pending[:c])
 					pending = pending[c:]
@@ -391,12 +425,16 @@ func (r ruleRedactor) Redact(ctx context.Context, _ harness.Kind, text string) (
 // reported here and not a leak at run time. A window of zero means the longest
 // match any rule can make.
 func Stream(rules []Rule, window int) (harness.Redactor, error) {
-	e := engine{rules: rules, replace: func(_ context.Context, r Rule, _ string) (string, error) {
-		return "[redacted:" + r.Name + "]", nil
-	}}
-	s, err := newStreamer(e, window)
+	s, err := newStreamer(redactEngine(rules), window)
 	if err != nil {
 		return nil, err
 	}
 	return ruleRedactor{s}, nil
+}
+
+// redactEngine replaces a span with "[redacted:<class>]".
+func redactEngine(rules []Rule) engine {
+	return engine{rules: rules, replace: func(_ context.Context, class, _ string) (string, error) {
+		return "[redacted:" + class + "]", nil
+	}}
 }
